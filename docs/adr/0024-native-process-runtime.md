@@ -41,6 +41,23 @@ This ADR changes two accepted texts. They change only when the maintainer accept
   - To drop the instance also ends the task that reads the error output, also when another process still holds the pipe. After the child has ended, the runtime waits for this task for the grace time at most, so the last lines of a crash are not lost; then it stops the task and writes the count of dropped lines.
   - After the child exits during a call, the runtime waits for the grace time at most for an answer that is still in the pipe (review finding R-104, on `main` since PR #172; read in the module documentation of `native.rs`). Before, it read one time, and an answer was lost under load. Consequences: if another process holds the output of the child open, a failed call ends later by the grace time (2 s by default; 0 before), so the rule that such a process delays no call is not true for a failed call. An answer without a line end is refused: the message form is one JSON object per line. With a grace time of 0 an answer directly before an exit can be lost.
   - Known limit: a process that the child starts itself is not ended with the child. To end a process group needs a system call that the standard library and tokio do not give without `unsafe` or a new crate. It belongs to the OS sandbox work.
+  - Proposed, waits for the owner (review finding R-87; nothing of this is built): the limit above is closed on Unix with the crate `rustix`.
+    - The child starts in its own process group (`process_group(0)` of the tokio command; no crate is needed for this).
+    - To end an extension, the runtime sends the kill signal to the group, not only to the child: `rustix::process::kill_process_group`, a safe function. The workspace rule `unsafe_code = "forbid"` stays for each crate of the workspace; the `unsafe` call is inside `rustix`.
+    - The runtime sends the group signal before it reads the exit status of the child. After that read the number of the group can belong to other processes.
+    - After a child that ended by itself (exit, crash), the runtime also ends the group, by the same rule.
+    - `rustix` 1.1.6 is in `Cargo.lock` already (the WASM runtime uses it). The direct dependency needs the feature `process`. Expected: no new package in `Cargo.lock`; the diff of the lock file is the proof and was not made for this record.
+    - Limits that stay: a process that leaves the group (it makes its own session or group) is not ended. This is not a sandbox. On Windows nothing changes: `rustix` has no process module there; the matching tool is a job object, which needs another crate. CI runs on Linux only on this date.
+    - Candidates compared (registry data of this date; sources not read, except the three function signatures):
+
+      | Candidate | Safe call for "kill the group" | Licence | New packages in `Cargo.lock` | Note |
+      | --- | --- | --- | --- | --- |
+      | `rustix` 1.1.6 | yes, `process::kill_process_group` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT (in the allow list) | 0 expected | Same organisation as Wasmtime. No Windows. |
+      | `nix` 0.32.0 | yes, `sys::signal::killpg` | MIT (in the allow list) | 2 expected (`nix`, `cfg_aliases`) | No Windows. |
+      | `process-wrap` 11.0.0 | yes, it wraps the command | Apache-2.0 OR MIT | more: `nix`, and `windows` for job objects | Changes how the child is started; has job objects for Windows. |
+      | `command-group` 5.0.1 | yes | Apache-2.0 OR MIT | more: `nix` 0.27, `winapi` | Older versions of its dependencies. |
+      | `libc` | no, the call is `unsafe` | | 0 | Breaks `unsafe_code = "forbid"`. |
+      | The program `kill` | no crate | | 0 | A second program in `PATH`; not proposed. |
 - Limits of this part, not resolved here:
   - A native process has no memory limit and no CPU limit (§4.3 requires limits per extension). No ticket has it.
   - The process is not sandboxed by the OS. §4.7 then requires that the install review says "runs with full user privileges"; that text is for #51 and does not exist.
