@@ -137,6 +137,10 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
 pub const DEFAULT_FUEL_PER_CALL: u64 = 1_000_000_000;
 
 /// The default of [`Limits::component_bytes`]: 4 MiB (ADR-0018).
+///
+/// A debug build of the host compiles a component of this size for longer
+/// than the default call time limit (ADR-0018: 35 to 64 s), so that load
+/// fails.
 pub const DEFAULT_COMPONENT_BYTES: usize = 4 << 20;
 
 /// The most core instances that one instance of a component can have.
@@ -210,6 +214,14 @@ impl Limits {
     /// and give the same `config` to the host. With a longer time limit in
     /// the runtime, the guest code of a call that the host gave up continues
     /// until the limit of the runtime.
+    ///
+    /// With the same limit, the guest code of `activate` and `deactivate`
+    /// stops not later than the overshoot after the host gave up the call.
+    /// For `load`, the timer of the host starts before the compilation and
+    /// the limit of the runtime starts when guest code starts: after the
+    /// host gave up a load, guest code can run for the full limit of the
+    /// runtime plus the overshoot, counted from the end of the compilation
+    /// (ADR-0018).
     #[must_use]
     pub fn for_host(config: &HostConfig) -> Self {
         Self {
@@ -1960,11 +1972,15 @@ mod tests {
 
         let report = hosted.start("acme.spin").await;
         let gave_up = std::time::Instant::now();
+        // The limit of the host ends the call first, because the runtime
+        // rounds its limit up. If a tick comes in the first millisecond
+        // after the limit, the error of the runtime can be first: the two
+        // texts have "time limit". The text of the host is checked with a
+        // paused clock in `a_call_that_exceeds_the_time_limit_fails_the_extension`
+        // (`host.rs`).
         let error = &report.not_activated[&id("acme.spin")];
-        assert!(
-            error.message().contains("exceeded the time limit"),
-            "{error}"
-        );
+        assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
+        assert!(error.message().contains("time limit"), "{error}");
         assert_eq!(hosted.state("acme.spin"), Some(ExtensionState::Failed));
 
         // The overshoot of the module documentation: two ticks, plus the
