@@ -6,6 +6,7 @@ pub mod host;
 pub mod install;
 pub mod jobs;
 pub mod logging;
+pub mod native;
 pub mod package;
 pub mod permissions;
 pub mod registry;
