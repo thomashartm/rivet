@@ -273,7 +273,7 @@ fn decode_key(base64: &str) -> Option<[u8; 42]> {
 /// Source: the list `blacklist` in `ge25519_has_small_order` of libsodium,
 /// tag `1.0.18`, file
 /// `src/libsodium/crypto_core/ed25519/ref10/ed25519_ref10.c`. The list
-/// has 7 entries there; tag `1.0.20` has the same list of 7 entries.
+/// has 7 entries there; tag `1.0.20` has a list of 7 entries too.
 /// The entries of the list for y = p and y = p + 1 are not here:
 /// [`is_weak_key`] refuses each y that is not below p.
 const SMALL_ORDER_Y: [[u8; 32]; 5] = [
