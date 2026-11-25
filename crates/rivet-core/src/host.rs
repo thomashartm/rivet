@@ -2044,16 +2044,36 @@ mod tests {
                     Ok(())
                 }
                 Some(Mode::Sleep(time)) => {
-                    std::thread::sleep(time);
+                    self.blocking(|| std::thread::sleep(time));
                     Ok(())
                 }
                 Some(Mode::Block) => {
                     let hold = format!("hold {call}");
-                    while self.mode(&hold).is_some() {
-                        std::thread::sleep(MS);
-                    }
+                    self.blocking(|| {
+                        while self.mode(&hold).is_some() {
+                            std::thread::sleep(MS);
+                        }
+                    });
                     Ok(())
                 }
+            }
+        }
+
+        /// Runs `block`, which blocks its thread, inside a call that does
+        /// not return to the runtime. On a runtime with more than one
+        /// thread, the runtime gets a new worker for that time: a blocked
+        /// worker can leave no thread that drives the timer, and then no
+        /// time limit ends.
+        fn blocking(&self, block: impl FnOnce()) {
+            match Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(block);
+                    // The thread can be a thread of the blocking pool from
+                    // now on: it is not known as an async worker any more.
+                    let here = std::thread::current().id();
+                    self.workers.lock().unwrap().retain(|id| *id != here);
+                }
+                _ => block(),
             }
         }
 
