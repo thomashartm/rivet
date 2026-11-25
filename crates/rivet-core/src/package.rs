@@ -14,7 +14,15 @@
 //!   the user and calls [`TrustStore::pin`] after the user confirms it.
 //!   Nothing in this module pins a key on its own.
 //! - The trusted comment of the signature is verified together with the
-//!   package.
+//!   package. It binds the signature to one extension id and one version. The
+//!   whole trusted comment must be exactly
+//!   `rivet-package id=<extension id> version=<version>`, for example made
+//!   with `minisign -S -t "rivet-package id=acme.postgres version=1.0.0"`.
+//! - [`TrustStore::verify_package`] refuses a signature for another id or
+//!   another version than the caller expects. For a publisher it also
+//!   refuses an id whose first segment is not the publisher name (ADR-0019).
+//! - [`TrustStore::pin`] never replaces another pinned key. A key change
+//!   needs a new review and [`TrustStore::replace_pin_after_review`].
 //! - Legacy signatures (not prehashed, made with `minisign -l`) are refused.
 //!
 //! # The caller must do this
@@ -25,9 +33,14 @@
 //!   [`tokio::task::spawn_blocking`] or in a blocking job
 //!   ([`JobScheduler::spawn_blocking`](crate::jobs::JobScheduler::spawn_blocking)),
 //!   never directly on an async worker thread (§5.1).
-//! - **Use the bytes that were verified.** Verification reads the file at the
-//!   given path. If another process can replace that file, copy the package
-//!   to a private location first, verify the copy and use only the copy.
+//! - **Use the bytes that were verified.** The caller MUST copy the package
+//!   to a private location first (a directory of the user that others cannot
+//!   write), verify the copy, and read the package only from the file handle
+//!   that [`Verified::into_file`] gives. The caller MUST NOT open the path
+//!   again: another file can be at that path after the verification.
+//! - **Compare with the manifest.** Give the id and the version of the
+//!   manifest to [`TrustStore::verify_package`]. After plain [`verify`],
+//!   compare [`Verified::id`] and [`Verified::version`] with the manifest.
 //!
 //! # Trust store file
 //!
@@ -63,11 +76,16 @@
 //!     store.pin("acme", key)?;
 //!     store.save(file)?;
 //! }
-//! store.verify_package(
+//! let verified = store.verify_package(
 //!     Origin::Publisher("acme"),
+//!     &"acme.postgres".parse()?,
+//!     &"1.0.0".parse().expect("a version"),
 //!     Path::new("acme.postgres-1.0.0.rivetpkg"),
 //!     Path::new("acme.postgres-1.0.0.rivetpkg.minisig"),
 //! )?;
+//! // Read the package from this handle only.
+//! let package = verified.into_file();
+//! # drop(package);
 //! # Ok::<(), rivet_sdk::error::Error>(())
 //! ```
 //!
@@ -75,11 +93,11 @@
 
 use crate::settings::SCHEMA_VERSION_KEY;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
-use rivet_sdk::manifest::ExtensionId;
+use rivet_sdk::manifest::{ExtensionId, Version};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 use std::str::FromStr;
 use toml::{Table, Value};
@@ -93,6 +111,10 @@ const PUBLISHERS_KEY: &str = "publishers";
 /// The largest key or signature file that is read. minisign permits a
 /// trusted comment of 8192 bytes; a valid file is always smaller than this.
 const TEXT_FILE_MAX_BYTES: u64 = 16 * 1024;
+
+/// The largest trust store file that is read. One pinned key needs about 80
+/// bytes, so this is room for more than 10 000 publishers.
+const TRUST_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// A minisign public key.
 ///
@@ -124,7 +146,7 @@ impl PublicKey {
     /// Returns a `user` error that names `path` if the file cannot be read or
     /// does not hold a minisign public key.
     pub fn load(path: &Path) -> Result<Self> {
-        read_text_file(path, "public key")?
+        read_text_file(path, "minisign public key", TEXT_FILE_MAX_BYTES)?
             .parse()
             .map_err(|error: Error| {
                 Error::user(format!("{}: {}", path.display(), error.message())).with_source(error)
@@ -170,11 +192,48 @@ impl PartialEq for PublicKey {
 
 impl Eq for PublicKey {}
 
+/// A package whose signature verified.
+///
+/// It holds the extension id and the version from the trusted comment of
+/// the signature, and the open file whose bytes were verified.
+///
+/// Limit: a process that can write to the package file can change the bytes
+/// behind the handle after the verification. Keep the package in a private
+/// location: see the [module documentation](self).
+#[derive(Debug)]
+pub struct Verified {
+    id: ExtensionId,
+    version: Version,
+    file: File,
+}
+
+impl Verified {
+    /// Returns the extension id that the signature is for.
+    pub fn id(&self) -> &ExtensionId {
+        &self.id
+    }
+
+    /// Returns the version that the signature is for.
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+
+    /// Returns the file that was verified, open for reading at position 0.
+    /// Read the package from this handle. Do not open the path again.
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
 /// Verifies the file `package` against the detached minisign signature file
 /// `signature` and the public key `key`.
 ///
 /// The package is read in pieces, so a large package does not need much
 /// memory. This is blocking I/O: see the [module documentation](self).
+///
+/// This function does not know which extension the caller expects. Compare
+/// [`Verified::id`] and [`Verified::version`] with the manifest, or use
+/// [`TrustStore::verify_package`].
 ///
 /// # Errors
 ///
@@ -183,8 +242,17 @@ impl Eq for PublicKey {}
 /// - `policy`: the signature does not verify. The package, the signature or
 ///   the trusted comment was changed, or the signature was made with another
 ///   key. The message names both files.
-pub fn verify(package: &Path, signature: &Path, key: &PublicKey) -> Result<()> {
-    let text = read_text_file(signature, "signature")?;
+/// - `policy`: the signature verifies, but its trusted comment is not
+///   `rivet-package id=<extension id> version=<version>`.
+pub fn verify(package: &Path, signature: &Path, key: &PublicKey) -> Result<Verified> {
+    let (trusted_comment, file) = verify_signature(package, signature, key)?;
+    bound_package(&trusted_comment, signature, file)
+}
+
+/// Verifies the signature. Returns the verified trusted comment and the
+/// verified file at position 0.
+fn verify_signature(package: &Path, signature: &Path, key: &PublicKey) -> Result<(String, File)> {
+    let text = read_text_file(signature, "minisign signature", TEXT_FILE_MAX_BYTES)?;
     let parsed = minisign_verify::Signature::decode(&text).map_err(|error| {
         Error::user(format!(
             "{}: not a valid minisign signature",
@@ -220,7 +288,32 @@ pub fn verify(package: &Path, signature: &Path, key: &PublicKey) -> Result<()> {
             Err(error) => return Err(unreadable(error)),
         }
     }
-    verifier.finalize().map_err(|_| rejected())
+    verifier.finalize().map_err(|_| rejected())?;
+    file.rewind().map_err(unreadable)?;
+    Ok((parsed.trusted_comment().to_owned(), file))
+}
+
+/// Reads the extension id and the version from a verified trusted comment.
+fn bound_package(trusted_comment: &str, signature: &Path, file: File) -> Result<Verified> {
+    trusted_comment
+        .strip_prefix("rivet-package id=")
+        .and_then(|rest| rest.split_once(" version="))
+        .and_then(|(id, version)| Some((id.parse().ok()?, version.parse().ok()?)))
+        // Only the one canonical text is accepted.
+        .filter(|(id, version)| trusted_comment == binding(id, version))
+        .map(|(id, version)| Verified { id, version, file })
+        .ok_or_else(|| {
+            Error::policy(format!(
+                "{}: the trusted comment of the signature must be \
+                 `rivet-package id=<extension id> version=<version>`",
+                signature.display()
+            ))
+        })
+}
+
+/// The trusted comment that binds a signature to `id` and `version`.
+fn binding(id: &ExtensionId, version: &Version) -> String {
+    format!("rivet-package id={id} version={version}")
 }
 
 /// Who a package comes from. It selects the one key that can verify it.
@@ -260,30 +353,81 @@ impl TrustStore {
         self.pins.get(publisher)
     }
 
-    /// Pins `key` as the only key of `publisher`. It replaces an earlier pin.
+    /// Pins `key` as the only key of `publisher`, on the first install of
+    /// that publisher. It never replaces another pinned key. To pin the same
+    /// key again is permitted and changes nothing.
     ///
     /// This call is the confirmation of the caller. Call it only after the
-    /// user reviewed the key: on the first install of a publisher, and after
-    /// a new review when the publisher changed its key. Call
-    /// [`save`](Self::save) to keep the pin.
+    /// user reviewed the key. Call [`save`](Self::save) to keep the pin.
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if `publisher` is not a valid name. A publisher
-    /// name follows the rules of an [`ExtensionId`].
+    /// - `user`: `publisher` is not a valid name. A publisher name follows
+    ///   the rules of an [`ExtensionId`].
+    /// - `policy`: another key is pinned for `publisher`. A key change needs
+    ///   a new review and then
+    ///   [`replace_pin_after_review`](Self::replace_pin_after_review).
+    /// - `policy`: `key` is the project key. Only built-in extensions use it.
     pub fn pin(&mut self, publisher: &str, key: PublicKey) -> Result<()> {
+        self.check_pin(publisher, &key)?;
+        if self
+            .pins
+            .get(publisher)
+            .is_some_and(|pinned| *pinned != key)
+        {
+            return Err(Error::policy(format!(
+                "publisher `{publisher}` has another pinned key. A key change needs a new \
+                 review before the new key replaces the pin"
+            )));
+        }
+        self.pins.insert(publisher.to_owned(), key);
+        Ok(())
+    }
+
+    /// Replaces the pinned key of `publisher` with `key`.
+    ///
+    /// Call it only after the user reviewed the key change of the publisher
+    /// and confirmed the new key. Call [`save`](Self::save) to keep the pin.
+    ///
+    /// # Errors
+    ///
+    /// - `user`: `publisher` is not a valid name.
+    /// - `policy`: `publisher` has no pinned key. Use [`pin`](Self::pin) for
+    ///   a first install.
+    /// - `policy`: `key` is the project key.
+    pub fn replace_pin_after_review(&mut self, publisher: &str, key: PublicKey) -> Result<()> {
+        self.check_pin(publisher, &key)?;
+        match self.pins.get_mut(publisher) {
+            Some(pinned) => *pinned = key,
+            None => {
+                return Err(Error::policy(format!(
+                    "publisher `{publisher}` has no pinned key to replace"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The checks that each new pin must pass.
+    fn check_pin(&self, publisher: &str, key: &PublicKey) -> Result<()> {
         // The manifest has no publisher field yet, so the name is a string
         // with the character rules of an extension id.
         publisher
             .parse::<ExtensionId>()
             .map_err(|error| Error::user(format!("invalid publisher name: {}", error.message())))?;
-        self.pins.insert(publisher.to_owned(), key);
+        if *key == self.project_key {
+            return Err(Error::policy(format!(
+                "publisher `{publisher}`: the project key cannot be the key of a publisher"
+            )));
+        }
         Ok(())
     }
 
     /// Verifies `package` against the signature file `signature` with the one
-    /// key that `origin` permits. See the [module documentation](self) for
-    /// the rules. This is blocking I/O.
+    /// key that `origin` permits, and checks that the signature is for
+    /// `expected_id` and `expected_version` (the id and the version of the
+    /// manifest). See the [module documentation](self) for the rules. This is
+    /// blocking I/O.
     ///
     /// A rejected package is logged as a warning.
     ///
@@ -294,18 +438,31 @@ impl TrustStore {
     ///   key, then call again.
     /// - `policy`: the signature does not verify with the permitted key. For
     ///   a publisher, the message says that a new review is needed.
+    /// - `policy`: the first segment of `expected_id` is not the publisher
+    ///   name.
+    /// - `policy`: the signature is for another extension id or another
+    ///   version, or its trusted comment has another format.
     /// - `user`: see [`verify`].
     pub fn verify_package(
         &self,
         origin: Origin<'_>,
+        expected_id: &ExtensionId,
+        expected_version: &Version,
         package: &Path,
         signature: &Path,
-    ) -> Result<()> {
-        self.check(origin, package, signature)
+    ) -> Result<Verified> {
+        self.check(origin, expected_id, expected_version, package, signature)
             .inspect_err(|error| tracing::warn!(%error, "package signature rejected"))
     }
 
-    fn check(&self, origin: Origin<'_>, package: &Path, signature: &Path) -> Result<()> {
+    fn check(
+        &self,
+        origin: Origin<'_>,
+        expected_id: &ExtensionId,
+        expected_version: &Version,
+        package: &Path,
+        signature: &Path,
+    ) -> Result<Verified> {
         let (key, rejected) = match origin {
             Origin::BuiltIn => (
                 &self.project_key,
@@ -316,6 +473,13 @@ impl TrustStore {
                 ),
             ),
             Origin::Publisher(publisher) => {
+                if expected_id.as_str().split('.').next() != Some(publisher) {
+                    return Err(Error::policy(format!(
+                        "{}: extension `{expected_id}` is not an extension of publisher \
+                         `{publisher}`: the first segment of the id must be the publisher name",
+                        package.display()
+                    )));
+                }
                 let key = self.pins.get(publisher).ok_or_else(|| {
                     Error::policy(format!(
                         "{}: publisher `{publisher}` has no pinned key; \
@@ -334,10 +498,21 @@ impl TrustStore {
                 )
             }
         };
-        verify(package, signature, key).map_err(|error| match error.category() {
-            ErrorCategory::Policy => Error::policy(rejected).with_source(error),
-            _ => error,
-        })
+        let (trusted_comment, file) =
+            verify_signature(package, signature, key).map_err(|error| match error.category() {
+                ErrorCategory::Policy => Error::policy(rejected).with_source(error),
+                _ => error,
+            })?;
+        let verified = bound_package(&trusted_comment, signature, file)?;
+        if verified.id != *expected_id || verified.version != *expected_version {
+            return Err(Error::policy(format!(
+                "{}: the signature is for `{}`, not for `{}`",
+                package.display(),
+                binding(&verified.id, &verified.version),
+                binding(expected_id, expected_version)
+            )));
+        }
+        Ok(verified)
     }
 
     /// Reads the pinned keys from the TOML file `path`. A file that does not
@@ -349,15 +524,16 @@ impl TrustStore {
     /// # Errors
     ///
     /// Returns a `user` error that names `path` if the file cannot be read,
-    /// is not valid TOML, has another [`SCHEMA_VERSION`], has an unknown key,
-    /// or holds an invalid publisher name or public key.
+    /// is larger than 1 MiB, is not valid TOML, has another
+    /// [`SCHEMA_VERSION`], has an unknown key, or holds an invalid publisher
+    /// name or public key.
     pub fn load(project_key: PublicKey, path: &Path) -> Result<Self> {
         let mut store = Self::new(project_key);
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(store),
-            Err(error) => return Err(io_error(path, "cannot read the trust store file", error)),
-        };
+        if matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(store);
+        }
+        let text = read_text_file(path, "trust store", TRUST_FILE_MAX_BYTES)?;
         let invalid = |reason: String| Error::user(format!("{}: {reason}", path.display()));
 
         let mut table: Table = text
@@ -396,13 +572,27 @@ impl TrustStore {
     ///
     /// The write is atomic: the content goes to a temporary file in the same
     /// directory, and that file then replaces `path`. A failed write leaves
-    /// the old file as it was. This is blocking I/O.
+    /// the old file as it was. On Unix the file can be read and written by
+    /// its owner only (mode 0600). This is blocking I/O.
+    ///
+    /// Two processes that load, change and save at the same time lose the
+    /// pin of one of them. That publisher is then refused until it is pinned
+    /// again.
     ///
     /// # Errors
     ///
-    /// Returns a `user` error that names `path` if the file cannot be
-    /// written.
+    /// Returns a `user` error that names `path` if `path` is a symbolic link
+    /// or the file cannot be written. A symbolic link is refused because the
+    /// write would replace the link and leave its target unchanged.
     pub fn save(&self, path: &Path) -> Result<()> {
+        // shortcut: no lock file, two concurrent writers lose one pin (fails
+        // closed); add a lock when a second process can pin keys.
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+            return Err(Error::user(format!(
+                "{}: the trust store file must not be a symbolic link",
+                path.display()
+            )));
+        }
         let publishers = self
             .pins
             .iter()
@@ -432,16 +622,16 @@ impl TrustStore {
     }
 }
 
-/// Reads a small text file: a key or a signature. `what` names the kind of
-/// file in the error.
-fn read_text_file(path: &Path, what: &str) -> Result<String> {
+/// Reads a text file of at most `max_bytes`: a key, a signature or the trust
+/// store. `what` names the kind of file in the error.
+fn read_text_file(path: &Path, what: &str, max_bytes: u64) -> Result<String> {
     let mut text = String::new();
     File::open(path)
-        .and_then(|file| file.take(TEXT_FILE_MAX_BYTES + 1).read_to_string(&mut text))
+        .and_then(|file| file.take(max_bytes + 1).read_to_string(&mut text))
         .map_err(|error| io_error(path, &format!("cannot read the {what} file"), error))?;
-    if text.len() as u64 > TEXT_FILE_MAX_BYTES {
+    if text.len() as u64 > max_bytes {
         return Err(Error::user(format!(
-            "{}: too large for a minisign {what} file",
+            "{}: too large for a {what} file",
             path.display()
         )));
     }
@@ -475,11 +665,15 @@ mod tests {
         /// The text of a prehashed signature of `data`, as `minisign -S`
         /// writes it.
         fn sign(&self, data: &[u8]) -> String {
+            self.sign_with(data, TRUSTED_COMMENT)
+        }
+
+        fn sign_with(&self, data: &[u8], trusted_comment: &str) -> String {
             minisign::sign(
                 Some(&self.pair.pk),
                 &self.pair.sk,
                 data,
-                Some(TRUSTED_COMMENT),
+                Some(trusted_comment),
                 None,
             )
             .unwrap()
@@ -488,7 +682,15 @@ mod tests {
     }
 
     const PACKAGE: &[u8] = b"rivet test package\n";
-    const TRUSTED_COMMENT: &str = "file:acme.postgres-1.0.0.rivetpkg";
+    const TRUSTED_COMMENT: &str = "rivet-package id=acme.postgres version=1.0.0";
+
+    fn id() -> ExtensionId {
+        "acme.postgres".parse().unwrap()
+    }
+
+    fn version() -> Version {
+        Version::new(1, 0, 0)
+    }
 
     /// A directory with a package file and its signature file.
     struct Files {
@@ -544,7 +746,14 @@ mod tests {
     fn valid_signature_verifies() {
         let key = TestKey::new();
         let f = files(PACKAGE, &key.sign(PACKAGE));
-        verify(&f.package, &f.signature, &key.public).unwrap();
+        let verified = verify(&f.package, &f.signature, &key.public).unwrap();
+        assert_eq!((verified.id(), verified.version()), (&id(), &version()));
+
+        // The handle gives the verified bytes, also after the path changed.
+        std::fs::remove_file(&f.package).unwrap();
+        let mut bytes = Vec::new();
+        verified.into_file().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, PACKAGE);
     }
 
     #[test]
@@ -771,7 +980,13 @@ mod tests {
 
         // A valid signature does not pin the key.
         assert_error(
-            store.verify_package(Origin::Publisher("acme"), &f.package, &f.signature),
+            store.verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            ),
             ErrorCategory::Policy,
             &["publisher `acme`", "no pinned key", &shown(&f.package)],
         );
@@ -780,7 +995,13 @@ mod tests {
         // The explicit confirmation of the caller.
         store.pin("acme", acme.public.clone()).unwrap();
         store
-            .verify_package(Origin::Publisher("acme"), &f.package, &f.signature)
+            .verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            )
             .unwrap();
     }
 
@@ -793,17 +1014,31 @@ mod tests {
 
         let f = files(PACKAGE, &new_key.sign(PACKAGE));
         assert_error(
-            store.verify_package(Origin::Publisher("acme"), &f.package, &f.signature),
+            store.verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            ),
             ErrorCategory::Policy,
             &["publisher `acme`", "new review", &shown(&f.package)],
         );
         // The rejected key was not pinned.
         assert_eq!(store.pinned("acme"), Some(&acme.public));
 
-        // After the review, the caller pins the new key.
-        store.pin("acme", new_key.public.clone()).unwrap();
+        // After the review, the caller replaces the pin with the new key.
         store
-            .verify_package(Origin::Publisher("acme"), &f.package, &f.signature)
+            .replace_pin_after_review("acme", new_key.public.clone())
+            .unwrap();
+        store
+            .verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            )
             .unwrap();
     }
 
@@ -819,7 +1054,13 @@ mod tests {
         for signer in [&project, &other] {
             let f = files(PACKAGE, &signer.sign(PACKAGE));
             assert_error(
-                store.verify_package(Origin::Publisher("acme"), &f.package, &f.signature),
+                store.verify_package(
+                    Origin::Publisher("acme"),
+                    &id(),
+                    &version(),
+                    &f.package,
+                    &f.signature,
+                ),
                 ErrorCategory::Policy,
                 &["publisher `acme`", "new review"],
             );
@@ -835,16 +1076,22 @@ mod tests {
 
         let f = files(PACKAGE, &project.sign(PACKAGE));
         store
-            .verify_package(Origin::BuiltIn, &f.package, &f.signature)
+            .verify_package(Origin::BuiltIn, &id(), &version(), &f.package, &f.signature)
             .unwrap();
 
         // A pinned publisher key does not make a package a built-in.
         let f = files(PACKAGE, &acme.sign(PACKAGE));
         store
-            .verify_package(Origin::Publisher("acme"), &f.package, &f.signature)
+            .verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            )
             .unwrap();
         assert_error(
-            store.verify_package(Origin::BuiltIn, &f.package, &f.signature),
+            store.verify_package(Origin::BuiltIn, &id(), &version(), &f.package, &f.signature),
             ErrorCategory::Policy,
             &["built-in", "project key", &shown(&f.package)],
         );
@@ -857,7 +1104,13 @@ mod tests {
         store.pin("acme", acme.public.clone()).unwrap();
         let f = files(PACKAGE, "not a signature\n");
         assert_error(
-            store.verify_package(Origin::Publisher("acme"), &f.package, &f.signature),
+            store.verify_package(
+                Origin::Publisher("acme"),
+                &id(),
+                &version(),
+                &f.package,
+                &f.signature,
+            ),
             ErrorCategory::User,
             &[&shown(&f.signature)],
         );
@@ -866,7 +1119,7 @@ mod tests {
     #[test]
     fn invalid_publisher_name_is_refused() {
         let key = TestKey::new().public;
-        let mut store = TrustStore::new(key.clone());
+        let mut store = TrustStore::new(TestKey::new().public);
         for name in ["", "Acme", "acme corp", "acme\n", "-acme", "a..b"] {
             assert_error(
                 store.pin(name, key.clone()),
@@ -894,7 +1147,9 @@ mod tests {
         );
 
         // A second save replaces the file and leaves no temporary file.
-        store.pin("acme", TestKey::new().public).unwrap();
+        store
+            .replace_pin_after_review("acme", TestKey::new().public)
+            .unwrap();
         store.save(&path).unwrap();
         assert_eq!(TrustStore::load(project.public, &path).unwrap(), store);
         let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
@@ -983,6 +1238,243 @@ mod tests {
         );
     }
 
+    // --- review findings R-29, R-31 ---------------------------------------
+
+    #[test]
+    fn pin_refuses_a_different_key_and_accepts_the_same_key_again() {
+        let first = TestKey::new().public;
+        let mut store = TrustStore::new(TestKey::new().public);
+        store.pin("acme", first.clone()).unwrap();
+        store.pin("acme", first.clone()).unwrap();
+        assert_error(
+            store.pin("acme", TestKey::new().public),
+            ErrorCategory::Policy,
+            &["publisher `acme`", "new review"],
+        );
+        assert_eq!(store.pinned("acme"), Some(&first));
+
+        // The explicit replacement after a new review.
+        let second = TestKey::new().public;
+        store
+            .replace_pin_after_review("acme", second.clone())
+            .unwrap();
+        assert_eq!(store.pinned("acme"), Some(&second));
+        assert_error(
+            store.replace_pin_after_review("other", second),
+            ErrorCategory::Policy,
+            &["publisher `other`", "no pinned key"],
+        );
+        assert_error(
+            store.replace_pin_after_review("acme", store.project_key().clone()),
+            ErrorCategory::Policy,
+            &["project key"],
+        );
+    }
+
+    #[test]
+    fn project_key_cannot_be_pinned_for_a_publisher() {
+        let project = TestKey::new().public;
+        let mut store = TrustStore::new(project.clone());
+        assert_error(
+            store.pin("acme", project.clone()),
+            ErrorCategory::Policy,
+            &["publisher `acme`", "project key"],
+        );
+        assert_eq!(store.pinned("acme"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.toml");
+        let text = format!("schema_version = 1\n[publishers]\nacme = \"{project}\"\n");
+        std::fs::write(&path, text).unwrap();
+        assert_error(
+            TrustStore::load(project, &path),
+            ErrorCategory::User,
+            &[&shown(&path), "publisher `acme`", "project key"],
+        );
+    }
+
+    #[test]
+    fn key_with_the_same_key_id_and_other_key_bytes_is_rejected() {
+        let key = TestKey::new();
+        let base64 = key.pair.pk.to_base64();
+        // The key is 2 bytes algorithm id, 8 bytes key id, 32 bytes key.
+        // Base64 characters from index 14 hold key bytes only.
+        let same_id: PublicKey = change_line(&base64, 0, 20).trim().parse().unwrap();
+        assert_eq!(same_id.to_string()[..14], base64[..14]);
+        assert_ne!(same_id, key.public);
+
+        let f = files(PACKAGE, &key.sign(PACKAGE));
+        assert_error(
+            verify(&f.package, &f.signature, &same_id),
+            ErrorCategory::Policy,
+            &["does not verify"],
+        );
+    }
+
+    // Fixed vectors of the reference minisign tool, copied from the tests
+    // `verify_prehashed` and `verify` in `src/lib.rs` of the crate
+    // `minisign-verify` 0.3.0. Both sign the 4 bytes `test`.
+    const VECTOR_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    const VECTOR_PREHASHED: &str = "untrusted comment: signature from minisign secret key\n\
+        RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/\
+        z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n\
+        trusted comment: timestamp:1556193335\tfile:test\n\
+        y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==\n";
+    const VECTOR_LEGACY: &str = "untrusted comment: signature from minisign secret key\n\
+        RWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\n\
+        trusted comment: timestamp:1555779966\tfile:test\n\
+        QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==\n";
+
+    #[test]
+    fn signature_with_a_trusted_comment_in_another_format_is_rejected() {
+        // R-30: the vector has the trusted comment `timestamp:…\tfile:test`.
+        let f = files(b"test", VECTOR_PREHASHED);
+        assert_error(
+            verify(&f.package, &f.signature, &VECTOR_KEY.parse().unwrap()),
+            ErrorCategory::Policy,
+            &[&shown(&f.signature), "trusted comment"],
+        );
+    }
+
+    #[test]
+    fn real_prehashed_signature_of_the_reference_tool_verifies() {
+        let f = files(b"test", VECTOR_PREHASHED);
+        let key = VECTOR_KEY.parse().unwrap();
+        let (trusted_comment, _) = verify_signature(&f.package, &f.signature, &key).unwrap();
+        assert_eq!(trusted_comment, "timestamp:1556193335\tfile:test");
+
+        std::fs::write(&f.package, b"Test").unwrap();
+        assert_error(
+            verify_signature(&f.package, &f.signature, &key),
+            ErrorCategory::Policy,
+            &["does not verify"],
+        );
+    }
+
+    #[test]
+    fn trusted_comment_must_be_the_one_canonical_text() {
+        let key = TestKey::new();
+        for comment in [
+            "",
+            "file:acme.postgres-1.0.0.rivetpkg",
+            "rivet-package id=acme.postgres",
+            "rivet-package version=1.0.0 id=acme.postgres",
+            "rivet-package id=acme.postgres  version=1.0.0",
+            "rivet-package id=acme.postgres version=1.0.0 ",
+            " rivet-package id=acme.postgres version=1.0.0",
+            "rivet-package id=Acme version=1.0.0",
+            "rivet-package id=acme.postgres version=1.0",
+            "rivet-package id=acme.postgres version=1.0.0 version=2.0.0",
+            "timestamp:1\trivet-package id=acme.postgres version=1.0.0",
+        ] {
+            let f = files(PACKAGE, &key.sign_with(PACKAGE, comment));
+            assert_error(
+                verify(&f.package, &f.signature, &key.public),
+                ErrorCategory::Policy,
+                &[&shown(&f.signature), "trusted comment"],
+            );
+        }
+    }
+
+    #[test]
+    fn signature_for_another_id_or_version_is_rejected() {
+        let acme = TestKey::new();
+        let mut store = TrustStore::new(TestKey::new().public);
+        store.pin("acme", acme.public.clone()).unwrap();
+        // A pinned key of `other` does not make `acme.postgres` its extension.
+        store.pin("other", acme.public.clone()).unwrap();
+        let f = files(PACKAGE, &acme.sign(PACKAGE));
+        let verify = |origin, id: &str, version: &str| {
+            store.verify_package(
+                origin,
+                &id.parse().unwrap(),
+                &version.parse().unwrap(),
+                &f.package,
+                &f.signature,
+            )
+        };
+
+        let verified = verify(Origin::Publisher("acme"), "acme.postgres", "1.0.0").unwrap();
+        assert_eq!((verified.id(), verified.version()), (&id(), &version()));
+
+        // Rollback: the signature of 1.0.0 does not install as 2.0.0.
+        assert_error(
+            verify(Origin::Publisher("acme"), "acme.postgres", "2.0.0"),
+            ErrorCategory::Policy,
+            &["version=1.0.0", "version=2.0.0", &shown(&f.package)],
+        );
+        // Substitution: the signature does not install under another id.
+        assert_error(
+            verify(Origin::Publisher("acme"), "acme.mysql", "1.0.0"),
+            ErrorCategory::Policy,
+            &["id=acme.postgres", "id=acme.mysql"],
+        );
+        // The publisher is the first segment of the id (ADR-0019).
+        assert_error(
+            verify(Origin::Publisher("other"), "acme.postgres", "1.0.0"),
+            ErrorCategory::Policy,
+            &["publisher `other`", "first segment"],
+        );
+        assert_error(
+            verify(Origin::Publisher("acme"), "acmex.postgres", "1.0.0"),
+            ErrorCategory::Policy,
+            &["first segment"],
+        );
+    }
+
+    #[test]
+    fn real_legacy_signature_of_the_reference_tool_is_a_user_error() {
+        let f = files(b"test", VECTOR_LEGACY);
+        assert_error(
+            verify(&f.package, &f.signature, &VECTOR_KEY.parse().unwrap()),
+            ErrorCategory::User,
+            &[&shown(&f.signature), "legacy"],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_trust_store_file_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.toml");
+        TrustStore::new(TestKey::new().public).save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.toml");
+        let path = dir.path().join("trust.toml");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert_error(
+            TrustStore::new(TestKey::new().public).save(&path),
+            ErrorCategory::User,
+            &[&shown(&path), "symbolic link"],
+        );
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn oversized_trust_store_file_is_refused() {
+        let key = TestKey::new().public;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.toml");
+        let text = format!("schema_version = 1\n#{}\n", "x".repeat(1024 * 1024));
+        std::fs::write(&path, text).unwrap();
+        assert_error(
+            TrustStore::load(key, &path),
+            ErrorCategory::User,
+            &[&shown(&path), "too large"],
+        );
+    }
+
     #[tokio::test]
     async fn verification_runs_on_the_blocking_pool() {
         let project = TestKey::new();
@@ -991,7 +1483,7 @@ mod tests {
 
         let (package, signature) = (f.package.clone(), f.signature.clone());
         tokio::task::spawn_blocking(move || {
-            store.verify_package(Origin::BuiltIn, &package, &signature)
+            store.verify_package(Origin::BuiltIn, &id(), &version(), &package, &signature)
         })
         .await
         .unwrap()
