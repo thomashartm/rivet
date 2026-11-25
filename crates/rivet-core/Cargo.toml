@@ -10,6 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+arrow-array = { version = "60.2.0", default-features = false }
+futures-core = "0.3.34"
 keyring = "4.2.0"
 minisign-verify = "=0.3.0"
 rivet-sdk = { path = "../rivet-sdk" }

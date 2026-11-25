@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod execute;
 pub mod host;
 pub mod install;
 pub mod jobs;
