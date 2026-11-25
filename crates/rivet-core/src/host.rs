@@ -687,9 +687,9 @@ fn scan(directories: &[PathBuf]) -> Scan {
 
 /// How the wait for a call into extension code ended.
 enum Limited<T> {
-    /// The call ended in the time limit.
+    /// The call ended in the time limit, or it ended later with an error.
     Ended(Result<T>),
-    /// The call ended after the time limit, with this result: it did not
+    /// The call ended after the time limit, with this `Ok` result: it did not
     /// return to the runtime, so the runtime could not end the wait.
     Late(Result<T>),
     /// The call still runs. The runtime was asked to stop it.
@@ -707,9 +707,11 @@ async fn joined<T>(
     // On a runtime with one thread, a call that does not return to the
     // runtime also stops the timer of the limit. Thus the real time is
     // compared again after the call.
+    // An error that comes late stays: it says more than the limit (the
+    // runtime ends a call at the same limit with its own error).
     let start = std::time::Instant::now();
     match tokio::time::timeout(limit, &mut *task).await {
-        Ok(Ok(result)) if start.elapsed() > limit => Limited::Late(result),
+        Ok(Ok(Ok(value))) if start.elapsed() > limit => Limited::Late(Ok(value)),
         Ok(Ok(result)) => Limited::Ended(result),
         Ok(Err(error)) => {
             let message = format!("extension `{id}` {} in `{what}`", ended(&error));
