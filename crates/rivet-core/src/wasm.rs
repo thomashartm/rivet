@@ -144,9 +144,10 @@ pub const DEFAULT_FUEL_PER_CALL: u64 = 1_000_000_000;
 
 /// The default of [`Limits::component_bytes`]: 4 MiB (ADR-0018).
 ///
-/// A debug build of the host compiles a component of this size for longer
-/// than the default call time limit (ADR-0018: 35 to 64 s), so that load
-/// fails.
+/// ADR-0018 gives 35 to 64 s for a debug build to compile a component of
+/// this size. That number was measured without the optimised compiler
+/// crates of the dev profile (root `Cargo.toml`); with them a generated
+/// component of 4 MiB compiled in about 1.5 s.
 pub const DEFAULT_COMPONENT_BYTES: usize = 4 << 20;
 
 /// The most core instances that one instance of a component can have.
