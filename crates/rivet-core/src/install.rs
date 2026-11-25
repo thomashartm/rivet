@@ -473,7 +473,13 @@ impl Installer {
         let _lock = self.lock(id)?;
         self.repair(id)?;
         // A record that cannot be read or is for another version is no review.
-        let record = fs::read_to_string(self.store(id).join(REVIEW_FILE)).unwrap_or_default();
+        // A regular file within the limit: a FIFO would block with the lock held.
+        let record = read_text_file(
+            &self.store(id).join(REVIEW_FILE),
+            "review record",
+            JOURNAL_MAX_BYTES,
+        )
+        .unwrap_or_default();
         if record.trim().parse::<Version>().ok().as_ref() != Some(version) {
             return Err(Error::policy(format!(
                 "extension `{id}`: no review waits for version {version}; update to it first"
@@ -2686,6 +2692,18 @@ mod tests {
 
         fs::write(&previous, "1.0.0\n").unwrap();
         assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_review_record_that_is_a_fifo_is_no_review() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        mkfifo(&f.store().join(REVIEW_FILE));
+        let result = within_10_seconds(&f, |installer| {
+            installer.activate_after_review(&id(), &v("1.0.0"))
+        });
+        assert_error(result, ErrorCategory::Policy, "no review waits");
     }
 
     /// `true` if the tests run as root: root ignores the mode of a directory.
