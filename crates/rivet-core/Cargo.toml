@@ -11,3 +11,8 @@ workspace = true
 
 [dependencies]
 rivet-sdk = { path = "../rivet-sdk" }
+semver = "1.0.28"
+tokio = { version = "1.54.1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
