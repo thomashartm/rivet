@@ -2032,6 +2032,7 @@ mod tests {
     use super::*;
     use crate::bus::{Received, Subscription};
     use crate::jobs::JobHandle;
+    use crate::logging::{Capture, Level, LogFormat, Redactor, capture_logs};
     use crate::secrets::{SecretBackend, SecretFuture};
     use rivet_sdk::error::ErrorCategory;
     use rivet_sdk::secret::Secret;
@@ -2332,6 +2333,14 @@ mod tests {
 
     fn id(text: &str) -> ExtensionId {
         text.parse().unwrap()
+    }
+
+    /// A log output and a subscriber that writes each line from `WARN` up
+    /// to it. `capture_logs` makes it the subscriber of one thread.
+    fn log() -> (Capture, tracing::Dispatch) {
+        let capture = Capture::default();
+        let dispatch = capture.dispatch(Level::WARN, LogFormat::Human, &Redactor::new());
+        (capture, dispatch)
     }
 
     /// A manifest that activates on the command with the name of the id.
@@ -3751,6 +3760,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_in_the_unload_of_an_instance_is_contained() {
+        let (log, dispatch) = log();
+        let _guard = capture_logs(&dispatch);
         let mut f = fixture(true);
         f.add("a", &[]);
         f.add("c", &[]);
@@ -3783,6 +3794,19 @@ mod tests {
         assert_eq!(f.state("a"), Some(Failed));
         // The host works.
         assert_eq!(f.go("c").await.activated, [id("c")]);
+        // Each of the two panics is in the log, with the extension.
+        let log = log.text();
+        let failed = "unload of the extension failed";
+        let lines: Vec<&str> = log.lines().filter(|line| line.contains(failed)).collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for line in lines {
+            assert!(line.contains("ERROR"), "{line}");
+            assert!(line.contains("extension=a"), "{line}");
+            assert!(
+                line.contains("extension `a` panicked in `unload`"),
+                "{line}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4481,12 +4505,24 @@ mod tests {
         f.fake.set("unload b", Some(Mode::Panic));
         f.fake.take_calls();
         let Fixture { host, fake, .. } = f;
+        let (log, dispatch) = log();
 
-        let dropped = std::thread::spawn(move || drop(host)).join();
+        let dropped = std::thread::spawn(move || {
+            let _guard = capture_logs(&dispatch);
+            drop(host);
+        });
 
-        assert!(dropped.is_ok(), "the drop of the host panicked");
+        assert!(dropped.join().is_ok(), "the drop of the host panicked");
         // The dependent first.
         assert_eq!(fake.take_calls(), ["unload b", "unload a"]);
+        let log = log.text();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for (line, extension) in lines.iter().zip(["extension=b", "extension=a"]) {
+            assert!(line.contains("ERROR"), "{line}");
+            assert!(line.contains("unload of the extension panicked"), "{line}");
+            assert!(line.contains(extension), "{line}");
+        }
     }
 
     #[tokio::test]
@@ -4568,54 +4604,71 @@ mod tests {
         assert_eq!(f.registered("a").await, (false, false));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_call_that_ends_after_the_restart_does_not_release_the_new_instance() {
-        // The test controls the order: the automatic restart is too late,
-        // and the old call ends when the test permits it.
-        let config = HostConfig {
-            call_timeout: 50 * MS,
-            backoff_initial: Duration::from_secs(3600),
-            backoff_max: Duration::from_secs(3600),
-            ..HostConfig::default()
-        };
-        let f = fixture_with(true, config);
-        f.add("a", &[]);
-        f.host.discover().await.unwrap();
-        f.fake.set("activate a", Some(Mode::Block));
-        f.fake.set("hold activate a", Some(Mode::Fail));
-        f.fake.set("late a", Some(Mode::Fail));
+    #[test]
+    fn a_call_that_ends_after_the_restart_does_not_release_the_new_instance() {
+        // The host writes the log line in a task, thus on a worker thread:
+        // each thread of this runtime gets the subscriber for its life.
+        let (log, dispatch) = log();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(move || std::mem::forget(capture_logs(&dispatch)))
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // The test controls the order: the automatic restart is too late,
+            // and the old call ends when the test permits it.
+            let config = HostConfig {
+                call_timeout: 50 * MS,
+                backoff_initial: Duration::from_secs(3600),
+                backoff_max: Duration::from_secs(3600),
+                ..HostConfig::default()
+            };
+            let f = fixture_with(true, config);
+            f.add("a", &[]);
+            f.host.discover().await.unwrap();
+            f.fake.set("activate a", Some(Mode::Block));
+            f.fake.set("hold activate a", Some(Mode::Fail));
+            f.fake.set("late a", Some(Mode::Fail));
 
-        let report = f.go("a").await;
+            let report = f.go("a").await;
 
-        f.fake.set("activate a", None);
-        f.fake.set("late a", None);
-        assert!(report.not_activated.contains_key(&id("a")));
-        // The restart does not wait for the old call.
-        f.host.restart(&id("a")).await.unwrap();
-        assert_eq!(f.state("a"), Some(Active));
-        assert_eq!(f.fake.count("unload a"), 0);
-        f.fake.set("hold activate a", None);
-        f.fake.called("unload a").await;
-        // One unload: the old instance, in a blocking task.
-        assert_eq!(
-            f.fake.take_calls(),
-            [
-                "load a@1.0.0",
-                "activate a",
-                "load a@1.0.0",
-                "activate a",
-                "unload a"
-            ]
-        );
-        // The new instance keeps what it registered. What the old call
-        // registered at its end stays also, until the next stop.
-        assert_eq!(f.registered("a").await, (true, true));
-        assert_eq!(f.late("a").await, (1, true, true, true));
-        f.fake.set("late a", Some(Mode::Fail));
-        f.host.deactivate(&id("a")).await.unwrap();
-        // `late` took the subscription. The job, service and command are gone.
-        assert_eq!(f.late("a").await, (0, false, false, false));
-        assert_eq!(f.registered("a").await, (false, false));
+            f.fake.set("activate a", None);
+            f.fake.set("late a", None);
+            assert!(report.not_activated.contains_key(&id("a")));
+            // The restart does not wait for the old call.
+            f.host.restart(&id("a")).await.unwrap();
+            assert_eq!(f.state("a"), Some(Active));
+            assert_eq!(f.fake.count("unload a"), 0);
+            f.fake.set("hold activate a", None);
+            f.fake.called("unload a").await;
+            // One unload: the old instance, in a blocking task.
+            assert_eq!(
+                f.fake.take_calls(),
+                [
+                    "load a@1.0.0",
+                    "activate a",
+                    "load a@1.0.0",
+                    "activate a",
+                    "unload a"
+                ]
+            );
+            // The new instance keeps what it registered. What the old call
+            // registered at its end stays also, until the next stop.
+            assert_eq!(f.registered("a").await, (true, true));
+            assert_eq!(f.late("a").await, (1, true, true, true));
+            f.fake.set("late a", Some(Mode::Fail));
+            f.host.deactivate(&id("a")).await.unwrap();
+            // `late` took the subscription. The job, service and command are gone.
+            assert_eq!(f.late("a").await, (0, false, false, false));
+            assert_eq!(f.registered("a").await, (false, false));
+        });
+        let log = log.text();
+        let late = "a call that exceeded the time limit ended after the restart";
+        let lines: Vec<&str> = log.lines().filter(|line| line.contains(late)).collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("WARN"), "{log}");
+        assert!(lines[0].contains("extension=a"), "{log}");
     }
 
     #[tokio::test]
@@ -4733,6 +4786,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_blocking_job_that_ignores_the_cancel_request_does_not_stop_the_unload() {
+        let (log, dispatch) = log();
+        let _guard = capture_logs(&dispatch);
         let grace = crate::jobs::JobConfig::default().cancel_grace;
         let f = fixture(true);
         f.add("a", &[]);
@@ -4765,5 +4820,12 @@ mod tests {
         assert_eq!(blocking.state, crate::jobs::JobState::Cancelled);
         assert_eq!(running, 1);
         assert_eq!(f.registered("a").await, (false, false));
+        // The log has the limit, one time: the release of the deactivation.
+        let log = log.text();
+        let limit = "the code of aborted jobs has not stopped";
+        let lines: Vec<&str> = log.lines().filter(|line| line.contains(limit)).collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("WARN"), "{log}");
+        assert!(lines[0].contains("extension=a jobs=1"), "{log}");
     }
 }
