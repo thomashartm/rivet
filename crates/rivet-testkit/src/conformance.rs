@@ -199,9 +199,13 @@ impl Sql {
             StringArray::from(vec![Some("12.50"), None]),
             Some("decimal"),
         ));
-        // Three joins of a system view: more rows than a test can read.
-        let columns = "information_schema.columns a, information_schema.columns b, \
-                       information_schema.columns c";
+        // 1000^4 rows: more than a test can read. Not a system view: the
+        // plan of three `information_schema` views takes 10 s or more.
+        // `NO_BNL`: a nested loop gives the first row at once; a hash join
+        // first builds 1000^3 rows.
+        let numbers = "with recursive t(n) as \
+                       (select 1 union all select n + 1 from t where n < 1000)";
+        let rows = "from t a, t b, t c, t d";
         Self {
             dialect: Dialect::new("mysql", '`'),
             ping: "select 1".to_owned(),
@@ -222,9 +226,9 @@ impl Sql {
                 .to_owned(),
             type_columns,
             empty: "select 1 from dual where false".to_owned(),
-            endless: format!("select a.ordinal_position from {columns}"),
+            endless: format!("{numbers} select /*+ NO_BNL() */ a.n {rows}"),
             // KILL QUERY stops it with an error. `sleep()` would return 1.
-            slow: format!("select count(*) from {columns}"),
+            slow: format!("{numbers} select /*+ NO_BNL() */ count(*) {rows}"),
             syntax_error: "this is not sql".to_owned(),
         }
     }
