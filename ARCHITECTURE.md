@@ -214,6 +214,7 @@ stateDiagram-v2
 - As built, the extension host differs from this diagram in two points ([ADR-0017](docs/adr/0017-extension-host-lifecycle.md), Proposed):
   - a failed activation goes from `Resolved` or `Inactive` directly to `Failed` (since PR #121);
   - an extension in `Resolved` or `Rejected` can be removed and discovered again.
+- Proposed, not on `main` on this date (ADR-0017 row f, PR #131): an explicit unload or reload can also remove an extension in `Failed` or `Disabled`. A reload then reads the package again and gives `Resolved` or `Rejected`.
 - As built, if two discovery directories contain the same extension id, the later directory wins: bundled < user < workspace. ADR-0017 proposes to limit this when signature checks exist.
 - Hot reload = deactivate, unload, load new version, activate. Open handles of the old version MUST be closed or migrated before unload.
 
@@ -510,3 +511,4 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 21 | Extension supervision (Proposed) | Restart with backoff from 100 ms to 1 s, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
 | 22 | Short secrets in logs (Proposed) | Values shorter than 4 bytes are not redacted; a warning is logged | [0022](docs/adr/0022-short-secrets-not-redacted.md) |
 | 23 | Package format and install layout (Proposed) | Uncompressed tar with three fixed entries; store plus active directory; journal for update and rollback | [0023](docs/adr/0023-package-format-and-install-layout.md) |
+| 24 | Native process runtime (Proposed) | One child process per native extension; JSON lines over standard input and output; empty environment | [0024](docs/adr/0024-native-process-runtime.md) |

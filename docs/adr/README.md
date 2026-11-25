@@ -25,6 +25,7 @@
 | [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Proposed |
 | [0022](0022-short-secrets-not-redacted.md) | Secrets shorter than 4 bytes are not redacted in logs | Proposed |
 | [0023](0023-package-format-and-install-layout.md) | Package format and install layout | Proposed |
+| [0024](0024-native-process-runtime.md) | Native process runtime: protocol and supervision | Proposed |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
