@@ -59,6 +59,9 @@ const DATABASE: &str = "rivet_test";
 const POSTGRES_PORT: u16 = 54329;
 const MYSQL_PORT: u16 = 33069;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a PostgreSQL server must stay silent after its answer to the
+/// `SSLRequest`.
+const POSTGRES_SILENCE: Duration = Duration::from_millis(100);
 
 /// Decides from the value of [`CONTAINERS_SWITCH`] if the container tests
 /// run. `None` means that the variable is not set.
@@ -115,16 +118,38 @@ async fn probe(postgres: bool, stream: &mut TcpStream) -> std::io::Result<Option
         stream.write_all(&POSTGRES_SSL_REQUEST).await?;
         // `S`: the server accepts TLS. `N`: it does not. Both are PostgreSQL.
         let answer = stream.read_u8().await?;
-        (!matches!(answer, b'S' | b'N'))
-            .then(|| format!("the answer to SSLRequest was byte {answer}, not `S` or `N`"))
+        if matches!(answer, b'S' | b'N') {
+            // PostgreSQL now waits for the client. A server that sends more
+            // is of another type: an SSH banner starts with `S` too.
+            match tokio::time::timeout(POSTGRES_SILENCE, stream.read_u8()).await {
+                Err(_silent) => None,
+                Ok(more) => Some(format!(
+                    "the server sent byte {} after the answer to SSLRequest",
+                    more?
+                )),
+            }
+        } else {
+            Some(format!(
+                "the answer to SSLRequest was byte {answer}, not `S` or `N`"
+            ))
+        }
     } else {
         // Packet header (3 bytes length, 1 byte sequence), then the payload.
         let mut header = [0; 4];
         stream.read_exact(&mut header).await?;
         let version = stream.read_u8().await?;
-        (version != MYSQL_PROTOCOL_VERSION).then(|| {
-            format!("the first packet has protocol version {version}, not {MYSQL_PROTOCOL_VERSION}")
-        })
+        let [length @ .., sequence] = header;
+        if version != MYSQL_PROTOCOL_VERSION {
+            Some(format!(
+                "the first packet has protocol version {version}, not {MYSQL_PROTOCOL_VERSION}"
+            ))
+        } else if sequence != 0 {
+            Some(format!(
+                "the first packet has sequence number {sequence}, not 0"
+            ))
+        } else {
+            (length == [0; 3]).then(|| "the first packet has an empty payload".to_owned())
+        }
     };
     Ok(wrong)
 }
@@ -168,8 +193,8 @@ impl DatabaseFixture {
     ///
     /// | Engine | Check |
     /// | --- | --- |
-    /// | `postgres` | The server answers an `SSLRequest` with `S` or `N`. |
-    /// | `mysql` | The first packet of the server has protocol version 10. |
+    /// | `postgres` | The server answers an `SSLRequest` with `S` or `N` and then sends nothing. |
+    /// | `mysql` | The first packet of the server has sequence number 0, a payload and protocol version 10. |
     ///
     /// The check does not log in: it does not prove the user, the password
     /// or the database name. A real login is a part-2 item; it needs a
@@ -375,6 +400,8 @@ mod tests {
             let mut request = [0; 8];
             stream.read_exact(&mut request).await.unwrap();
             stream.write_all(b"N").await.unwrap();
+            // PostgreSQL keeps the connection open after the answer.
+            let _ = stream.read_u8().await;
             request
         };
         let (request, reachable) = tokio::join!(request, fixture.ensure_reachable());
@@ -409,6 +436,33 @@ mod tests {
             assert!(error.message().contains(reason), "{error:?}");
             assert!(error.message().contains(START_COMMAND), "{error:?}");
         }
+    }
+
+    /// R-56: one correct byte at the correct place is not enough.
+    #[tokio::test]
+    async fn server_with_one_matching_byte_is_not_reachable() {
+        let mut wrongly_reachable = Vec::new();
+        for (engine, answer, reason) in [
+            // An SSH banner starts with `S`.
+            (
+                "postgres",
+                &b"SSH-2.0-OpenSSH_9.9\r\n"[..],
+                "byte 83 after the answer to SSLRequest",
+            ),
+            // The fifth byte of each answer is 10, the MySQL protocol version.
+            ("mysql", b"+OK\r\n", "sequence number 13, not 0"),
+            ("mysql", b"PING\n", "sequence number 71, not 0"),
+            ("mysql", b"\x00\x00\x00\x00\x0a", "an empty payload"),
+        ] {
+            let fixture = server(engine, 0, answer).await;
+            let Err(error) = fixture.ensure_reachable().await else {
+                wrongly_reachable.push((engine, answer));
+                continue;
+            };
+            assert_eq!(error.category(), ErrorCategory::Connectivity);
+            assert!(error.message().contains(reason), "{error:?}");
+        }
+        assert_eq!(wrongly_reachable, []);
     }
 
     #[tokio::test]

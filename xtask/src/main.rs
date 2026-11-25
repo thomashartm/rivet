@@ -154,6 +154,7 @@ mod tests {
         let found = found(&metadata);
         assert!(found.contains(&("rivet-testkit", "rivet-core", false)));
         assert!(found.contains(&("rivet-testkit", "rivet-sdk", false)));
-        assert!(found.iter().all(|(from, _, _)| *from != "xtask"));
+        // ADR-0016 rule 5: the only edge that the xtask must not have.
+        assert!(!found.contains(&("xtask", "rivet-testkit", false)));
     }
 }
