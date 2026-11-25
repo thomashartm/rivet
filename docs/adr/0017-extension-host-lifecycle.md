@@ -5,7 +5,7 @@
 
 ## Context
 
-The extension host was merged with PR #109 (`crates/rivet-core/src/host.rs`). It differs from the diagram of ARCHITECTURE.md §4.4 in three points (rows b, c and, since PR #131, f: six transitions in the code that the diagram does not have), and it fixes three things that §4.4 leaves open (rows a, d and e). The signature check (#12) does not exist yet.
+The extension host was merged with PR #109 (`crates/rivet-core/src/host.rs`). It differs from the diagram of ARCHITECTURE.md §4.4 in three points (rows b, c and, since PR #131, f: six transitions in the code that the diagram does not have), and it fixes three things that §4.4 leaves open (rows a, d and e). The signature check exists for install (`package.rs`, `install.rs`, #12). The host does not verify a signature when it loads an extension (ticket #138).
 
 As built (read in the code on 2026-11-25):
 
