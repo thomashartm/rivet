@@ -89,6 +89,8 @@
 //!   registered stays until the next stop of the extension.
 //! - In both conditions the host unloads the old instance like each other
 //!   instance. The task that waits for the call keeps the host alive.
+//! - During a shutdown, the shutdown releases and unloads it, before the
+//!   other instances ([`ExtensionHost::shutdown`]).
 //!
 //! A runtime with one thread cannot end the wait for such a call. There the
 //! host compares the time after the call: a call that took longer than the
@@ -815,6 +817,12 @@ struct Inner {
     index: ActivationIndex,
     /// `true` after `shutdown`: the host activates nothing any more.
     stopped: bool,
+    /// The calls that exceeded the time limit and that the host follows
+    /// (`follow`), by a key. `Some` holds the instance of a call that ended
+    /// after the start of the shutdown: the shutdown unloads it.
+    late: BTreeMap<u64, (ExtensionId, Option<Box<dyn Send>>)>,
+    /// The key of the last entry in `late`.
+    late_key: u64,
 }
 
 impl Inner {
@@ -878,6 +886,9 @@ pub struct ExtensionHost {
     scanning: tokio::sync::Mutex<()>,
     /// Never held across an `.await`.
     inner: Mutex<Inner>,
+    /// Notified when a call in `Inner::late` ends after the start of the
+    /// shutdown.
+    late_ended: tokio::sync::Notify,
 }
 
 impl ExtensionHost {
@@ -925,7 +936,10 @@ impl ExtensionHost {
                 index: ActivationIndex::new(&resolution),
                 resolution,
                 stopped: false,
+                late: BTreeMap::new(),
+                late_key: 0,
             }),
+            late_ended: tokio::sync::Notify::new(),
         })
     }
 
@@ -1386,6 +1400,12 @@ impl ExtensionHost {
     /// The shutdown waits for the lifecycle operation that runs. The time
     /// limit of a call into an extension ([`HostConfig::call_timeout`])
     /// ends that wait.
+    ///
+    /// Before it drops the other instances, the shutdown waits for the
+    /// calls that exceeded the time limit and still run, and unloads their
+    /// instances. One [`HostConfig::call_timeout`] limits this wait for all
+    /// of them together. An extension whose call still runs after it is in
+    /// the result with an `internal` error, and its instance stays loaded.
     pub async fn shutdown(&self) -> BTreeMap<ExtensionId, Error> {
         let operation = self.operation(|host| async move { host.shutdown_locked().await });
         operation.await.unwrap_or_else(|error| {
@@ -1419,6 +1439,7 @@ impl ExtensionHost {
                 failures.insert(id, error);
             }
         }
+        self.unload_late(&mut failures).await;
         // Each instance, also of an extension that was `Inactive` before:
         // a child process lives as long as its instance (ADR-0021). The
         // states stay. Without this, the instances are dropped with the
@@ -1556,8 +1577,29 @@ impl ExtensionHost {
             return;
         };
         let id = id.clone();
+        let key = {
+            let mut inner = self.inner();
+            inner.late_key += 1;
+            let key = inner.late_key;
+            inner.late.insert(key, (id.clone(), None));
+            key
+        };
         tokio::spawn(async move {
             let result = task.await;
+            {
+                let mut inner = host.inner();
+                // The shutdown holds the lifecycle lock: it unloads the
+                // instance. Without the entry, the shutdown has returned.
+                if inner.stopped
+                    && let Some((_, held)) = inner.late.get_mut(&key)
+                {
+                    *held = Some(Box::new((result, keep)));
+                    drop(inner);
+                    host.late_ended.notify_waiters();
+                    return;
+                }
+                inner.late.remove(&key);
+            }
             // No operation changes the state between the check and the release.
             let _lifecycle = host.lifecycle.lock().await;
             let active = {
@@ -1572,6 +1614,41 @@ impl ExtensionHost {
             }
             host.drop_instance(&id, Some((result, keep))).await;
         });
+    }
+
+    /// Part of the shutdown: waits for the calls that exceeded the time
+    /// limit and still run, one `call_timeout` for all together. Then it
+    /// releases and unloads the instance of each call that ended. Each
+    /// call that still runs is a failure of its extension.
+    async fn unload_late(&self, failures: &mut BTreeMap<ExtensionId, Error>) {
+        let limit = self.config.call_timeout;
+        let deadline = Instant::now() + limit;
+        loop {
+            let ended = self.late_ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            let running = self.inner().late.values().any(|(_, held)| held.is_none());
+            if !running || tokio::time::timeout_at(deadline, ended).await.is_err() {
+                break;
+            }
+        }
+        let late = std::mem::take(&mut self.inner().late);
+        for (id, held) in late.into_values() {
+            match held {
+                Some(held) => {
+                    self.release(&id).await;
+                    self.drop_instance(&id, Some(held)).await;
+                }
+                None => {
+                    tracing::error!(extension = %id, "a call that exceeded the time limit still runs after the shutdown: its instance is not unloaded");
+                    let message = format!(
+                        "extension `{id}`: a call that exceeded the time limit did not end \
+                         in {limit:?} after the deactivation"
+                    );
+                    failures.entry(id).or_insert(Error::internal(message));
+                }
+            }
+        }
     }
 
     /// Unloads the instance of `id`: drops it in a blocking task, with the
@@ -3378,10 +3455,8 @@ mod tests {
     }
 
     // R-124: a `deactivate` call that ends after the time limit. The
-    // shutdown unloads the dependent before its dependency, and it returns
-    // with no instance left.
+    // shutdown waits for it and unloads the dependent before its dependency.
     #[tokio::test(start_paused = true)]
-    #[ignore = "waits for ruling"]
     async fn a_shutdown_unloads_a_dependent_whose_deactivation_ended_late_first() {
         let f = fixture(true);
         f.add("a", &[]);
@@ -3389,22 +3464,70 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("b").await;
         f.fake.take_calls();
-        f.fake.set("deactivate b", Some(Mode::Wait));
-        // The call of `b` ends one second after the time limit.
-        let fake = Arc::clone(&f.fake);
-        let late = HostConfig::default().call_timeout + Duration::from_secs(1);
-        tokio::spawn(async move {
-            tokio::time::sleep(late).await;
-            fake.gate.notify_one();
-        });
+        // The abort after the time limit ends the call; the host follows it
+        // like each late call.
+        f.fake.set("deactivate b", Some(Mode::Hang));
 
         let failures = f.host.shutdown().await;
 
         assert!(failures.contains_key(&id("b")), "{failures:?}");
+        assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(
             f.fake.take_calls(),
-            ["deactivate b", "unload b", "deactivate a", "unload a"]
+            ["deactivate b", "deactivate a", "unload b", "unload a"]
         );
+        assert_eq!(f.registered("b").await, (false, false));
+    }
+
+    // R-124: one `call_timeout` bounds the wait for all late calls. The
+    // calls do not return to the runtime, so the abort cannot end them.
+    #[test]
+    fn a_shutdown_waits_for_late_calls_only_up_to_the_time_limit() {
+        let (log, dispatch) = log();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(move || std::mem::forget(capture_logs(&dispatch)))
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config = HostConfig {
+                call_timeout: 50 * MS,
+                ..HostConfig::default()
+            };
+            let f = fixture_with(true, config);
+            let _open = [
+                Open(&f.fake, "hold deactivate a"),
+                Open(&f.fake, "hold deactivate b"),
+            ];
+            for extension in ["a", "b"] {
+                f.add(extension, &[]);
+                f.host.discover().await.unwrap();
+                f.go(extension).await;
+                f.fake
+                    .set(&format!("deactivate {extension}"), Some(Mode::Block));
+                f.fake
+                    .set(&format!("hold deactivate {extension}"), Some(Mode::Fail));
+            }
+            f.fake.take_calls();
+
+            let failures = tokio::time::timeout(Duration::from_secs(20), f.host.shutdown()).await;
+
+            let failures = failures.expect("the shutdown did not end");
+            assert_eq!(failures.len(), 2, "{failures:?}");
+            for error in failures.values() {
+                assert_eq!(error.category(), ErrorCategory::Internal);
+            }
+            assert_eq!(f.fake.count("unload a") + f.fake.count("unload b"), 0);
+        });
+        let text = log.text();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("still runs")).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for (line, extension) in lines.iter().zip(["extension=b", "extension=a"]) {
+            // In the order of the shutdown.
+            assert!(line.contains("ERROR"), "{text}");
+            assert!(line.contains(extension), "{text}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
