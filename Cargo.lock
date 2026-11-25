@@ -1614,6 +1614,9 @@ dependencies = [
 name = "rivet-testkit"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "futures-core",
  "rivet-core",
  "rivet-sdk",
  "tempfile",
