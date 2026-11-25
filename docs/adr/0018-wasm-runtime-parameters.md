@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no version. ARCHITECTURE.md §4.3 allows fuel or epoch interruption and gives no memory rule. The WASM runtime ticket (#4) needs these values. They were asked by the implementing agent; the code is not merged on this date.
+ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no version. ARCHITECTURE.md §4.3 allows fuel or epoch interruption and gives no memory rule. The WASM runtime ticket (#4) needs these values. Part 1 of #4 is on `main` (`crates/rivet-core/src/wasm.rs`). The rows "Time limit", "Component size" and "Guest log output" are review fixes that are not on `main` on this date.
 
 ## Decision
 

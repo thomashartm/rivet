@@ -5,17 +5,18 @@
 
 ## Context
 
-ADR-0006 pins publisher keys on first install. It does not say what identifies a publisher or where pinned keys are stored. The signature ticket (#12) needs both. Part 1 of #12 is not merged on this date.
+ADR-0006 pins publisher keys on first install. It does not say what identifies a publisher or where pinned keys are stored. The signature ticket (#12) needs both. Part 1 of #12 is on `main` (`crates/rivet-core/src/package.rs`). The rules for the caller are for part 2 of #12.
 
 ## Decision
 
 - The publisher of an extension is the first segment of its extension id: `acme.postgres` has the publisher `acme`. An id with one segment is its own publisher. The manifest gets no free publisher field.
+- The publisher of a bundled extension is the project. Its package is verified with the project key only. The first segment `rivet` is reserved for the project: a key cannot be pinned for the publisher `rivet` (to enforce in #12 part 2; no check exists).
 - Verification uses the `minisign-verify` crate. Legacy signatures (not prehashed) are refused, so a package is verified as a stream.
 - Pinned keys are stored in `trust.toml` in the user configuration directory. The file has `schema_version` and a table `[publishers]` with one public key per publisher.
-- The trust store MUST NOT be read from a workspace directory or a bundled directory.
+- The trust store MUST NOT be read from a workspace directory or a bundled directory (to enforce in #12 part 2, which gives the path; no check exists).
 - The project key ships with the binary. It is never read from the trust store file.
 - The trusted comment of a signature is exactly `rivet-package id=<extension id> version=<version>`. Verification fails if the comment has another form, or if the id or the version differs from the package that the caller expects. For a publisher package, the publisher must be the first segment of the id.
-- Verification returns the open file that was verified. The caller reads the package from this handle and does not open the path again. The caller MUST verify a copy in a private location of the user.
+- Verification returns the open file that was verified. The caller reads the package from this handle and does not open the path again. The caller MUST verify a copy in a private location of the user (to enforce in #12 part 2; no check exists).
 - The project key cannot be pinned as a publisher key. A pinned key is replaced only by a separate call that the caller makes after a new review.
 - Failed verification, a key that differs from the pin, and a publisher without a pin give a `policy` error. Malformed or unreadable input gives a `user` error.
 
