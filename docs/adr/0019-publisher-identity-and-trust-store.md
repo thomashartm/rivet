@@ -1,0 +1,24 @@
+# ADR-0019: Publisher identity and trust store
+
+- Status: Proposed
+- Date: 2026-11-25
+
+## Context
+
+ADR-0006 pins publisher keys on first install. It does not say what identifies a publisher or where pinned keys are stored. The signature ticket (#12) needs both. Part 1 of #12 is not merged on this date.
+
+## Decision
+
+- The publisher of an extension is the first segment of its extension id: `acme.postgres` has the publisher `acme`. An id with one segment is its own publisher. The manifest gets no free publisher field.
+- Verification uses the `minisign-verify` crate. Legacy signatures (not prehashed) are refused, so a package is verified as a stream.
+- Pinned keys are stored in `trust.toml` in the user configuration directory. The file has `schema_version` and a table `[publishers]` with one public key per publisher.
+- The trust store MUST NOT be read from a workspace directory or a bundled directory.
+- The project key ships with the binary. It is never read from the trust store file.
+- Failed verification, a key that differs from the pin, and a publisher without a pin give a `policy` error. Malformed or unreadable input gives a `user` error.
+
+## Consequences
+
+- A package cannot name another publisher to replace that publisher's extension.
+- A changed trust store file cannot replace the project key.
+- Extension ids need a publisher prefix to share one key between extensions.
+- A repository opened as a workspace cannot pin its own keys.

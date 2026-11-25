@@ -503,3 +503,6 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 15 | Integration test databases | Local PostgreSQL and MySQL containers with Docker Compose | [0015](docs/adr/0015-integration-test-databases.md) |
 | 16 | `rivet-testkit` dependencies (Proposed) | May use `rivet-sdk`, `rivet-engine-api`, `rivet-core`; others use it as dev-dependency only | [0016](docs/adr/0016-testkit-dependency-rule.md) |
 | 17 | Extension host lifecycle (Proposed) | As-built behaviour recorded; changes to §4.4 proposed | [0017](docs/adr/0017-extension-host-lifecycle.md) |
+| 18 | WASM runtime parameters (Proposed) | No WASI for now; fuel; memory budget with trap; WIT package `rivet:extension` | [0018](docs/adr/0018-wasm-runtime-parameters.md) |
+| 19 | Publisher identity and trust store (Proposed) | Publisher = first segment of the extension id; `trust.toml` in the user configuration directory | [0019](docs/adr/0019-publisher-identity-and-trust-store.md) |
+| 20 | Permission matching rules (Proposed) | Exact matches, deny in case of doubt | [0020](docs/adr/0020-permission-matching-rules.md) |
