@@ -21,33 +21,50 @@
 //!
 //! - Memory: each instance has a limit for its linear memories and tables
 //!   together ([`Limits::memory_bytes`]).
-//! - CPU: each call has a fuel budget ([`Limits::fuel_per_call`]). Fuel was
-//!   chosen and not epoch interruption because it gives the same result on
-//!   each run and needs no timer thread. Its cost is slower guest code.
-//!   Fuel counts WASM instructions. It does not limit the time in a host
-//!   import that blocks; a time limit comes with issue #11.
+//! - CPU: each call has a fuel budget ([`Limits::fuel_per_call`]). Fuel
+//!   gives the same result on each run. Fuel counts WASM instructions. It
+//!   does not count the work of the host in an import.
+//! - Time: each call has a time limit ([`Limits::call_timeout`]). It is the
+//!   backstop for the work that fuel does not count. One thread for each
+//!   runtime advances the epoch of Wasmtime; guest code stops when its
+//!   deadline has passed. The limit does not stop host code: each host
+//!   import must do a bounded quantity of work.
+//! - Data to the host: one call of an import, and one result of an export,
+//!   can pass [`MAX_GUEST_CALL_BYTES`] at most. Wasmtime checks this before
+//!   it copies the data. More is a trap: one log message past this size
+//!   ends the instance.
+//! - Log: the messages of one call have a budget of [`LOG_LINES_PER_CALL`]
+//!   lines and [`LOG_BYTES_PER_CALL`] bytes. The host drops the messages
+//!   past the budget and writes one line with their number.
+//! - File: a component file can have [`Limits::component_bytes`] at most.
 //!
 //! # Errors
 //!
 //! | Failure | Category |
 //! | --- | --- |
 //! | Invalid file, wrong world, import that the host does not give | `user` |
-//! | Trap, CPU limit, memory limit | `internal` |
+//! | Component file past the size limit | `user` |
+//! | Trap, CPU limit, time limit, memory limit, data limit | `internal` |
 //! | The component returns an error | the category that the component gives |
 //!
-//! After a trap or a limit violation (ARCHITECTURE.md §5.6) the instance
-//! cannot be used: each later call gives an error. Other instances are not affected.
+//! After a trap, a limit violation or a panic of the host in an import
+//! (ARCHITECTURE.md §5.6) the instance cannot be used: each later call gives
+//! an `internal` error. Other instances are not affected.
 //!
 //! # Threads
 //!
 //! Compilation and each call into a component run on the blocking pool of
 //! Tokio, not on an async worker thread (ARCHITECTURE.md §5.1). A call that
-//! the caller drops continues until it returns or its fuel is used.
+//! the caller drops continues until it returns or reaches a limit: the fuel
+//! or the time limit.
 
+use crate::logging::Redactor;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::manifest::ExtensionId;
+use std::io::Read;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, Trap};
 
@@ -65,8 +82,30 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
 /// The default of [`Limits::fuel_per_call`].
 pub const DEFAULT_FUEL_PER_CALL: u64 = 1_000_000_000;
 
+/// The default of [`Limits::call_timeout`]: 30 s, the call time limit of
+/// ADR-0021.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default of [`Limits::component_bytes`]: 16 MiB.
+pub const DEFAULT_COMPONENT_BYTES: usize = 16 << 20;
+
+/// The most bytes that a component can pass to the host in one call of an
+/// import or in one result of an export. More is a trap.
+pub const MAX_GUEST_CALL_BYTES: usize = 64 * 1024;
+
+/// The most log lines that the host writes for one call into a component.
+pub const LOG_LINES_PER_CALL: u32 = 100;
+
+/// The most bytes of log messages that the host writes for one call into a
+/// component.
+pub const LOG_BYTES_PER_CALL: usize = 64 * 1024;
+
 /// Log or error text from a component is cut to this number of bytes.
 const MAX_GUEST_TEXT_BYTES: usize = 8 * 1024;
+
+/// The time between two epoch ticks of an engine. A call can run this much
+/// longer than [`Limits::call_timeout`].
+const EPOCH_TICK: Duration = Duration::from_millis(100);
 
 /// The resource limits of an extension instance (ARCHITECTURE.md §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +117,35 @@ pub struct Limits {
     /// call. Wasmtime uses approximately one unit of fuel for each WASM
     /// instruction.
     pub fuel_per_call: u64,
+    /// The longest time of one call into a component. The instantiation is
+    /// also one call. The call can end up to 100 ms later.
+    pub call_timeout: Duration,
+    /// The most bytes that a component file can have.
+    pub component_bytes: usize,
 }
 
 impl Default for Limits {
-    /// [`DEFAULT_MEMORY_BYTES`] and [`DEFAULT_FUEL_PER_CALL`].
+    /// [`DEFAULT_MEMORY_BYTES`], [`DEFAULT_FUEL_PER_CALL`],
+    /// [`DEFAULT_CALL_TIMEOUT`] and [`DEFAULT_COMPONENT_BYTES`].
     fn default() -> Self {
         Self {
             memory_bytes: DEFAULT_MEMORY_BYTES,
             fuel_per_call: DEFAULT_FUEL_PER_CALL,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            component_bytes: DEFAULT_COMPONENT_BYTES,
         }
+    }
+}
+
+impl Limits {
+    /// The epoch ticks after which a call has run for `call_timeout` at
+    /// least. One more than the quotient: the first tick can come at once.
+    fn epoch_ticks(&self) -> u64 {
+        let ticks = self.call_timeout.as_millis() / EPOCH_TICK.as_millis();
+        // The cap keeps the sum with the current epoch in a `u64`.
+        u64::try_from(ticks).map_or(u64::from(u32::MAX), |ticks| {
+            ticks.min(u64::from(u32::MAX)) + 1
+        })
     }
 }
 
@@ -109,6 +168,13 @@ struct State {
     /// The bytes that the instance was given. A growth that Wasmtime refuses
     /// afterwards is not given back: the count can only be too high.
     memory_used: usize,
+    redactor: Redactor,
+    /// The log lines that the current call can still write.
+    log_lines: u32,
+    /// The log message bytes that the current call can still write.
+    log_bytes: usize,
+    /// The log lines of the current call that were dropped.
+    log_dropped: u64,
 }
 
 impl State {
@@ -151,14 +217,25 @@ impl ResourceLimiter for State {
 
 impl logging::Host for State {
     fn log(&mut self, level: LogLevel, message: String) {
+        // Before the work on the text: a dropped message must be cheap.
+        let bytes = message.len().min(MAX_GUEST_TEXT_BYTES);
+        if self.log_lines == 0 || bytes > self.log_bytes {
+            self.log_dropped += 1;
+            return;
+        }
+        self.log_lines -= 1;
+        self.log_bytes -= bytes;
+        let message = guest_text(&self.redactor, &message);
         let extension = self.id.as_str();
-        let message = guest_text(&message);
+        // A field, not the message: in the log each character of the
+        // component is inside `guest_message`, apart from the host fields.
+        let guest_message = message.as_str();
         match level {
-            LogLevel::Trace => tracing::trace!(extension, "{message}"),
-            LogLevel::Debug => tracing::debug!(extension, "{message}"),
-            LogLevel::Info => tracing::info!(extension, "{message}"),
-            LogLevel::Warn => tracing::warn!(extension, "{message}"),
-            LogLevel::Error => tracing::error!(extension, "{message}"),
+            LogLevel::Trace => tracing::trace!(extension, guest_message, "extension log"),
+            LogLevel::Debug => tracing::debug!(extension, guest_message, "extension log"),
+            LogLevel::Info => tracing::info!(extension, guest_message, "extension log"),
+            LogLevel::Warn => tracing::warn!(extension, guest_message, "extension log"),
+            LogLevel::Error => tracing::error!(extension, guest_message, "extension log"),
         }
     }
 }
@@ -167,8 +244,8 @@ impl types::Host for State {}
 
 /// Turns an error that a component returned into the error of the SDK. The
 /// category stays.
-fn guest_error(error: &types::Error) -> Error {
-    let message = guest_text(&error.message);
+fn guest_error(redactor: &Redactor, error: &types::Error) -> Error {
+    let message = guest_text(redactor, &error.message);
     match error.category {
         GuestCategory::User => Error::user(message),
         GuestCategory::Auth => Error::auth(message),
@@ -181,14 +258,61 @@ fn guest_error(error: &types::Error) -> Error {
     }
 }
 
-/// Makes text from a component safe for a log line or an error message: it
-/// is cut to [`MAX_GUEST_TEXT_BYTES`] and has no control characters, so a
-/// component cannot write a false log line.
-fn guest_text(text: &str) -> String {
-    text[..text.floor_char_boundary(MAX_GUEST_TEXT_BYTES)]
+/// Makes text from a component safe for a log line or an error message.
+///
+/// 1. Secrets are redacted. This is before the cut, so the cut cannot leave
+///    a part of a secret that the redacting log writer does not find.
+/// 2. Each character that can start a line or hide text becomes a space
+///    ([`is_unsafe`]), and `"` becomes `'`. The human log format writes a host
+///    field as `name="value"`, so the text cannot imitate one.
+/// 3. The text is cut to [`MAX_GUEST_TEXT_BYTES`].
+fn guest_text(redactor: &Redactor, text: &str) -> String {
+    let mut text: String = redactor
+        .redact(text)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+        .map(|c| match c {
+            '"' => '\'',
+            c if is_unsafe(c) => ' ',
+            c => c,
+        })
+        .collect();
+    text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
+    text
+}
+
+/// The format characters of Unicode 16.0 (general category Cf), the line
+/// separator (Zl) and the paragraph separator (Zp). `std` has no API for the
+/// general category. A range can include code points that are not assigned.
+const FORMAT_AND_SEPARATOR_RANGES: [(char, char); 20] = [
+    ('\u{ad}', '\u{ad}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61c}', '\u{61c}'),
+    ('\u{6dd}', '\u{6dd}'),
+    ('\u{70f}', '\u{70f}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8e2}', '\u{8e2}'),
+    ('\u{180e}', '\u{180e}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{2028}', '\u{202e}'),
+    ('\u{2060}', '\u{206f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{fff9}', '\u{fffb}'),
+    ('\u{110bd}', '\u{110bd}'),
+    ('\u{110cd}', '\u{110cd}'),
+    ('\u{13430}', '\u{1343f}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0001}', '\u{e0001}'),
+    ('\u{e0020}', '\u{e007f}'),
+];
+
+/// Returns `true` for a control character (Cc), a format character (Cf), the
+/// line separator (Zl) and the paragraph separator (Zp).
+fn is_unsafe(c: char) -> bool {
+    c.is_control()
+        || FORMAT_AND_SEPARATOR_RANGES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&c))
 }
 
 /// Runs `work` on the blocking pool, with the log subscriber and the span of
@@ -209,12 +333,40 @@ async fn blocking<T: Send + 'static>(
 fn failure(id: &ExtensionId, action: &str, error: wasmtime::Error) -> Error {
     let reason = if error.is::<MemoryLimitExceeded>() {
         "the memory limit was exceeded"
-    } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
-        "the CPU limit was exceeded"
     } else {
-        "the component trapped"
+        match error.downcast_ref::<Trap>() {
+            Some(Trap::OutOfFuel) => "the CPU limit was exceeded",
+            Some(Trap::Interrupt) => "the call time limit was exceeded",
+            Some(Trap::HostcallFuelExhausted) => "the component passed too much data to the host",
+            _ => "the component trapped",
+        }
     };
     Error::internal(format!("extension `{id}`: {action} failed: {reason}")).with_source(error)
+}
+
+/// Runs one call into a component with a new fuel budget, a new time limit
+/// and a new log budget. Writes the number of dropped log lines afterwards.
+fn limited<T>(
+    store: &mut Store<State>,
+    limits: &Limits,
+    call: impl FnOnce(&mut Store<State>) -> wasmtime::Result<T>,
+) -> wasmtime::Result<T> {
+    let state = store.data_mut();
+    state.log_lines = LOG_LINES_PER_CALL;
+    state.log_bytes = LOG_BYTES_PER_CALL;
+    state.log_dropped = 0;
+    store.set_fuel(limits.fuel_per_call)?;
+    store.set_epoch_deadline(limits.epoch_ticks());
+    let result = call(store);
+    let state = store.data();
+    if state.log_dropped > 0 {
+        tracing::warn!(
+            extension = state.id.as_str(),
+            "{} log lines dropped",
+            state.log_dropped
+        );
+    }
+    result
 }
 
 /// The WASM runtime: one Wasmtime engine and the limits for its instances.
@@ -225,20 +377,41 @@ pub struct WasmRuntime {
     engine: Engine,
     linker: Arc<Linker<State>>,
     limits: Limits,
+    redactor: Redactor,
 }
 
 impl WasmRuntime {
-    /// Makes a runtime. Each instance gets `limits`.
+    /// Makes a runtime. Each instance gets `limits`. Text from a component
+    /// goes through `redactor` before it is cut for the log or for an error.
+    ///
+    /// The runtime starts one thread that counts the time for
+    /// [`Limits::call_timeout`]. The thread ends when the runtime, its
+    /// components and its instances are dropped.
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if Wasmtime cannot start on this machine.
-    pub fn new(limits: Limits) -> Result<Self> {
+    /// Returns an `internal` error if Wasmtime or the thread cannot start on
+    /// this machine.
+    pub fn new(limits: Limits, redactor: Redactor) -> Result<Self> {
         let unusable =
             |error: wasmtime::Error| Error::internal("cannot start Wasmtime").with_source(error);
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(unusable)?;
+        let weak = engine.weak();
+        std::thread::Builder::new()
+            .name("rivet-wasm-epoch".to_owned())
+            .spawn(move || {
+                while let Some(engine) = weak.upgrade() {
+                    engine.increment_epoch();
+                    drop(engine);
+                    std::thread::sleep(EPOCH_TICK);
+                }
+            })
+            .map_err(|error| {
+                Error::internal("cannot start the WASM timer thread").with_source(error)
+            })?;
         let mut linker = Linker::new(&engine);
         // The only import of a component. There is no WASI on purpose.
         Extension::add_to_linker::<_, HasSelf<State>>(&mut linker, |state| state)
@@ -247,6 +420,7 @@ impl WasmRuntime {
             engine,
             linker: Arc::new(linker),
             limits,
+            redactor,
         })
     }
 
@@ -254,13 +428,23 @@ impl WasmRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if `bytes` is not a valid component, if the
-    /// component does not export the world `extension`, or if it imports
+    /// Returns a `user` error if `bytes` is longer than
+    /// [`Limits::component_bytes`], if `bytes` is not a valid component, if
+    /// the component does not export the world `extension`, or if it imports
     /// something that the host does not give, for example a WASI interface.
     pub async fn load(&self, bytes: Vec<u8>) -> Result<WasmComponent> {
+        let limit = self.limits.component_bytes;
+        if bytes.len() > limit {
+            return Err(Error::user(format!(
+                "the WASM component is larger than the limit of {limit} bytes"
+            )));
+        }
         let engine = self.engine.clone();
         let linker = Arc::clone(&self.linker);
         blocking(move || {
+            // shortcut: no time limit for the compilation, it is bounded by the
+            // size limit only; add one (a thread that can be left behind) when
+            // a component of the allowed size compiles for too long.
             let component = Component::new(&engine, &bytes).map_err(|error| {
                 Error::user("the file is not a valid WASM component").with_source(error)
             })?;
@@ -290,11 +474,19 @@ impl WasmRuntime {
     /// [`load`](Self::load).
     pub async fn load_file(&self, path: &Path) -> Result<WasmComponent> {
         let path = path.to_owned();
+        // One byte more than the limit: `load` then refuses the file, and a
+        // file of any size costs this much memory at most.
+        let most =
+            u64::try_from(self.limits.component_bytes).map_or(u64::MAX, |n| n.saturating_add(1));
         let bytes = blocking(move || {
-            std::fs::read(&path).map_err(|error| {
-                Error::user(format!("cannot read the WASM component {}", path.display()))
-                    .with_source(error)
-            })
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|file| file.take(most).read_to_end(&mut bytes))
+                .map_err(|error| {
+                    Error::user(format!("cannot read the WASM component {}", path.display()))
+                        .with_source(error)
+                })?;
+            Ok(bytes)
         })
         .await?;
         self.load(bytes).await
@@ -315,21 +507,29 @@ impl WasmRuntime {
         let engine = self.engine.clone();
         let component = component.0.clone();
         let limits = self.limits;
+        let redactor = self.redactor.clone();
         blocking(move || {
             let state = State {
                 id: id.clone(),
                 memory_limit: limits.memory_bytes,
                 memory_used: 0,
+                redactor,
+                log_lines: 0,
+                log_bytes: 0,
+                log_dropped: 0,
             };
             let mut store = Store::new(&engine, state);
             store.limiter(|state| state);
-            let extension = store
-                .set_fuel(limits.fuel_per_call)
-                .and_then(|()| component.instantiate(&mut store))
+            store.set_hostcall_fuel(MAX_GUEST_CALL_BYTES);
+            let extension = limited(&mut store, &limits, |store| component.instantiate(store))
                 .map_err(|error| failure(&id, "instantiate", error))?;
             Ok(WasmInstance {
-                inner: Arc::new(Mutex::new((store, extension))),
-                fuel_per_call: limits.fuel_per_call,
+                inner: Arc::new(Mutex::new(Inner {
+                    store,
+                    extension,
+                    failed: false,
+                })),
+                limits,
             })
         })
         .await
@@ -347,8 +547,15 @@ type Lifecycle = fn(&Extension, &mut Store<State>) -> wasmtime::Result<Result<()
 ///
 /// Calls into one instance run one after the other.
 pub struct WasmInstance {
-    inner: Arc<Mutex<(Store<State>, Extension)>>,
-    fuel_per_call: u64,
+    inner: Arc<Mutex<Inner>>,
+    limits: Limits,
+}
+
+struct Inner {
+    store: Store<State>,
+    extension: Extension,
+    /// A call ended with a trap or a limit violation.
+    failed: bool,
 }
 
 impl WasmInstance {
@@ -380,17 +587,31 @@ impl WasmInstance {
 
     async fn call(&self, action: &'static str, export: Lifecycle) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let fuel = self.fuel_per_call;
+        let limits = self.limits;
         blocking(move || {
-            // A poisoned lock is safe to use: Wasmtime refuses calls into an
-            // instance that failed.
-            let mut inner = inner.lock().unwrap_or_else(PoisonError::into_inner);
-            let (store, extension) = &mut *inner;
-            let result = store.set_fuel(fuel).and_then(|()| export(extension, store));
-            match result {
+            // The lock is poisoned if the host panicked in an import.
+            let (mut inner, poisoned) = match inner.lock() {
+                Ok(inner) => (inner, false),
+                Err(poison) => (poison.into_inner(), true),
+            };
+            let Inner {
+                store,
+                extension,
+                failed,
+            } = &mut *inner;
+            if poisoned || *failed {
+                return Err(Error::internal(format!(
+                    "extension `{}`: {action} failed: the instance failed in an earlier call",
+                    store.data().id
+                )));
+            }
+            match limited(store, &limits, |store| export(extension, store)) {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(guest_error(&error)),
-                Err(error) => Err(failure(&store.data().id, action, error)),
+                Ok(Err(error)) => Err(guest_error(&store.data().redactor, &error)),
+                Err(error) => {
+                    *failed = true;
+                    Err(failure(&store.data().id, action, error))
+                }
             }
         })
         .await
@@ -403,12 +624,15 @@ mod tests {
     use crate::logging::{Capture, Level, LogConfig, LogFormat, Redactor, dispatch};
     use rivet_sdk::error::ErrorCategory;
     use rivet_sdk::secret::Secret;
+    use std::future::Future;
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};
 
     const SMALL: Limits = Limits {
         memory_bytes: 2 * 65536,
         fuel_per_call: 100_000,
+        call_timeout: DEFAULT_CALL_TIMEOUT,
+        component_bytes: DEFAULT_COMPONENT_BYTES,
     };
 
     /// Builds a component of the `extension` world from WAT text.
@@ -458,13 +682,29 @@ mod tests {
 
     /// Logs `message` at the level `info`, then returns `ok`.
     fn logging_guest(message: &str) -> Vec<u8> {
+        let data: String = message.bytes().map(|b| format!("\\{b:02x}")).collect();
         guest(
-            &format!(r#"(data (i32.const 256) "{message}")"#),
+            &format!(r#"(data (i32.const 256) "{data}")"#),
             &format!(
                 "(call $log (i32.const 2) (i32.const 256) (i32.const {})) (i32.const 0)",
                 message.len()
             ),
         )
+    }
+
+    /// Makes `log` the log subscriber of this thread.
+    ///
+    /// It also keeps a second subscriber alive for the whole test process.
+    /// Reason: while only one subscriber exists, tracing-core 0.1 decides if
+    /// a log statement is on with the subscriber of the thread that reaches
+    /// the statement first, and keeps the answer for the process
+    /// (`Rebuilder::JustOne` in `callsite.rs`). A parallel test with no
+    /// subscriber then turns the statement off for the test that captures.
+    /// With two subscribers, each event asks the subscriber of its thread.
+    fn capture_logs(log: &tracing::Dispatch) -> tracing::dispatcher::DefaultGuard {
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
+        tracing::dispatcher::set_default(log)
     }
 
     fn trapping_guest() -> Vec<u8> {
@@ -481,7 +721,11 @@ mod tests {
     }
 
     fn runtime() -> WasmRuntime {
-        WasmRuntime::new(SMALL).unwrap()
+        runtime_with(SMALL, &Redactor::new())
+    }
+
+    fn runtime_with(limits: Limits, redactor: &Redactor) -> WasmRuntime {
+        WasmRuntime::new(limits, redactor.clone()).unwrap()
     }
 
     #[test]
@@ -497,6 +741,8 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_BYTES);
         assert_eq!(limits.fuel_per_call, DEFAULT_FUEL_PER_CALL);
+        assert_eq!(limits.call_timeout, DEFAULT_CALL_TIMEOUT);
+        assert_eq!(limits.component_bytes, DEFAULT_COMPONENT_BYTES);
     }
 
     #[tokio::test]
@@ -505,7 +751,7 @@ mod tests {
         let path = directory.path().join("extension.wasm");
         std::fs::write(&path, logging_guest("hello")).unwrap();
 
-        let runtime = WasmRuntime::new(Limits::default()).unwrap();
+        let runtime = runtime_with(Limits::default(), &Redactor::new());
         let component = runtime.load_file(&path).await.unwrap();
         let instance = runtime
             .instantiate(&component, id("acme.hello"))
@@ -589,10 +835,13 @@ mod tests {
             Internal,
         ];
         for (category, name) in all.into_iter().zip(wit) {
-            let error = guest_error(&types::Error {
-                category,
-                message: String::new(),
-            });
+            let error = guest_error(
+                &Redactor::new(),
+                &types::Error {
+                    category,
+                    message: String::new(),
+                },
+            );
             assert_eq!(error.category().to_string(), name);
         }
     }
@@ -628,27 +877,97 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_network_environment_and_process_imports_are_refused() {
+        // The imports have the names and the function types of WASI 0.2.6, so
+        // a host that gives WASI would accept them.
+        let resource = |interface: &str, name: &str| {
+            format!(
+                r#"(import "{interface}" (instance $i (export "{name}" (type (sub resource)))))
+                   (alias export $i "{name}" (type $r))"#
+            )
+        };
+        let function = |interface: &str, name: &str, signature: &str| {
+            format!(r#"(import "{interface}" (instance (export "{name}" (func {signature}))))"#)
+        };
+        let cases = [
+            (
+                "wasi:filesystem/types@0.2.6",
+                resource("wasi:filesystem/types@0.2.6", "descriptor")
+                    + &function(
+                        "wasi:filesystem/preopens@0.2.6",
+                        "get-directories",
+                        "(result (list (tuple (own $r) string)))",
+                    ),
+            ),
+            (
+                "wasi:sockets/network@0.2.6",
+                resource("wasi:sockets/network@0.2.6", "network")
+                    + &function(
+                        "wasi:sockets/instance-network@0.2.6",
+                        "instance-network",
+                        "(result (own $r))",
+                    ),
+            ),
+            (
+                "wasi:cli/environment@0.2.6",
+                function(
+                    "wasi:cli/environment@0.2.6",
+                    "get-environment",
+                    "(result (list (tuple string string)))",
+                ),
+            ),
+            (
+                "wasi:cli/exit@0.2.6",
+                function(
+                    "wasi:cli/exit@0.2.6",
+                    "exit",
+                    r#"(param "status" (result))"#,
+                ),
+            ),
+            (
+                "wasi:clocks/monotonic-clock@0.2.6",
+                function("wasi:clocks/monotonic-clock@0.2.6", "now", "(result u64)"),
+            ),
+            (
+                "wasi:random/random@0.2.6",
+                function(
+                    "wasi:random/random@0.2.6",
+                    "get-random-bytes",
+                    r#"(param "len" u64) (result (list u8))"#,
+                ),
+            ),
+        ];
         let runtime = runtime();
-        for import in [
-            "wasi:filesystem/preopens@0.2.6",
-            "wasi:sockets/tcp-create-socket@0.2.6",
-            "wasi:sockets/ip-name-lookup@0.2.6",
-            "wasi:cli/environment@0.2.6",
-            "wasi:cli/exit@0.2.6",
-            "wasi:cli/stdout@0.2.6",
-            "wasi:clocks/wall-clock@0.2.6",
-            "wasi:random/random@0.2.6",
-        ] {
-            let bytes = guest_with(
-                &format!(r#"(import "{import}" (instance (export "f" (func))))"#),
-                "",
-                "(i32.const 0)",
-            );
-            let error = runtime.load(bytes).await.err().unwrap();
+        for (import, imports) in cases {
+            let error = runtime
+                .load(guest_with(&imports, "", "(i32.const 0)"))
+                .await
+                .err()
+                .unwrap();
             assert_eq!(error.category(), ErrorCategory::User, "{import}: {error}");
             assert!(error.message().contains(import), "{error}");
             assert!(error.message().contains("no WASI"), "{error}");
+            // Refused for its name, not for a type that is different.
+            let mut cause: &dyn std::error::Error = &error;
+            while let Some(source) = cause.source() {
+                cause = source;
+            }
+            assert!(
+                cause.to_string().ends_with("implementation is missing"),
+                "{cause}"
+            );
         }
+    }
+
+    #[test]
+    fn the_wit_world_imports_logging_and_no_wasi_interface() {
+        // The linker gets its names from the WIT world only.
+        assert!(!WIT.contains("wasi:"));
+        let world = WIT.split_once("world extension {").unwrap().1;
+        let imports: Vec<&str> = world
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("import "))
+            .collect();
+        assert_eq!(imports, ["logging;"]);
     }
 
     #[tokio::test]
@@ -688,11 +1007,11 @@ mod tests {
 
     #[tokio::test]
     async fn initial_memory_past_the_limit_is_an_internal_error() {
-        let runtime = WasmRuntime::new(Limits {
+        let limits = Limits {
             memory_bytes: 1000,
             ..SMALL
-        })
-        .unwrap();
+        };
+        let runtime = runtime_with(limits, &Redactor::new());
         let component = runtime.load(logging_guest("hello")).await.unwrap();
         let error = runtime
             .instantiate(&component, id("acme.hello"))
@@ -758,7 +1077,10 @@ mod tests {
 
         healthy.activate().await.unwrap();
         // A second call into the broken instance is an error, not a panic.
-        let _ = broken.deactivate().await;
+        let error = broken.deactivate().await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("acme.broken"), "{error}");
+        assert!(error.message().contains("earlier call"), "{error}");
         healthy.deactivate().await.unwrap();
     }
 
@@ -776,7 +1098,7 @@ mod tests {
             },
             Redactor::new(),
         );
-        let _guard = tracing::dispatcher::set_default(&log);
+        let _guard = capture_logs(&log);
 
         let instance = instance(&runtime(), logging_guest("hello"), "acme.hello").await;
         instance.activate().await.unwrap();
@@ -792,8 +1114,7 @@ mod tests {
         redactor.register(&Secret::from("hunter2-value".to_owned()));
         for format in [LogFormat::Human, LogFormat::Json] {
             let capture = Capture::default();
-            let _guard =
-                tracing::dispatcher::set_default(&capture.dispatch(Level::INFO, format, &redactor));
+            let _guard = capture_logs(&capture.dispatch(Level::INFO, format, &redactor));
 
             let bytes = logging_guest("password is hunter2-value");
             let instance = instance(&runtime(), bytes, "acme.leaky").await;
@@ -809,13 +1130,234 @@ mod tests {
     #[tokio::test]
     async fn control_characters_in_component_log_text_are_replaced() {
         let capture = Capture::default();
-        let _guard = tracing::dispatcher::set_default(&capture.dispatch(
-            Level::INFO,
-            LogFormat::Human,
-            &Redactor::new(),
-        ));
-        let instance = instance(&runtime(), logging_guest("one\\ntwo"), "acme.forger").await;
+        let _guard =
+            capture_logs(&capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new()));
+        let instance = instance(&runtime(), logging_guest("one\ntwo"), "acme.forger").await;
         instance.activate().await.unwrap();
         assert_eq!(capture.text().lines().count(), 1, "{}", capture.text());
+    }
+
+    /// `activate` fills 8192 bytes at address 256 with `a`, then logs them at
+    /// the level `error` without end.
+    const FLOOD: &str = "(memory.fill (i32.const 256) (i32.const 97) (i32.const 8192))
+        (loop $l (call $log (i32.const 4) (i32.const 256) (i32.const 8192)) (br $l))
+        unreachable";
+
+    #[tokio::test]
+    async fn a_log_message_past_the_host_limit_ends_the_call_at_once() {
+        // R-32: 1000 pages of memory, then messages of 60 MB without end.
+        let capture = Capture::default();
+        let log = capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new());
+        let _guard = capture_logs(&log);
+        let limits = Limits {
+            memory_bytes: 1001 * 65536,
+            fuel_per_call: 20_000,
+            ..SMALL
+        };
+        let runtime = runtime_with(limits, &Redactor::new());
+        let body = "(drop (memory.grow (i32.const 999)))
+            (loop $l (call $log (i32.const 2) (i32.const 0) (i32.const 60000000)) (br $l))
+            unreachable";
+        let instance = instance(&runtime, guest("", body), "acme.heavy").await;
+        let start = std::time::Instant::now();
+        let error = instance.activate().await.unwrap_err();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("acme.heavy"), "{error}");
+        assert!(error.message().contains("too much data"), "{error}");
+        // Wasmtime refused the message before the host import ran.
+        assert_eq!(capture.text(), "");
+    }
+
+    #[tokio::test]
+    async fn the_log_output_of_one_call_has_a_budget() {
+        let capture = Capture::default();
+        let _guard =
+            capture_logs(&capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new()));
+        let instance = instance(&runtime(), guest("", FLOOD), "acme.flood").await;
+        instance.activate().await.unwrap_err();
+
+        let text = capture.text();
+        assert!(text.len() <= 100_000, "{} bytes", text.len());
+        assert!(
+            text.lines().count() <= 101,
+            "{} lines",
+            text.lines().count()
+        );
+        assert_eq!(text.matches(" log lines dropped").count(), 1);
+        let last = text.lines().last().unwrap();
+        assert!(
+            last.contains("WARN") && last.contains("acme.flood"),
+            "{last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_cannot_be_used_after_a_host_panic() {
+        // The log writer panics one time: a panic in host code in the log import.
+        let panicked = std::sync::atomic::AtomicBool::new(false);
+        let log = dispatch(
+            &LogConfig::default(),
+            move || {
+                assert!(
+                    panicked.swap(true, std::sync::atomic::Ordering::SeqCst),
+                    "writer"
+                );
+                std::io::sink()
+            },
+            Redactor::new(),
+        );
+        let _guard = capture_logs(&log);
+        let instance = instance(&runtime(), logging_guest("hello"), "acme.hello").await;
+        let error = instance.activate().await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal);
+
+        let error = instance.activate().await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("acme.hello"), "{error}");
+        assert!(error.message().contains("earlier call"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_at_the_cut_of_a_long_log_message_is_redacted() {
+        let redactor = Redactor::new();
+        redactor.register(&Secret::from("hunter2-value".to_owned()));
+        for format in [LogFormat::Human, LogFormat::Json] {
+            let capture = Capture::default();
+            let _guard = capture_logs(&capture.dispatch(Level::INFO, format, &redactor));
+            // The cut at 8192 bytes is in the middle of the secret.
+            let message = "a".repeat(8185) + "hunter2-value";
+            let instance = instance(
+                &runtime_with(SMALL, &redactor),
+                logging_guest(&message),
+                "acme.leaky",
+            )
+            .await;
+            instance.activate().await.unwrap();
+            let text = capture.text();
+            assert!(text.contains("aaaa"), "{text}");
+            assert!(!text.contains("hunter"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn component_log_text_cannot_imitate_a_line_or_a_host_field() {
+        for format in [LogFormat::Human, LogFormat::Json] {
+            let capture = Capture::default();
+            let _guard = capture_logs(&capture.dispatch(Level::INFO, format, &Redactor::new()));
+            let message =
+                "one\u{2028}two\u{2029}three\u{202e}four\u{85}five extension=\"core\" six";
+            let instance = instance(&runtime(), logging_guest(message), "acme.forger").await;
+            instance.activate().await.unwrap();
+            let text = capture.text();
+            assert_eq!(text.lines().count(), 1, "{text}");
+            for forbidden in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{85}'] {
+                assert!(!text.contains(forbidden), "{text:?}");
+            }
+            assert!(text.contains("acme.forger"), "{text}");
+            if format == LogFormat::Human {
+                assert_eq!(text.matches("extension=\"").count(), 1, "{text}");
+                assert!(text.contains("guest_message=\"one two"), "{text}");
+                assert!(text.contains("extension='core' six\""), "{text}");
+            } else {
+                assert!(text.contains("\"guest_message\":\"one two"), "{text}");
+            }
+        }
+    }
+
+    /// Fuel that an endless loop does not use up in the time of a test.
+    const HURRIED: Limits = Limits {
+        fuel_per_call: u64::MAX,
+        call_timeout: Duration::from_millis(200),
+        ..SMALL
+    };
+
+    #[tokio::test]
+    async fn an_endless_loop_with_fuel_left_is_stopped_by_the_time_limit() {
+        let runtime = runtime_with(HURRIED, &Redactor::new());
+        let body = "(loop $l (br $l)) unreachable";
+        let instance = instance(&runtime, guest("", body), "acme.spin").await;
+        let start = std::time::Instant::now();
+        let error = instance.activate().await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= HURRIED.call_timeout, "{elapsed:?}");
+        assert!(elapsed.as_secs() < 5, "{elapsed:?}");
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("acme.spin"), "{error}");
+        assert!(error.message().contains("time limit"), "{error}");
+
+        let error = instance.deactivate().await.unwrap_err();
+        assert!(error.message().contains("earlier call"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_the_caller_drops_ends_at_the_time_limit() {
+        let runtime = runtime_with(HURRIED, &Redactor::new());
+        let body = "(loop $l (br $l)) unreachable";
+        let instance = instance(&runtime, guest("", body), "acme.spin").await;
+        {
+            // The first poll starts the call on the blocking pool.
+            let mut call = std::pin::pin!(instance.activate());
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(call.as_mut().poll(cx).is_pending())
+            });
+            assert!(pending.await);
+        }
+        // The call holds a reference to the instance until it ends.
+        let start = std::time::Instant::now();
+        while Arc::strong_count(&instance.inner) > 1 {
+            assert!(start.elapsed().as_secs() < 5, "the call did not end");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = instance.deactivate().await.unwrap_err();
+        assert!(error.message().contains("earlier call"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_component_past_the_size_limit_is_refused() {
+        let bytes = logging_guest("hello");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("extension.wasm");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let limits = |component_bytes| Limits {
+            component_bytes,
+            ..SMALL
+        };
+        let exact = runtime_with(limits(bytes.len()), &Redactor::new());
+        exact.load(bytes.clone()).await.unwrap();
+        exact.load_file(&path).await.unwrap();
+
+        let small = runtime_with(limits(bytes.len() - 1), &Redactor::new());
+        for result in [small.load(bytes).await, small.load_file(&path).await] {
+            let error = result.err().unwrap();
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+            assert!(error.message().contains("larger than the limit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn control_format_and_separator_characters_are_replaced() {
+        let ranges = FORMAT_AND_SEPARATOR_RANGES;
+        assert!(ranges.iter().all(|(first, last)| first <= last));
+        assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+        // 170 format characters, U+2028, U+2029, and U+2065 (not assigned).
+        let count: u32 = ranges
+            .iter()
+            .map(|&(first, last)| u32::from(last) - u32::from(first) + 1)
+            .sum();
+        assert_eq!(count, 173);
+
+        let replaced = "\0\n\u{1b}\u{7f}\u{85}\u{ad}\u{61c}\u{200b}\u{200e}\u{2028}\u{2029}\u{202a}\
+            \u{202e}\u{2066}\u{2069}\u{feff}\u{fff9}\u{1d173}\u{e0001}\u{e007f}";
+        for c in replaced.chars() {
+            assert!(is_unsafe(c), "{c:?}");
+        }
+        let kept = " a=é中\u{a0}\u{2027}\u{202f}\u{2070}\u{1f600}";
+        for c in kept.chars() {
+            assert!(!is_unsafe(c), "{c:?}");
+        }
+        assert_eq!(guest_text(&Redactor::new(), kept), kept);
+        assert_eq!(guest_text(&Redactor::new(), "a\u{202e}b \"c\""), "a b 'c'");
     }
 }
