@@ -156,7 +156,10 @@ pub const SECRET_KEY_NAMES: &[&str] = &[
 
 /// The schemes of the built-in secret backends (ADR-0008). The text of a
 /// secret URI with one of these schemes is not checked for a password.
-const BUILT_IN_SECRET_SCHEMES: [&str; 3] = [crate::secrets::KEYCHAIN_SCHEME, "aws-sm", "gcp-sm"];
+const BUILT_IN_SECRET_SCHEMES: [&str; 3] = {
+    let [first, second] = crate::secrets::BUILT_IN_SCHEMES;
+    [crate::secrets::KEYCHAIN_SCHEME, first, second]
+};
 
 /// Key-name segments that make a key a setting about a secret, not a
 /// secret: `max_tokens`, `token_ttl`, `db_password_file`. Such a key, and
