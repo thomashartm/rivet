@@ -41,7 +41,7 @@ Directories:
 - The same code runs on Windows, macOS and Linux. No symbolic link is used.
 - Between the two renames an extension id has no active directory. A load in that time fails and the host retries it (ADR-0021).
 - The host does not verify a signature when it loads an extension (§7.7 "on load"). The store keeps the package and the signature so that this can be added. No ticket has it yet.
-- Limits of the first version (`install.rs`, not on `main` on this date):
+- Limits of the first version (`install.rs`, on `main` since PR #134):
   - The caller gives `<data>`. The installer does not check that it is private or outside a workspace. No function for the platform data directory exists.
   - There is no lock. Two processes MUST NOT change the same extension id at the same time; nothing enforces this.
   - Files are synced; the parent directory is not synced after a move. A power loss can undo the last move. The recovery step repairs the states that the journal describes.
