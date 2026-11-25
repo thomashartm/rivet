@@ -1099,8 +1099,12 @@ impl ExtensionHost {
     ///   package, or if a later discovery directory holds an invalid package
     ///   with this id. The host changes nothing: it never goes back to a
     ///   valid package of an earlier directory (ADR-0017).
-    /// - A `user` error if the package is not on disk any more, or if the
-    ///   new manifest is invalid or does not resolve. If the extension was
+    /// - A `user` error if no discovery directory has a package with this id
+    ///   any more, or if the new manifest is invalid or does not resolve. If
+    ///   the folder in use was deleted and another directory has a package
+    ///   with this id, that is no error: the host uses that package and
+    ///   writes a `warn` log event with the old and the new directory
+    ///   (ADR-0017). If the extension was
     ///   activated before (`Active`, `Inactive`, `Failed` or `Disabled`),
     ///   the host checks this first and changes nothing: the old version
     ///   and its dependents stay as they are. An extension without loaded
