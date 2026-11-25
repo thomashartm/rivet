@@ -5,6 +5,10 @@
 //! that formats the events and spans. Every formatted line goes through a
 //! [`Redactor`] before it reaches the output, so a secret value that code
 //! logs by mistake is replaced with [`REDACTED`].
+//!
+//! The redactor replaces text in the formatted line. It is the second line
+//! of defence, not a proof: see the limits of [`Redactor`]. The first line
+//! is the `Secret` type, which code cannot print by accident.
 
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::secret::Secret;
@@ -36,27 +40,51 @@ struct Registered {
     count: usize,
 }
 
-/// The forms of `value` that the two log formats can write:
-/// the value itself, its `Debug` form (a field logged with `?`), its
-/// [`sanitized`] form (a message in the human format), and each of the three
-/// as a JSON string (the JSON format).
+/// How many escapes on top of each other the redactor undoes: one by the log
+/// format, and two by the application before it logs the text.
+const ESCAPE_DEPTH: usize = 3;
+
+/// The forms of `value` that a log line can contain: the value itself, then
+/// each chain of up to [`ESCAPE_DEPTH`] escapes of it. An escape is the
+/// `Debug` form (a field logged with `?`, a string field in the human
+/// format), a JSON string (the JSON format, a JSON body) or the
+/// [`sanitized`] form (a message in the human format).
+///
+/// A value in which no escape changes a character has one form only.
 fn needles(value: &str) -> Vec<Zeroizing<String>> {
-    let quoted = Zeroizing::new(format!("{value:?}"));
-    let debug = &quoted[1..quoted.len() - 1];
-    let sanitized = sanitized(value);
-    let mut needles: Vec<Zeroizing<String>> = Vec::new();
-    for form in [value, debug, &sanitized] {
-        let mut forms = vec![Zeroizing::new(form.to_owned())];
-        if let Ok(json) = serde_json::to_string(form).map(Zeroizing::new) {
-            forms.push(Zeroizing::new(json[1..json.len() - 1].to_owned()));
-        }
-        for needle in forms {
-            if !needles.iter().any(|known| **known == *needle) {
-                needles.push(needle);
+    let escapes: [fn(&str) -> Zeroizing<String>; 3] = [debug_escaped, json_escaped, sanitized];
+    let mut needles = vec![Zeroizing::new(value.to_owned())];
+    // The forms that the last round added. Only these get one more escape.
+    let mut added = 0..1;
+    for _ in 0..ESCAPE_DEPTH {
+        let start = needles.len();
+        for index in added {
+            for escape in escapes {
+                let form = escape(&needles[index]);
+                if !needles.iter().any(|known| **known == *form) {
+                    needles.push(form);
+                }
             }
         }
+        added = start..needles.len();
     }
     needles
+}
+
+/// Returns `value` as `Debug` writes it, without the quotes.
+fn debug_escaped(value: &str) -> Zeroizing<String> {
+    let quoted = Zeroizing::new(format!("{value:?}"));
+    Zeroizing::new(quoted[1..quoted.len() - 1].to_owned())
+}
+
+/// Returns `value` as serde_json writes it in a string, without the quotes.
+fn json_escaped(value: &str) -> Zeroizing<String> {
+    // A string always serialises; the fallback keeps the function total.
+    let quoted = Zeroizing::new(serde_json::to_string(value).unwrap_or_default());
+    // Not `trim_matches`: it also removes the escaped quote of a value that
+    // ends with `"`.
+    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+    Zeroizing::new(inner.to_owned())
 }
 
 /// Returns `value` as the human format writes it in a message and in an
@@ -102,11 +130,17 @@ fn sanitized(value: &str) -> Zeroizing<String> {
 /// # Limits
 ///
 /// - A value shorter than [`MIN_REDACTED_LEN`] bytes is not redacted.
-/// - The redactor finds the value itself, its `Debug`-escaped form, the form
-///   in which the human format writes control characters (for example ESC
-///   as `\x1b`), and the JSON-escaped form of each. It does not find other
-///   encodings of the value, for example Base64, URL encoding or a part of
-///   the value.
+/// - The redactor searches the formatted line for the value and for its
+///   escaped forms. An escape is the `Debug` form of Rust, a JSON string as
+///   serde_json writes it, or the form in which the human format writes
+///   control characters (for example ESC as `\\x1b`). Up to three escapes on
+///   top of each other are found. The log format adds one, so the
+///   application can add two: for example a JSON body that is logged with
+///   `?`. Text that the application escaped three or more times is not
+///   redacted.
+/// - It does not find other encodings of the value: Base64, URL encoding,
+///   hex, a JSON encoder with other rules than serde_json (for example `\\/`
+///   or `\\u001B`), or a part of the value.
 /// - Redaction applies to log output only. Errors must not contain secrets
 ///   by construction (§5.6).
 ///
@@ -596,6 +630,19 @@ mod tests {
                             error = &failure as &(dyn std::error::Error + 'static),
                             "failed"
                         );
+                        // R-43: text that the application escaped one or two
+                        // times before it logged it. No `?` here: it is one
+                        // more escape, and the texts include that form.
+                        for text in escaped_by_the_application(&value) {
+                            let failure = io::Error::other(text.clone());
+                            let _span = info_span!("send", display = %text, plain = text).entered();
+                            info!("request {text}");
+                            info!(display = %text, plain = text, "fields");
+                            info!(
+                                error = &failure as &(dyn std::error::Error + 'static),
+                                "failed"
+                            );
+                        }
                     });
                     for part in ["Zq", "Xw", "Jk"] {
                         assert!(
@@ -605,6 +652,69 @@ mod tests {
                     }
                     assert!(output.contains(REDACTED), "{output}");
                 }
+            }
+        }
+    }
+
+    /// Texts that contain `value` after one and after two escapes by the
+    /// application: JSON text, `Debug` text, and each of the two escaped again
+    /// in each of the two ways.
+    fn escaped_by_the_application(value: &str) -> Vec<String> {
+        let json = |text: &str| serde_json::json!({ "password": text }).to_string();
+        let debug = |text: &str| format!("{text:?}");
+        let once = [json(value), debug(value)];
+        let twice = once.iter().flat_map(|text| [json(text), debug(text)]);
+        twice.chain(once.clone()).collect()
+    }
+
+    /// R-43: each escape alone, and three escapes on top of each other.
+    #[test]
+    fn json_form_of_a_secret_with_a_quote_at_the_end_is_complete() {
+        let value = "ZqXwJk7\"";
+        assert_eq!(*json_escaped(value), "ZqXwJk7\\\"");
+        let json = serde_json::to_string(value).unwrap();
+        assert_eq!(redactor(&[value]).redact(&json), format!("\"{REDACTED}\""));
+    }
+
+    #[test]
+    fn redact_finds_each_escaped_form_and_a_chain_of_three() {
+        // No escape leaves this value as it is.
+        let value = "Zq\"Xw\u{1b}Jk";
+        let redactor = redactor(&[value]);
+        let chain = json_escaped(&debug_escaped(&json_escaped(value)));
+        let forms = [
+            debug_escaped(value),
+            json_escaped(value),
+            sanitized(value),
+            chain,
+        ];
+        for form in forms {
+            assert_ne!(*form, value);
+            assert_eq!(redactor.redact(&format!("<{}>", *form)), "<[REDACTED]>");
+        }
+        // The limit: four escapes are not found.
+        let four = json_escaped(&json_escaped(&json_escaped(&json_escaped(value))));
+        assert!(redactor.redact(&four).contains("Zq"));
+    }
+
+    /// R-43: the reported cases.
+    #[test]
+    fn a_secret_in_a_json_body_is_redacted_in_message_and_debug_field() {
+        for value in ["Zq\"XwJk", "Zq\u{1b}XwJk", "Zq\"Xw\u{7f}Jk"] {
+            let redactor = redactor(&[value]);
+            let body = serde_json::json!({ "password": value }).to_string();
+            for format in FORMATS {
+                let output = captured(Level::INFO, format, &redactor, || {
+                    info!(body = ?body, "request");
+                    info!("request {body}");
+                });
+                for part in ["Zq", "Xw", "Jk"] {
+                    assert!(
+                        !output.contains(part),
+                        "{format:?} leaked {part} of {value:?}: {output}"
+                    );
+                }
+                assert_eq!(output.matches(REDACTED).count(), 2, "{output}");
             }
         }
     }
