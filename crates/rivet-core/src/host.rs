@@ -565,6 +565,22 @@ struct Scan {
     packages: BTreeMap<ExtensionId, Package>,
     /// Directories that cannot be read as an extension and give no id.
     invalid: Vec<(PathBuf, String)>,
+    /// Why the newest package of an id is not in `packages`: it is invalid,
+    /// and a valid package of an earlier directory stays.
+    refused: BTreeMap<ExtensionId, String>,
+}
+
+impl Scan {
+    /// Why a reload must not replace the package in `directory` of the
+    /// extension `id` (ADR-0017): that directory now holds an invalid
+    /// package, or a later directory holds an invalid package with this id.
+    /// `packages` then has no package for `id`, or one of an earlier
+    /// directory.
+    fn broken(&self, id: &ExtensionId, directory: Option<&Path>) -> Option<&String> {
+        let here = |(folder, _): &&(PathBuf, String)| Some(folder.as_path()) == directory;
+        let in_use = self.invalid.iter().find(here).map(|(_, reason)| reason);
+        in_use.or_else(|| self.refused.get(id))
+    }
 }
 
 /// Reads the manifest file of the extension directory `directory`.
@@ -600,8 +616,11 @@ fn read_manifest(directory: &Path) -> Result<Option<String>, String> {
 ///
 /// An extension directory is a real directory: a symbolic link is refused.
 /// For one id, a later discovery directory wins, but an invalid package
-/// never replaces a valid one (ADR-0017). Two packages with the same id in
-/// the same discovery directory make the id invalid in that directory.
+/// never replaces a valid one (ADR-0017). If two folders of one discovery
+/// directory have the same id, the folder with the name of the id wins, also
+/// if its manifest is invalid: the installer gives a package that name
+/// (ADR-0023), and another folder can only claim the id. Without such a
+/// folder, the id is invalid in that directory.
 fn scan(directories: &[PathBuf]) -> Scan {
     let mut scan = Scan::default();
     for root in directories {
@@ -620,7 +639,7 @@ fn scan(directories: &[PathBuf]) -> Scan {
             }
         };
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut in_root: BTreeMap<ExtensionId, Package> = BTreeMap::new();
+        let mut in_root: BTreeMap<ExtensionId, Vec<Package>> = BTreeMap::new();
         for (directory, kind) in entries {
             if kind.is_symlink() {
                 let reason = "a symbolic link is not read as an extension directory";
@@ -652,31 +671,58 @@ fn scan(directories: &[PathBuf]) -> Scan {
                 scan.invalid.push((directory, reason));
                 continue;
             };
-            let manifest = match in_root.get(&id) {
-                Some(other) => Err(format!(
-                    "extension `{id}` has two packages in `{}`: `{}` and `{}`",
-                    root.display(),
-                    other.directory.display(),
-                    directory.display()
-                )),
-                None => manifest,
-            };
             let package = Package {
                 directory,
                 manifest,
             };
-            in_root.insert(id, package);
+            in_root.entry(id).or_default().push(package);
         }
-        for (id, package) in in_root {
+        for (id, mut folders) in in_root {
+            let named = |package: &Package| {
+                package.directory.file_name() == Some(std::ffi::OsStr::new(id.as_str()))
+            };
+            let package = match folders.iter().position(named) {
+                _ if folders.len() == 1 => folders.remove(0),
+                Some(named) => {
+                    let package = folders.remove(named);
+                    for other in folders {
+                        let reason = format!(
+                            "extension `{id}` has a second package in `{}`: only the folder \
+                             that has the name of the id is read",
+                            root.display()
+                        );
+                        scan.invalid.push((other.directory, reason));
+                    }
+                    package
+                }
+                None => {
+                    let all: Vec<String> = folders
+                        .iter()
+                        .map(|package| format!("`{}`", package.directory.display()))
+                        .collect();
+                    let reason = format!(
+                        "extension `{id}` has two packages in `{}` and no folder has the name \
+                         of the id: {}",
+                        root.display(),
+                        all.join(", ")
+                    );
+                    Package {
+                        directory: folders.remove(folders.len() - 1).directory,
+                        manifest: Err(reason),
+                    }
+                }
+            };
             match (&package.manifest, scan.packages.get(&id)) {
                 (Err(reason), Some(earlier)) if earlier.manifest.is_ok() => {
                     let reason = format!(
                         "extension `{id}`: {reason}; the valid package in `{}` stays",
                         earlier.directory.display()
                     );
+                    scan.refused.insert(id, reason.clone());
                     scan.invalid.push((package.directory, reason));
                 }
                 _ => {
+                    scan.refused.remove(&id);
                     scan.packages.insert(id, package);
                 }
             }
@@ -1042,6 +1088,10 @@ impl ExtensionHost {
     ///
     /// # Errors
     ///
+    /// - A `user` error if the directory of the package now holds an invalid
+    ///   package, or if a later discovery directory holds an invalid package
+    ///   with this id. The host changes nothing: it never goes back to a
+    ///   valid package of an earlier directory (ADR-0017).
     /// - A `user` error if the package is not on disk any more, or if the
     ///   new manifest is invalid or does not resolve. If the extension was
     ///   activated before (`Active`, `Inactive`, `Failed` or `Disabled`),
@@ -1067,6 +1117,10 @@ impl ExtensionHost {
         {
             let inner = self.inner();
             let entry = inner.entries.get(id);
+            let in_use = entry.map(|entry| entry.package.directory.as_path());
+            if let Some(reason) = scan.broken(id, in_use) {
+                return Err(Error::user(reason.clone()));
+            }
             // The old version stops only if the new package can replace it.
             if entry.is_some_and(Entry::keeps_package) {
                 self.replaceable(&inner, id, new.as_ref())?;
@@ -3885,6 +3939,80 @@ mod tests {
         assert!(invalid[0].1.contains("two packages"), "{invalid:?}");
         assert_eq!(invalid[1].0, f.roots[WORKSPACE].path().join("whatever"));
         assert!(invalid[1].1.contains("missing field"), "{invalid:?}");
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert_eq!(f.fake.take_calls(), ["load a@1.0.0", "activate a"]);
+    }
+
+    #[tokio::test]
+    async fn reload_of_a_broken_package_fails_and_keeps_the_running_extension() {
+        let f = fixture(true);
+        f.write(BUNDLED, "a", &manifest("a", "1.0.0", &[], ""));
+        f.write(WORKSPACE, "a", &manifest("a", "2.0.0", &[], ""));
+        f.write(BUNDLED, "b", &manifest("b", "1.0.0", &[], ""));
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        f.go("b").await;
+        f.fake.take_calls();
+
+        // The package in use: a manifest without a version, then without an id.
+        f.write(WORKSPACE, "a", "id = \"a\"\n");
+        let no_version = f.host.reload(&id("a")).await.unwrap_err();
+        f.write(WORKSPACE, "a", "version = \"2.0.0\"\n");
+        let no_id = f.host.reload(&id("a")).await.unwrap_err();
+        // A new, invalid package in a later directory than the one in use.
+        f.write(USER, "b", "id = \"b\"\n");
+        let later = f.host.reload(&id("b")).await.unwrap_err();
+
+        assert!(
+            no_version.message().contains("missing field"),
+            "{no_version}"
+        );
+        assert!(no_id.message().contains("no valid `id`"), "{no_id}");
+        assert!(later.message().contains("missing field"), "{later}");
+        for error in [no_version, no_id, later] {
+            assert_eq!(error.category(), ErrorCategory::User);
+        }
+        // Nothing was stopped, and no older package was loaded.
+        assert!(f.fake.take_calls().is_empty());
+        for (extension, root) in [("a", WORKSPACE), ("b", BUNDLED)] {
+            let status = f.status(extension).unwrap();
+            assert_eq!(status.state, Active, "{extension}");
+            assert_eq!(status.directory, f.roots[root].path().join(extension));
+        }
+
+        // The corrected package is loaded.
+        f.write(WORKSPACE, "a", &manifest("a", "2.1.0", &[], ""));
+        assert_eq!(f.host.reload(&id("a")).await.unwrap().activated, [id("a")]);
+        assert_eq!(f.fake.count("load a@2.1.0"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_folder_with_the_name_of_the_id_wins_in_one_directory() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        // Each of them only claims the id `a`.
+        f.write(USER, "evil", "id = \"a\"\n");
+        f.write(USER, "z-copy", &manifest("a", "9.0.0", &[], ""));
+        // The folder `b` is invalid: it wins also, and `b` is rejected.
+        f.write(USER, "b", "id = \"b\"\n");
+        f.write(USER, "b-copy", &manifest("b", "1.0.0", &[], ""));
+
+        f.host.discover().await.unwrap();
+
+        let user = f.roots[USER].path();
+        let a = f.status("a").unwrap();
+        assert_eq!((a.state, a.directory), (Resolved, user.join("a")));
+        let b = f.status("b").unwrap();
+        assert_eq!((b.state, b.directory), (Rejected, user.join("b")));
+        assert!(f.reason("b").contains("missing field"), "{}", f.reason("b"));
+        let invalid = f.host.invalid_packages();
+        let folders: Vec<_> = invalid.iter().map(|(folder, _)| folder.clone()).collect();
+        // In the order of the ids.
+        let copies = ["evil", "z-copy", "b-copy"].map(|folder| user.join(folder));
+        assert_eq!(folders, copies);
+        for (_, reason) in &invalid {
+            assert!(reason.contains("has the name of the id"), "{reason}");
+        }
         assert_eq!(f.go("a").await.activated, [id("a")]);
         assert_eq!(f.fake.take_calls(), ["load a@1.0.0", "activate a"]);
     }
