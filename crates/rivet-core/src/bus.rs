@@ -10,6 +10,7 @@
 //! extension stops ([`EventBus::unsubscribe_owner`], §5.2).
 
 use crate::Owner;
+use crate::registry::ClosedOwners;
 use rivet_sdk::error::{Error, Result};
 use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
@@ -51,6 +52,7 @@ struct Registration {
 #[derive(Default)]
 pub struct CommandBus {
     handlers: RwLock<HashMap<String, Registration>>,
+    closed: ClosedOwners,
 }
 
 impl CommandBus {
@@ -65,8 +67,9 @@ impl CommandBus {
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if `name` already has a handler. The
-    /// first handler stays.
+    /// - An `internal` error if `name` already has a handler. The first
+    ///   handler stays.
+    /// - A `policy` error while the host stops the extension `owner`.
     pub fn register<A, R, F, Fut>(&self, owner: Owner, name: &str, handler: F) -> Result<()>
     where
         A: Send + 'static,
@@ -79,6 +82,7 @@ impl CommandBus {
             .handlers
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        self.closed.check(&owner)?;
         match handlers.entry(name.to_owned()) {
             Entry::Occupied(taken) => Err(Error::internal(format!(
                 "command `{name}` already has a handler, registered by `{}`",
@@ -138,6 +142,18 @@ impl CommandBus {
             .is_some()
     }
 
+    /// Refuses each new handler of `owner` until
+    /// [`open_owner`](Self::open_owner). The host calls it when it starts
+    /// to stop the extension.
+    pub(crate) fn close_owner(&self, owner: &Owner) {
+        self.closed.close(owner);
+    }
+
+    /// Accepts the handlers of `owner` again.
+    pub(crate) fn open_owner(&self, owner: &Owner) {
+        self.closed.open(owner);
+    }
+
     /// Removes every handler of `owner`. Returns how many were removed.
     pub fn unregister_owner(&self, owner: &Owner) -> usize {
         let mut handlers = self
@@ -184,6 +200,7 @@ pub struct EventBus {
     /// One entry for each subscription that has an owner. To send on it
     /// closes the subscription.
     owned: Mutex<Vec<(Owner, oneshot::Sender<()>)>>,
+    closed: ClosedOwners,
 }
 
 impl EventBus {
@@ -194,6 +211,7 @@ impl EventBus {
             capacity: capacity.get().into(),
             channels: RwLock::default(),
             owned: Mutex::default(),
+            closed: ClosedOwners::default(),
         }
     }
 
@@ -244,6 +262,9 @@ impl EventBus {
     /// Subscribes like [`subscribe`](Self::subscribe), for the extension
     /// `owner`. [`unsubscribe_owner`](Self::unsubscribe_owner) closes the
     /// subscription.
+    ///
+    /// While the host stops the extension `owner`, the new subscription is
+    /// closed at once: [`Subscription::recv`] returns `None`.
     pub fn subscribe_owned<E>(&self, owner: Owner) -> Subscription<E>
     where
         E: Clone + Send + 'static,
@@ -252,10 +273,26 @@ impl EventBus {
         let (close, closed) = oneshot::channel();
         subscription.closed = Some(closed);
         let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.check(&owner).is_err() {
+            subscription.receiver = None;
+            return subscription;
+        }
         // The entries of dropped subscriptions must not collect.
         owned.retain(|(_, close)| !close.is_closed());
         owned.push((owner, close));
         subscription
+    }
+
+    /// Closes each new subscription of `owner` at once, until
+    /// [`open_owner`](Self::open_owner). The host calls it when it starts
+    /// to stop the extension.
+    pub(crate) fn close_owner(&self, owner: &Owner) {
+        self.closed.close(owner);
+    }
+
+    /// Accepts the subscriptions of `owner` again.
+    pub(crate) fn open_owner(&self, owner: &Owner) {
+        self.closed.open(owner);
     }
 
     /// Closes every subscription of `owner`: each receives nothing more,
@@ -550,6 +587,34 @@ mod tests {
             assert_eq!(slow.recv().await, Some(Received::Event(SchemaChanged(n))));
         }
         assert_eq!(slow.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_closed_owner_cannot_register_or_subscribe_until_it_is_open_again() {
+        let (commands, events) = (CommandBus::new(), EventBus::new(NonZeroU16::MIN));
+        let (a, b) = (owner("ext.a"), owner("ext.b"));
+        let handler = |(): ()| async { Ok(()) };
+
+        commands.close_owner(&a);
+        events.close_owner(&a);
+
+        let error = commands.register(a.clone(), "a.one", handler).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert!(commands.execute::<(), ()>("a.one", ()).await.is_err());
+        let mut closed = events.subscribe_owned::<u8>(a.clone());
+        let mut open = events.subscribe_owned::<u8>(b.clone());
+        events.publish(1_u8);
+        assert_eq!(closed.recv().await, None);
+        // Only this owner is refused.
+        assert_eq!(open.recv().await, Some(Received::Event(1)));
+        commands.register(b, "b.one", handler).unwrap();
+
+        commands.open_owner(&a);
+        events.open_owner(&a);
+        commands.register(a.clone(), "a.one", handler).unwrap();
+        let mut again = events.subscribe_owned::<u8>(a);
+        events.publish(2_u8);
+        assert_eq!(again.recv().await, Some(Received::Event(2)));
     }
 
     #[tokio::test]

@@ -161,12 +161,17 @@ async fn lifecycle_discover_trigger_deactivate_reload_shutdown_is_recorded() -> 
     let version: &str = commands.execute("acme.base.version", ()).await?;
     assert_eq!(version, "version 2");
 
-    // Shutdown: reverse dependency order.
+    // Shutdown: reverse dependency order, then the drop of each instance.
     engine.take_state_changes()?;
     assert!(host.shutdown().await.is_empty());
     assert_eq!(
         engine.take_calls(),
-        ["deactivate acme.app", "deactivate acme.base"]
+        [
+            "deactivate acme.app",
+            "deactivate acme.base",
+            "unload acme.app",
+            "unload acme.base"
+        ]
     );
     assert_eq!(
         changes(&engine),

@@ -44,31 +44,62 @@
 //! - Each planned restart is published as an [`ExtensionRestartScheduled`].
 //! - A restart that fails changes no state: the extension stays `Failed`
 //!   with the new reason, and the next restart is planned.
-//! - After [`HostConfig::restart_limit`] failed restarts in a row the
-//!   extension goes to `Disabled`.
+//! - [`HostConfig::restart_limit`] is the number of automatic restarts that
+//!   are permitted. The failure after the last one gives `Disabled`. Each
+//!   failure counts, also when the restart before it was successful: an
+//!   extension that starts and crashes again is a crash loop (ADR-0021).
 //! - An extension that stayed `Active` for [`HostConfig::reset_after`]
-//!   starts again with a failure count of zero.
+//!   starts again with a failure count of zero. Nothing else sets it to
+//!   zero.
 //! - [`ExtensionHost::shutdown`] stops all pending restarts, and the host
 //!   activates nothing after it.
 //!
-//! When an extension stops for any reason, the host waits until its jobs
-//! have ended, before the state changes and before the instance is dropped
-//! (§4.4, §5.2). The job scheduler aborts a job that does not end in
-//! [`JobConfig::cancel_grace`](crate::jobs::JobConfig::cancel_grace).
+//! When an extension stops for any reason, the host waits until each of
+//! its jobs has ended or was aborted, before the state changes and before
+//! the instance is dropped (§4.4, §5.2). The job scheduler aborts a job that
+//! does not end in
+//! [`JobConfig::cancel_grace`](crate::jobs::JobConfig::cancel_grace). During
+//! this stop, the service registry, the two buses and the job scheduler
+//! refuse the extension: its code cannot register again or start a job.
+//!
+//! Limit: the abort cannot stop a blocking job, or a job that does not
+//! return to the runtime. Such code runs on after the stop and after a
+//! restart of the extension. It keeps its job slot, and it can register
+//! again with the id of the extension. The next stop of the extension
+//! removes what it registered. The host does not keep the extension stopped
+//! for it (ADR-0021).
 //!
 //! # Time limit
 //!
 //! Each call into extension code (`load`, `activate`, `deactivate`) has the
 //! time limit [`HostConfig::call_timeout`]. After the limit, the host stops
-//! waiting, puts the extension in `Failed`, drops the instance and does not
-//! call it again. The host cannot stop code that does not return to the
-//! async runtime, for example a blocking call or a WASM call that still has
-//! fuel: that code can run on after the limit. It cannot change the state
-//! of the extension.
+//! waiting, puts the extension in `Failed` and does not call the instance
+//! again. The host unloads the instance when the call has ended.
+//!
+//! Limit: the host cannot stop code that does not return to the async
+//! runtime, for example a blocking call or a WASM call that still has fuel.
+//! That code can run on after the limit. It cannot change the state of the
+//! extension. The host does not wait for it: the automatic restart can load
+//! a new instance while the old call runs. When the old call ends:
+//!
+//! - If the extension is not `Active`, the host releases again what the
+//!   extension owns (§5.2).
+//! - If the extension is `Active` again, the host releases nothing, because
+//!   that removes what the new instance registered. What the old call
+//!   registered stays until the next stop of the extension.
+//! - In both conditions the host unloads the old instance like each other
+//!   instance. The task that waits for the call keeps the host alive.
+//!
+//! A runtime with one thread cannot end the wait for such a call. There the
+//! host compares the time after the call: a call that took longer than the
+//! limit failed, although it returned.
 //!
 //! The drop of an instance (the unload) has the same time limit and the
 //! same containment: a panic in it is logged as an `internal` error, and the
-//! state change occurs nevertheless.
+//! state change occurs nevertheless. It runs in a blocking task.
+//! [`ExtensionHost::shutdown`] drops each instance in this way. If the host
+//! is dropped without a shutdown, the instances are dropped on the thread
+//! that drops the host: a panic is contained, but there is no time limit.
 //!
 //! # Concurrency
 //!
@@ -79,7 +110,21 @@
 //!
 //! Each lifecycle operation runs in its own task. A caller that drops the
 //! future of an operation does not stop it: the operation completes, and
-//! the next operation starts after it.
+//! the next operation starts after it. Thus each operation needs a Tokio
+//! runtime: outside a runtime, and when the runtime stops during the
+//! operation, the operation returns an `internal` error.
+//!
+//! An operation waits for extension code while it holds its turn. The wait
+//! has an upper bound for each extension that the operation starts or stops:
+//!
+//! - [`HostConfig::call_timeout`] for each call: `load`, `activate`,
+//!   `deactivate` and the unload;
+//! - [`JobConfig::cancel_grace`](crate::jobs::JobConfig::cancel_grace) for
+//!   each release of the jobs of the extension.
+//!
+//! The longest sequence for one extension is a reload whose new activation
+//! fails: five calls and two releases. With the defaults, that is not more
+//! than 160 s.
 //!
 //! [`ExtensionHost::discover`] and [`ExtensionHost::reload`] read the
 //! discovery directories before they wait for their turn. Thus a slow read
@@ -156,6 +201,7 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::Instant;
 
@@ -176,9 +222,10 @@ pub trait ExtensionRuntime: Send + Sync {
     /// Loads the package in `directory`, which has the manifest `manifest`,
     /// and returns its instance. The instance is not active.
     ///
-    /// The host unloads an instance by dropping it, in a blocking task.
-    /// Dropping must release everything the instance holds (§5.2). A panic
-    /// in the drop is contained (§5.6). There is no `unload` method,
+    /// The host unloads an instance by dropping it, in a blocking task (see
+    /// the module documentation for a host that is dropped without a
+    /// shutdown). Dropping must release everything the instance holds
+    /// (§5.2). A panic in the drop is contained (§5.6). There is no `unload` method,
     /// because an unload that can fail has no state in the diagram of §4.4.
     fn load<'a>(
         &'a self,
@@ -192,7 +239,8 @@ pub trait ExtensionRuntime: Send + Sync {
 ///
 /// The host calls each method in a separate task. A panic in a method, or
 /// a method that exceeds [`HostConfig::call_timeout`], puts the extension in
-/// the state `Failed` (§5.6).
+/// the state `Failed` (§5.6). A method MUST NOT block its thread: the host
+/// cannot stop a call that does not return to the runtime.
 pub trait ExtensionInstance: Send + Sync {
     /// Activates the extension. The extension registers its services,
     /// command handlers, event subscriptions and jobs through `context`,
@@ -281,12 +329,13 @@ pub struct HostConfig {
     pub backoff_factor: u32,
     /// The longest delay before an automatic restart.
     pub backoff_max: Duration,
-    /// How many restarts in a row can fail. The next failure puts the
-    /// extension in the state `Disabled`. With `0`, the first failure
-    /// disables the extension.
+    /// The automatic restarts that are permitted. The failure after the
+    /// last one puts the extension in the state `Disabled`. Each failure
+    /// counts, also when the restart before it was successful. With `0`,
+    /// the first failure disables the extension.
     pub restart_limit: u32,
     /// An extension that stayed `Active` for this time starts again with a
-    /// failure count of zero.
+    /// failure count of zero. Nothing else sets the count to zero.
     pub reset_after: Duration,
 }
 
@@ -471,7 +520,7 @@ struct Entry {
     package: Package,
     state: ExtensionState,
     reason: Option<String>,
-    /// `Some` in the states `Active` and `Inactive`.
+    /// `Some` in the states `Active` and `Inactive`, until the shutdown.
     instance: Option<Arc<dyn ExtensionInstance>>,
     /// The failures in a row. See [`Entry::end_run`].
     failures: u32,
@@ -479,7 +528,8 @@ struct Entry {
     active_since: Option<Instant>,
     /// The task of the pending automatic restart.
     restart: Option<AbortHandle>,
-    /// The dependents that a crash deactivated, in activation order. A
+    /// The dependents that a crash stopped, in activation order: each is
+    /// `Inactive`, or `Failed` if its `deactivate` call failed. A
     /// successful restart activates them again.
     revive: Vec<ExtensionId>,
 }
@@ -635,21 +685,15 @@ fn scan(directories: &[PathBuf]) -> Scan {
     scan
 }
 
-/// Runs a call into extension code in a separate task, so that a panic in
-/// the call is an `internal` error and not a panic of the host (§5.6). A
-/// call that takes longer than `limit` is an `internal` error also: like a
-/// panic or a trap, it is a defect of the extension.
-// shortcut: the abort stops the call at its next `.await` only, so code
-// that does not return to the runtime runs on and can still register a
-// service after the host released what the extension owns; the WASM runtime
-// (#4, epoch interruption) and the native host process (#95) must stop it.
-async fn contained<T: Send + 'static>(
-    id: &ExtensionId,
-    what: &str,
-    limit: Duration,
-    call: impl Future<Output = Result<T>> + Send + 'static,
-) -> Result<T> {
-    joined(id, what, limit, tokio::spawn(call)).await
+/// How the wait for a call into extension code ended.
+enum Limited<T> {
+    /// The call ended in the time limit, or it ended later with an error.
+    Ended(Result<T>),
+    /// The call ended after the time limit, with this `Ok` result: it did not
+    /// return to the runtime, so the runtime could not end the wait.
+    Late(Result<T>),
+    /// The call still runs. The runtime was asked to stop it.
+    Running,
 }
 
 /// Waits for `task`, which runs the call `what` into the code of `id`, not
@@ -658,22 +702,34 @@ async fn joined<T>(
     id: &ExtensionId,
     what: &str,
     limit: Duration,
-    mut task: JoinHandle<Result<T>>,
-) -> Result<T> {
-    match tokio::time::timeout(limit, &mut task).await {
-        Ok(Ok(result)) => result,
+    task: &mut JoinHandle<Result<T>>,
+) -> Limited<T> {
+    // On a runtime with one thread, a call that does not return to the
+    // runtime also stops the timer of the limit. Thus the real time is
+    // compared again after the call.
+    // An error that comes late stays: it says more than the limit (the
+    // runtime ends a call at the same limit with its own error).
+    let start = std::time::Instant::now();
+    match tokio::time::timeout(limit, &mut *task).await {
+        Ok(Ok(Ok(value))) if start.elapsed() > limit => Limited::Late(Ok(value)),
+        Ok(Ok(result)) => Limited::Ended(result),
         Ok(Err(error)) => {
             let message = format!("extension `{id}` {} in `{what}`", ended(&error));
-            Err(Error::internal(message).with_source(error))
+            Limited::Ended(Err(Error::internal(message).with_source(error)))
         }
         Err(_) => {
-            // The result of the call, if one comes, is dropped with the task.
             task.abort();
-            Err(Error::internal(format!(
-                "extension `{id}` exceeded the time limit of {limit:?} in `{what}`"
-            )))
+            Limited::Running
         }
     }
+}
+
+/// The error of a call that exceeded the time limit: like a panic or a
+/// trap, it is a defect of the extension, thus `internal`.
+fn overdue(id: &ExtensionId, what: &str, limit: Duration) -> Error {
+    Error::internal(format!(
+        "extension `{id}` exceeded the time limit of {limit:?} in `{what}`"
+    ))
 }
 
 /// How a task ended that did not complete.
@@ -752,7 +808,8 @@ pub struct ExtensionHost {
     directories: Vec<PathBuf>,
     headless: bool,
     /// Held for the whole of each lifecycle operation, by the task of the
-    /// operation.
+    /// operation, also while the operation waits for extension code. The
+    /// module documentation gives the upper bound of that wait.
     // shortcut: one lock for all extensions, so a slow activation delays the
     // activation of an unrelated extension; use one lock per dependency tree
     // when that delay is measured as a problem.
@@ -853,7 +910,10 @@ impl ExtensionHost {
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if the read of the directories panicked.
+    /// Returns an `internal` error if the read of the directories panicked,
+    /// if the caller is not in a Tokio runtime, or if the runtime stopped
+    /// during the operation. Each other operation of the host returns the
+    /// same error for the last two conditions.
     pub async fn discover(&self) -> Result<()> {
         self.scanned(|host, scan| async move {
             let scan = scan?;
@@ -865,7 +925,7 @@ impl ExtensionHost {
             host.drop_instances(unloaded).await;
             Ok(())
         })
-        .await
+        .await?
     }
 
     /// Activates the extensions that `trigger` selects, each after its
@@ -877,7 +937,8 @@ impl ExtensionHost {
     /// activate, but not the dependents of the failed extension. The report
     /// gives the reason for each extension that did not activate. After
     /// [`shutdown`](Self::shutdown), the reason is a `policy` error for each
-    /// selected extension.
+    /// selected extension. If the operation cannot run or cannot end (see
+    /// [`discover`](Self::discover)), the reason is that `internal` error.
     pub async fn trigger(&self, trigger: ActivationTrigger<'_>) -> ActivationReport {
         // The task of the operation cannot borrow the name in `trigger`.
         type Plan = Box<dyn FnOnce(&ActivationIndex, bool) -> ActivationPlan + Send>;
@@ -898,7 +959,7 @@ impl ExtensionHost {
                 })
             }
         };
-        self.operation(|host| async move {
+        let operation = self.operation(|host| async move {
             let plan = plan(&host.inner().index, host.headless);
             let mut report = ActivationReport {
                 activated: Vec::new(),
@@ -906,8 +967,19 @@ impl ExtensionHost {
             };
             host.activate_all(plan.activate, &mut report).await;
             report
+        });
+        operation.await.unwrap_or_else(|error| {
+            let plan = self.inner().index.plan(trigger, self.headless);
+            let mut report = ActivationReport {
+                activated: Vec::new(),
+                not_activated: plan.blocked,
+            };
+            for id in plan.activate {
+                let reason = Error::internal(error.message());
+                report.not_activated.insert(id, reason);
+            }
+            report
         })
-        .await
     }
 
     /// Deactivates the active extension `id`, after the active extensions
@@ -924,7 +996,7 @@ impl ExtensionHost {
     pub async fn deactivate(&self, id: &ExtensionId) -> Result<()> {
         let id = id.clone();
         self.operation(|host| async move { host.deactivate_tree(&id).await })
-            .await
+            .await?
     }
 
     /// Unloads the extension `id`, which is `Inactive`, `Failed` or
@@ -952,7 +1024,7 @@ impl ExtensionHost {
             host.drop_instances(unloaded).await;
             Ok(())
         })
-        .await
+        .await?
     }
 
     /// Hot reload (§4.4): reads the package of `id` again, deactivates `id`
@@ -982,7 +1054,7 @@ impl ExtensionHost {
     pub async fn reload(&self, id: &ExtensionId) -> Result<ActivationReport> {
         let id = id.clone();
         self.scanned(|host, scan| async move { host.reload_locked(&id, scan?).await })
-            .await
+            .await?
     }
 
     /// The body of [`reload`](Self::reload). `scan` is what is on disk.
@@ -1098,7 +1170,7 @@ impl ExtensionHost {
     pub async fn restart(&self, id: &ExtensionId) -> Result<()> {
         let id = id.clone();
         self.operation(|host| async move { host.restart_one(&id).await })
-            .await
+            .await?
     }
 
     /// Handles a crash of the active extension `id`, for example a WASM
@@ -1109,7 +1181,8 @@ impl ExtensionHost {
     /// state `Failed`, releases what it owns (§5.2) and drops its instance.
     /// It does not call the crashed instance. Then the automatic restart
     /// applies ([`HostConfig`]). A successful restart activates the
-    /// dependents again.
+    /// dependents again, also a dependent whose `deactivate` call failed
+    /// here and that is `Failed` thus.
     ///
     /// # Errors
     ///
@@ -1118,7 +1191,7 @@ impl ExtensionHost {
     pub async fn report_crash(&self, id: &ExtensionId, error: Error) -> Result<()> {
         let id = id.clone();
         self.operation(|host| async move { host.crash(&id, &error).await })
-            .await
+            .await?
     }
 
     /// The body of [`report_crash`](Self::report_crash).
@@ -1135,21 +1208,14 @@ impl ExtensionHost {
             inner.active_dependents(id)
         };
         for dependent in dependents.iter().rev() {
-            // A dependent that fails here stays `Failed`.
+            // A dependent that fails here is `Failed` until the restart of
+            // `id` succeeds.
             if let Err(error) = self.deactivate_one(dependent).await {
                 tracing::warn!(extension = %dependent, %error, "deactivation after a crash failed");
             }
         }
-        {
-            let mut inner = self.inner();
-            let inactive = |dependent: &ExtensionId| {
-                let entry = inner.entries.get(dependent);
-                entry.is_some_and(|entry| entry.state == ExtensionState::Inactive)
-            };
-            let revive: Vec<ExtensionId> = dependents.into_iter().filter(inactive).collect();
-            if let Some(entry) = inner.entries.get_mut(id) {
-                entry.revive = revive;
-            }
+        if let Some(entry) = self.inner().entries.get_mut(id) {
+            entry.revive = dependents;
         }
         self.fail(id, error, true).await
     }
@@ -1174,8 +1240,12 @@ impl ExtensionHost {
     }
 
     /// Deactivates all active extensions in reverse dependency order
-    /// (§5.7). A failure does not stop the shutdown. Returns the extensions
-    /// whose `deactivate` call failed, each with the error.
+    /// (§5.7), then drops the instance of each loaded extension in the same
+    /// order, also of an extension that was `Inactive` before. The states
+    /// stay readable. A failure does not stop the shutdown. Returns the extensions whose `deactivate` call failed, each
+    /// with the error. If the operation cannot run or cannot end (see
+    /// [`discover`](Self::discover)), it returns each active extension with
+    /// that `internal` error.
     ///
     /// The shutdown stops all pending restarts. After it, the host does not
     /// activate or restart an extension: each attempt is a `policy` error.
@@ -1184,8 +1254,15 @@ impl ExtensionHost {
     /// limit of a call into an extension ([`HostConfig::call_timeout`])
     /// ends that wait.
     pub async fn shutdown(&self) -> BTreeMap<ExtensionId, Error> {
-        self.operation(|host| async move { host.shutdown_locked().await })
-            .await
+        let operation = self.operation(|host| async move { host.shutdown_locked().await });
+        operation.await.unwrap_or_else(|error| {
+            let inner = self.inner();
+            let active = inner.entries.iter();
+            let active = active.filter(|(_, entry)| entry.state == ExtensionState::Active);
+            active
+                .map(|(id, _)| (id.clone(), Error::internal(error.message())))
+                .collect()
+        })
     }
 
     /// The body of [`shutdown`](Self::shutdown).
@@ -1209,13 +1286,29 @@ impl ExtensionHost {
                 failures.insert(id, error);
             }
         }
+        // Each instance, also of an extension that was `Inactive` before:
+        // a child process lives as long as its instance (ADR-0021). The
+        // states stay. Without this, the instances are dropped with the
+        // host, on the thread of its last owner.
+        let loaded: Vec<ExtensionId> = {
+            let inner = self.inner();
+            inner.resolution.shutdown_order().cloned().collect()
+        };
+        for id in loaded {
+            let instance = {
+                let mut inner = self.inner();
+                let entry = inner.entries.get_mut(&id);
+                entry.and_then(|entry| entry.instance.take())
+            };
+            self.drop_instance(&id, instance).await;
+        }
         failures
     }
 
     /// Runs one lifecycle operation in its own task, which holds the
     /// lifecycle lock. Thus a caller that drops its future does not stop
     /// the operation between two steps.
-    async fn operation<T, F, Fut>(&self, body: F) -> T
+    async fn operation<T, F, Fut>(&self, body: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
@@ -1236,7 +1329,7 @@ impl ExtensionHost {
     /// safe, because the read uses no state of the host, and because the
     /// `scanning` lock applies the results in the order of the reads: a
     /// newer read is never replaced by an older one.
-    async fn scanned<T, F, Fut>(&self, body: F) -> T
+    async fn scanned<T, F, Fut>(&self, body: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Self>, Result<Scan>) -> Fut + Send + 'static,
@@ -1252,34 +1345,119 @@ impl ExtensionHost {
     }
 
     /// Runs `body` in its own task and waits for it.
-    async fn detached<T, F, Fut>(&self, body: F) -> T
+    ///
+    /// Returns an `internal` error if the caller is not in a Tokio runtime,
+    /// or if the runtime stopped before `body` ended.
+    async fn detached<T, F, Fut>(&self, body: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send,
     {
         let host = self.this.upgrade();
-        let host = host.expect("a host that is in use is not dropped");
-        let task = tokio::spawn(async move { body(host).await });
-        match task.await.map_err(tokio::task::JoinError::try_into_panic) {
-            Ok(result) => result,
+        let host = host.ok_or_else(|| Error::internal("the extension host is not in its `Arc`"))?;
+        let runtime = Handle::try_current().map_err(|error| {
+            let message = "a lifecycle operation can start only inside the Tokio runtime";
+            Error::internal(message).with_source(error)
+        })?;
+        let task = runtime.spawn(async move { body(host).await });
+        match task.await.map_err(JoinError::try_into_panic) {
+            Ok(result) => Ok(result),
             // A panic of the host itself, not of an extension.
             Err(Ok(panic)) => std::panic::resume_unwind(panic),
-            Err(Err(_)) => panic!("the Tokio runtime stopped during a lifecycle operation"),
+            Err(Err(error)) => {
+                let message = "the Tokio runtime stopped during a lifecycle operation";
+                Err(Error::internal(message).with_source(error))
+            }
         }
+    }
+
+    /// Runs the call `what` into the code of `id` in a separate task, so
+    /// that a panic in the call is an `internal` error and not a panic of
+    /// the host (§5.6). A call that takes longer than
+    /// [`HostConfig::call_timeout`] is an `internal` error also.
+    ///
+    /// `keep` is the instance that the call uses. If the call runs on after
+    /// the time limit, [`follow`](Self::follow) unloads it when the call
+    /// ended.
+    // shortcut: the abort stops the call at its next `.await` only, so code
+    // that does not return to the runtime runs on until it returns; the WASM
+    // runtime (#4, epoch interruption) and the native host process (#95)
+    // must stop it.
+    async fn contained<T: Send + 'static>(
+        &self,
+        id: &ExtensionId,
+        what: &str,
+        keep: Option<Arc<dyn ExtensionInstance>>,
+        call: impl Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T> {
+        let limit = self.config.call_timeout;
+        let mut task = tokio::spawn(call);
+        match joined(id, what, limit, &mut task).await {
+            Limited::Ended(result) => return result,
+            // A late `load` gives an instance. It is unloaded.
+            Limited::Late(result) => self.drop_instance(id, Some(result)).await,
+            Limited::Running => self.follow(id, task, keep),
+        }
+        Err(overdue(id, what, limit))
+    }
+
+    /// Follows the call `task` into the code of `id`, which runs on after
+    /// the time limit. When the call has ended, the host releases what the
+    /// call registered after the failure, and unloads what the call held:
+    /// the instance `keep`, or the instance that a `load` call returned.
+    ///
+    /// There is no release if the extension is `Active` again at that time:
+    /// the release would remove what the new instance registered. What the
+    /// old call registered then stays until the next release of `id`.
+    ///
+    /// The task of this function keeps the host alive until the call ended.
+    fn follow<T: Send + 'static>(
+        &self,
+        id: &ExtensionId,
+        task: JoinHandle<Result<T>>,
+        keep: Option<Arc<dyn ExtensionInstance>>,
+    ) {
+        // An operation holds the host.
+        let Some(host) = self.this.upgrade() else {
+            return;
+        };
+        let id = id.clone();
+        tokio::spawn(async move {
+            let result = task.await;
+            // No operation changes the state between the check and the release.
+            let _lifecycle = host.lifecycle.lock().await;
+            let active = {
+                let inner = host.inner();
+                let entry = inner.entries.get(&id);
+                entry.is_some_and(|entry| entry.state == ExtensionState::Active)
+            };
+            if active {
+                tracing::warn!(extension = %id, "a call that exceeded the time limit ended after the restart of the extension");
+            } else {
+                host.release(&id).await;
+            }
+            host.drop_instance(&id, Some((result, keep))).await;
+        });
     }
 
     /// Unloads the instance of `id`: drops it in a blocking task, with the
     /// time limit and the containment of each call into extension code.
-    async fn drop_instance(&self, id: &ExtensionId, instance: Option<Arc<dyn ExtensionInstance>>) {
+    /// `instance` is the instance, or a value that holds it.
+    async fn drop_instance<D: Send + 'static>(&self, id: &ExtensionId, instance: Option<D>) {
         let Some(instance) = instance else {
             return;
         };
-        let unload = tokio::task::spawn_blocking(move || {
+        let mut unload = tokio::task::spawn_blocking(move || {
             drop(instance);
             Ok(())
         });
-        if let Err(error) = joined(id, "unload", self.config.call_timeout, unload).await {
+        let limit = self.config.call_timeout;
+        let result = match joined(id, "unload", limit, &mut unload).await {
+            Limited::Ended(result) => result,
+            Limited::Late(_) | Limited::Running => Err(overdue(id, "unload", limit)),
+        };
+        if let Err(error) = result {
             tracing::error!(extension = %id, %error, "unload of the extension failed");
         }
     }
@@ -1443,18 +1621,37 @@ impl ExtensionHost {
     /// decision of the user and ends only with an uninstall or a new review
     /// (§4.7, ADR-0020).
     ///
-    /// It waits until the jobs of `owner` have ended. The job scheduler
-    /// limits this wait: it aborts a job that ignores the cancel request.
+    /// From its start to its end, the registry, the two buses and the job
+    /// scheduler refuse `owner`: code that still runs cannot register behind
+    /// the release (ADR-0021).
+    ///
+    /// It waits until each job of `owner` has ended or was aborted. The job
+    /// scheduler limits this wait: it aborts a job that ignores the cancel
+    /// request. The registrations are removed after that wait, so that the
+    /// state of the extension and its registrations change together.
     async fn release(&self, owner: &Owner) {
+        self.services.registry.close_owner(owner);
+        self.services.commands.close_owner(owner);
+        self.services.events.close_owner(owner);
+        self.services.jobs.close_owner(owner);
+        self.services.jobs.stop_owner(owner).await;
         self.services.registry.unregister_owner(owner);
         self.services.commands.unregister_owner(owner);
         self.services.events.unsubscribe_owner(owner);
-        self.services.jobs.stop_owner(owner).await;
         // After the jobs: a job that still runs could register a backend
-        // again after the removal, and that backend would stay. Until its
-        // jobs have ended, the extension keeps complete backends; a resolve
-        // that runs holds its own reference to the backend.
+        // again after the removal, and that backend would stay (the secret
+        // store has no gate for an owner). Until its jobs have ended, the
+        // extension keeps complete backends; a resolve that runs holds its
+        // own reference to the backend.
         self.secrets.unregister_owner(owner);
+        self.services.registry.open_owner(owner);
+        self.services.commands.open_owner(owner);
+        self.services.events.open_owner(owner);
+        self.services.jobs.open_owner(owner);
+        let running = self.services.jobs.aborted_running(owner);
+        if running > 0 {
+            tracing::warn!(extension = %owner, jobs = running, "the release of the extension ended, but the code of aborted jobs has not stopped: it can register again");
+        }
     }
 
     /// Handles a failure of `id`: releases what it owns, puts it in the
@@ -1561,8 +1758,18 @@ impl ExtensionHost {
             entry.map(|entry| std::mem::take(&mut entry.revive))
         };
         for dependent in revive.unwrap_or_default() {
+            let failed = {
+                let inner = self.inner();
+                let entry = inner.entries.get(&dependent);
+                entry.is_some_and(|entry| entry.state == ExtensionState::Failed)
+            };
+            let event = match failed {
+                // Its `deactivate` call failed in the crash.
+                true => Lifecycle::Restart,
+                false => Lifecycle::Activate,
+            };
             // A dependent that fails is `Failed` and has its own restart.
-            if let Err(error) = self.activate_one(&dependent, Lifecycle::Activate).await {
+            if let Err(error) = self.activate_one(&dependent, event).await {
                 tracing::warn!(extension = %dependent, %error, "activation after a restart failed");
             }
         }
@@ -1628,8 +1835,6 @@ impl ExtensionHost {
             }
         };
 
-        let limit = self.config.call_timeout;
-
         let result = async {
             let instance = match instance {
                 Some(instance) => instance,
@@ -1637,7 +1842,7 @@ impl ExtensionHost {
                     let runtime = Arc::clone(&self.runtime);
                     let load = async move { runtime.load(&manifest, &directory).await };
                     let instance: Arc<dyn ExtensionInstance> =
-                        contained(id, "load", limit, load).await?.into();
+                        self.contained(id, "load", None, load).await?.into();
                     if let Some(entry) = self.inner().entries.get_mut(id) {
                         entry.instance = Some(Arc::clone(&instance));
                     }
@@ -1648,8 +1853,9 @@ impl ExtensionHost {
                 owner: id.clone(),
                 services: self.services.clone(),
             };
+            let keep = Some(Arc::clone(&instance));
             let activate = async move { instance.activate(context).await };
-            contained(id, "activate", limit, activate).await
+            self.contained(id, "activate", keep, activate).await
         }
         .await;
 
@@ -1680,8 +1886,9 @@ impl ExtensionHost {
         };
         let result = match instance {
             Some(instance) => {
+                let keep = Some(Arc::clone(&instance));
                 let deactivate = async move { instance.deactivate().await };
-                contained(id, "deactivate", self.config.call_timeout, deactivate).await
+                self.contained(id, "deactivate", keep, deactivate).await
             }
             None => Ok(()),
         };
@@ -1729,11 +1936,29 @@ impl ExtensionHost {
 impl Drop for ExtensionHost {
     /// Stops the restart tasks, so that no timer waits for a host that is
     /// gone.
+    ///
+    /// Then it drops the instances that are left, in reverse dependency
+    /// order. There are none after [`ExtensionHost::shutdown`]. A panic in
+    /// a drop is contained. These drops run on the thread that drops the
+    /// host, without a time limit: call `shutdown` first.
     fn drop(&mut self) {
         let inner = self.inner.get_mut();
         let inner = inner.unwrap_or_else(PoisonError::into_inner);
-        for (id, entry) in &mut inner.entries {
-            entry.cancel_restart(id, "the host is dropped");
+        let mut ids: Vec<ExtensionId> = inner.resolution.shutdown_order().cloned().collect();
+        // An entry that the resolution does not have.
+        ids.extend(inner.entries.keys().cloned());
+        for id in ids {
+            let Some(entry) = inner.entries.get_mut(&id) else {
+                continue;
+            };
+            entry.cancel_restart(&id, "the host is dropped");
+            let Some(instance) = entry.instance.take() else {
+                continue;
+            };
+            let unload = std::panic::AssertUnwindSafe(move || drop(instance));
+            if std::panic::catch_unwind(unload).is_err() {
+                tracing::error!(extension = %id, "unload of the extension panicked");
+            }
         }
     }
 }
@@ -1759,6 +1984,12 @@ mod tests {
         Hang,
         /// The call returns after `Fake::gate` is notified.
         Wait,
+        /// The call blocks its thread for this real time: it does not
+        /// return to the runtime.
+        Sleep(Duration),
+        /// The call blocks its thread until the test removes the mode
+        /// `hold <call>`.
+        Block,
     }
 
     /// The record of the fake runtime: what the host called, and what must
@@ -1773,6 +2004,8 @@ mod tests {
         /// The store of the host. The host gives it to no extension; the
         /// fake stands for the host service that registers a backend.
         secrets: Arc<SecretStore>,
+        /// The threads that ran async extension code.
+        workers: Mutex<Vec<std::thread::ThreadId>>,
     }
 
     /// The secret backend of each fake extension.
@@ -1797,6 +2030,10 @@ mod tests {
         /// for it.
         async fn call(&self, call: &str) -> Result<()> {
             self.log(call);
+            self.workers
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
             match self.mode(call) {
                 None => Ok(()),
                 Some(Mode::Fail) => Err(Error::connectivity(format!("{call} failed"))),
@@ -1806,6 +2043,37 @@ mod tests {
                     self.gate.notified().await;
                     Ok(())
                 }
+                Some(Mode::Sleep(time)) => {
+                    self.blocking(|| std::thread::sleep(time));
+                    Ok(())
+                }
+                Some(Mode::Block) => {
+                    let hold = format!("hold {call}");
+                    self.blocking(|| {
+                        while self.mode(&hold).is_some() {
+                            std::thread::sleep(MS);
+                        }
+                    });
+                    Ok(())
+                }
+            }
+        }
+
+        /// Runs `block`, which blocks its thread, inside a call that does
+        /// not return to the runtime. On a runtime with more than one
+        /// thread, the runtime gets a new worker for that time: a blocked
+        /// worker can leave no thread that drives the timer, and then no
+        /// time limit ends.
+        fn blocking(&self, block: impl FnOnce()) {
+            match Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(block);
+                    // The thread can be a thread of the blocking pool from
+                    // now on: it is not known as an async worker any more.
+                    let here = std::thread::current().id();
+                    self.workers.lock().unwrap().retain(|id| *id != here);
+                }
+                _ => block(),
             }
         }
 
@@ -1837,6 +2105,29 @@ mod tests {
         fn take_calls(&self) -> Vec<String> {
             std::mem::take(&mut self.calls.lock().unwrap())
         }
+    }
+
+    /// What code of `owner` can try after the host asked it to stop: a job,
+    /// a service, a command handler and an event subscription. Each has the
+    /// name `<owner>.late`.
+    fn register_late(fake: &Fake, services: &Services, owner: &Owner) {
+        let name = format!("{owner}.late");
+        let _ = services
+            .jobs
+            .spawn(owner.clone(), "late", |job| async move {
+                job.cancelled().await;
+                Err::<(), _>(Error::cancelled("stopped"))
+            });
+        let service: Arc<str> = Arc::from("late");
+        let version = Version::new(1, 0, 0);
+        let _ = services
+            .registry
+            .register(owner.clone(), &name, version, service);
+        let handler = |(): ()| async { Ok(()) };
+        let _ = services.commands.register(owner.clone(), &name, handler);
+        let subscription = services.events.subscribe_owned(owner.clone());
+        let mut subscriptions = fake.subscriptions.lock().unwrap();
+        subscriptions.insert(name, subscription);
     }
 
     struct FakeRuntime(Arc<Fake>);
@@ -1893,7 +2184,13 @@ mod tests {
                     .insert(owner.to_string(), subscription);
                 // `job <id>` = `Hang`: the job ignores the cancel request.
                 let stubborn = self.fake.mode(&format!("job {owner}")).is_some();
-                let late = owner.clone();
+                let backend_owner = owner.clone();
+                // `job <id> late`: the job answers the cancel request with
+                // `register_late`.
+                let answers = self.fake.mode(&format!("job {owner} late")).is_some();
+                // `late <id>`: the activation calls `register_late` at its end.
+                let late = self.fake.mode(&format!("late {owner}")).is_some();
+                let (fake, again, of) = (Arc::clone(&self.fake), services.clone(), owner.clone());
                 let job = services
                     .jobs
                     .spawn(owner.clone(), "work", move |job| async move {
@@ -1901,9 +2198,31 @@ mod tests {
                             std::future::pending::<()>().await;
                         }
                         job.cancelled().await;
-                        secrets.register(late.clone(), &format!("{late}.late"), Arc::new(Fixed))?;
+                        secrets.register(
+                            backend_owner.clone(),
+                            &format!("{backend_owner}.late"),
+                            Arc::new(Fixed),
+                        )?;
+                        if answers {
+                            register_late(&fake, &again, &of);
+                        }
                         Err(Error::cancelled("stopped"))
                     })?;
+                // `blocking <id>`: a blocking job that ignores the cancel
+                // request. It runs until the test removes the mode.
+                let blocking = format!("blocking {owner}");
+                if self.fake.mode(&blocking).is_some() {
+                    let fake = Arc::clone(&self.fake);
+                    services
+                        .jobs
+                        .spawn_blocking(owner.clone(), "blocking", move |_| {
+                            fake.log(&blocking);
+                            while fake.mode(&blocking).is_some() {
+                                std::thread::sleep(MS);
+                            }
+                            Ok(())
+                        })?;
+                }
                 self.fake
                     .jobs
                     .lock()
@@ -1911,7 +2230,11 @@ mod tests {
                     .insert(owner.to_string(), job);
                 // Gives a concurrent activation the chance to run.
                 tokio::task::yield_now().await;
-                self.fake.call(&format!("activate {owner}")).await
+                let result = self.fake.call(&format!("activate {owner}")).await;
+                if late {
+                    register_late(&self.fake, &services, &owner);
+                }
+                result
             })
         }
 
@@ -1924,6 +2247,11 @@ mod tests {
         fn drop(&mut self) {
             let call = format!("unload {}", self.id);
             self.fake.log(&call);
+            // The host drops an instance in a blocking task.
+            let here = std::thread::current().id();
+            if self.fake.workers.lock().unwrap().contains(&here) {
+                self.fake.log(&format!("{call} on an async worker"));
+            }
             if self.fake.mode(&call).is_some() {
                 panic!("{call} panicked");
             }
@@ -2140,6 +2468,28 @@ mod tests {
                     "{message}"
                 );
             }
+        }
+
+        /// What is left of `register_late` of `owner`: the number of its
+        /// jobs that have not ended, and `true` for the service, the command
+        /// handler and the open subscription.
+        async fn late(&self, owner: &str) -> (usize, bool, bool, bool) {
+            let name = format!("{owner}.late");
+            let jobs = self.services.jobs.jobs();
+            let left = |job: &&crate::jobs::JobSnapshot| {
+                job.owner.as_str() == owner && job.kind == "late" && !job.state.is_finished()
+            };
+            let any = semver::VersionReq::STAR;
+            let service = self.services.registry.lookup::<str>(&name, &any);
+            let command = self.services.commands.execute::<(), ()>(&name, ()).await;
+            let subscription = self.fake.subscriptions.lock().unwrap().remove(&name);
+            self.services.events.publish(Ping);
+            let open = match subscription {
+                Some(mut subscription) => subscription.recv().await.is_some(),
+                None => false,
+            };
+            let jobs = jobs.iter().filter(left).count();
+            (jobs, service.is_ok(), command.is_ok(), open)
         }
 
         /// Takes the job that `owner` started in its last activation.
@@ -2747,11 +3097,20 @@ mod tests {
 
         let failures = f.host.shutdown().await;
 
+        // Each instance is dropped after the deactivations.
         assert_eq!(
             f.fake.take_calls(),
-            ["deactivate c", "deactivate b", "unload b", "deactivate a"]
+            [
+                "deactivate c",
+                "deactivate b",
+                "unload b",
+                "deactivate a",
+                "unload c",
+                "unload a"
+            ]
         );
         assert_eq!(failures.keys().collect::<Vec<_>>(), [&id("b")]);
+        // The states stay readable.
         assert_eq!(f.state("a"), Some(Inactive));
         assert_eq!(f.state("b"), Some(Failed));
         assert_eq!(f.state("c"), Some(Inactive));
@@ -2787,10 +3146,11 @@ mod tests {
             assert_eq!(f.reason("a"), error.message());
             assert_eq!(f.changes().await, ["a: Resolved -> Failed"]);
             assert_eq!(f.registered("a").await, (false, false));
-            // The instance is dropped when the runtime removed the aborted
-            // call, which holds it. It is not called again.
+            // The instance is unloaded when the stopped call has ended. It
+            // is not called again.
             if call == "activate a" {
                 assert_eq!(f.job_end("a").await, ErrorCategory::Cancelled);
+                f.fake.called("unload a").await;
                 let calls = f.fake.take_calls();
                 assert_eq!(calls, ["load a@1.0.0", "activate a", "unload a"]);
             } else {
@@ -2822,9 +3182,12 @@ mod tests {
             f.changes().await,
             ["b: Active -> Failed", "a: Active -> Inactive"]
         );
+        // The instance is unloaded when the stopped call has ended, after
+        // the operation.
+        f.fake.called("unload b").await;
         assert_eq!(
             f.fake.take_calls(),
-            ["deactivate b", "unload b", "deactivate a"]
+            ["deactivate b", "deactivate a", "unload b"]
         );
         assert_eq!(f.registered("b").await, (false, false));
         assert_eq!(f.job_end("b").await, ErrorCategory::Cancelled);
@@ -3395,6 +3758,7 @@ mod tests {
         assert_eq!(start.elapsed(), HostConfig::default().call_timeout);
         assert!(trigger.await.unwrap().activated.is_empty());
         assert_eq!(f.state("b"), Some(Inactive));
+        f.fake.called("unload a").await;
         f.fake.take_calls();
 
         // After the shutdown the host activates nothing.
@@ -3667,10 +4031,14 @@ mod tests {
         cancelled.abort();
         let panicked: JoinHandle<Result<()>> = tokio::spawn(async { panic!("defect") });
 
-        let cancelled = joined(&id("a"), "activate", DAY, cancelled).await;
-        let panicked = joined(&id("a"), "activate", DAY, panicked).await;
+        let (mut cancelled, mut panicked) = (cancelled, panicked);
+        let cancelled = joined(&id("a"), "activate", DAY, &mut cancelled).await;
+        let panicked = joined(&id("a"), "activate", DAY, &mut panicked).await;
 
-        let (cancelled, panicked) = (cancelled.unwrap_err(), panicked.unwrap_err());
+        let (Limited::Ended(Err(cancelled)), Limited::Ended(Err(panicked))) = (cancelled, panicked)
+        else {
+            panic!("a call that ended in the time limit is not overdue");
+        };
         assert_eq!(cancelled.category(), ErrorCategory::Internal);
         assert_eq!(
             cancelled.message(),
@@ -3879,5 +4247,342 @@ mod tests {
         f.until("a", Active).await;
 
         assert!(f.has_backend("a").await);
+    }
+
+    // --- Review findings R-16, R-17, R-49 to R-53 ---
+
+    #[tokio::test]
+    async fn shutdown_unloads_the_instances_and_contains_a_panic_in_each_drop() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.add("c", &[]);
+        f.host.discover().await.unwrap();
+        f.go("b").await;
+        // `c` is loaded and not active.
+        f.go("c").await;
+        f.host.deactivate(&id("c")).await.unwrap();
+        for unload in ["unload a", "unload b", "unload c"] {
+            f.fake.set(unload, Some(Mode::Panic));
+        }
+        f.fake.take_calls();
+        let Fixture { host, fake, .. } = f;
+
+        // In a task, so that a panic of the host is a result of the test.
+        let end = tokio::spawn(async move {
+            let failures = host.shutdown().await;
+            let left: Vec<_> = host.extensions().iter().map(|x| x.state).collect();
+            drop(host);
+            (failures, left)
+        });
+
+        let (failures, left) = end.await.expect("no panic");
+        assert!(failures.is_empty());
+        // The states stay readable.
+        assert_eq!(left, [Inactive, Inactive, Inactive]);
+        // The deactivation, then the drop of each instance, also of `c`, in
+        // reverse dependency order.
+        let calls = fake.take_calls();
+        assert_eq!(calls[..2], ["deactivate b", "deactivate a"]);
+        let unloads: BTreeSet<&str> = calls[2..].iter().map(String::as_str).collect();
+        assert_eq!(
+            unloads,
+            BTreeSet::from(["unload a", "unload b", "unload c"])
+        );
+        let position = |call: &str| calls.iter().position(|made| made == call);
+        assert!(position("unload b") < position("unload a"), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn the_drop_of_a_host_that_was_not_shut_down_contains_a_panic_in_each_instance() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.host.discover().await.unwrap();
+        f.go("b").await;
+        f.fake.set("unload a", Some(Mode::Panic));
+        f.fake.set("unload b", Some(Mode::Panic));
+        f.fake.take_calls();
+        let Fixture { host, fake, .. } = f;
+
+        let dropped = std::thread::spawn(move || drop(host)).join();
+
+        assert!(dropped.is_ok(), "the drop of the host panicked");
+        // The dependent first.
+        assert_eq!(fake.take_calls(), ["unload b", "unload a"]);
+    }
+
+    #[tokio::test]
+    async fn an_extension_that_stops_cannot_start_jobs_or_register() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("job a late", Some(Mode::Fail));
+        f.go("a").await;
+
+        f.host.deactivate(&id("a")).await.unwrap();
+
+        assert_eq!(f.late("a").await, (0, false, false, false));
+        f.host.unload(&id("a")).await.unwrap();
+        assert_eq!(f.late("a").await, (0, false, false, false));
+
+        // After the stop, the extension can register again.
+        f.fake.set("job a late", None);
+        f.host.discover().await.unwrap();
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert_eq!(f.registered("a").await, (true, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_state_and_the_registrations_agree_while_the_host_waits_for_the_jobs() {
+        let grace = crate::jobs::JobConfig::default().cancel_grace;
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("job a", Some(Mode::Hang));
+        f.go("a").await;
+        let host = Arc::clone(&f.host);
+        let deactivate = tokio::spawn(async move { host.deactivate(&id("a")).await });
+
+        pass(grace / 2).await;
+
+        // The host waits for the job. The extension is not stopped yet.
+        assert_eq!(f.fake.count("deactivate a"), 1);
+        assert_eq!(f.state("a"), Some(Active));
+        assert_eq!(f.registered("a").await, (true, true));
+        deactivate.await.unwrap().unwrap();
+        assert_eq!(f.state("a"), Some(Inactive));
+        assert_eq!(f.registered("a").await, (false, false));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_that_runs_on_after_the_time_limit_is_released_again_when_it_ends() {
+        // No restart: the extension is not active when the old call ends.
+        let config = HostConfig {
+            call_timeout: 50 * MS,
+            restart_limit: 0,
+            ..HostConfig::default()
+        };
+        let f = fixture_with(true, config);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        // The call does not return to the runtime. It registers at its end.
+        f.fake.set("activate a", Some(Mode::Sleep(400 * MS)));
+        f.fake.set("late a", Some(Mode::Fail));
+
+        let report = f.go("a").await;
+
+        let error = &report.not_activated[&id("a")];
+        assert!(error.message().contains("exceeded the time limit"));
+        assert_eq!(f.state("a"), Some(Disabled));
+        // The old call ends. Then the host unloads its instance, in a
+        // blocking task.
+        f.fake.called("unload a").await;
+        assert_eq!(
+            f.fake.take_calls(),
+            ["load a@1.0.0", "activate a", "unload a"]
+        );
+        // What the old call registered at its end is released.
+        assert_eq!(f.late("a").await, (0, false, false, false));
+        assert_eq!(f.registered("a").await, (false, false));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_that_ends_after_the_restart_does_not_release_the_new_instance() {
+        // The test controls the order: the automatic restart is too late,
+        // and the old call ends when the test permits it.
+        let config = HostConfig {
+            call_timeout: 50 * MS,
+            backoff_initial: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        let f = fixture_with(true, config);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("activate a", Some(Mode::Block));
+        f.fake.set("hold activate a", Some(Mode::Fail));
+        f.fake.set("late a", Some(Mode::Fail));
+
+        let report = f.go("a").await;
+
+        f.fake.set("activate a", None);
+        f.fake.set("late a", None);
+        assert!(report.not_activated.contains_key(&id("a")));
+        // The restart does not wait for the old call.
+        f.host.restart(&id("a")).await.unwrap();
+        assert_eq!(f.state("a"), Some(Active));
+        assert_eq!(f.fake.count("unload a"), 0);
+        f.fake.set("hold activate a", None);
+        f.fake.called("unload a").await;
+        // One unload: the old instance, in a blocking task.
+        assert_eq!(
+            f.fake.take_calls(),
+            [
+                "load a@1.0.0",
+                "activate a",
+                "load a@1.0.0",
+                "activate a",
+                "unload a"
+            ]
+        );
+        // The new instance keeps what it registered. What the old call
+        // registered at its end stays also, until the next stop.
+        assert_eq!(f.registered("a").await, (true, true));
+        assert_eq!(f.late("a").await, (1, true, true, true));
+        f.fake.set("late a", Some(Mode::Fail));
+        f.host.deactivate(&id("a")).await.unwrap();
+        // `late` took the subscription. The job, service and command are gone.
+        assert_eq!(f.late("a").await, (0, false, false, false));
+        assert_eq!(f.registered("a").await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_does_not_yield_is_limited_on_a_runtime_with_one_thread() {
+        let config = HostConfig {
+            call_timeout: 50 * MS,
+            ..HostConfig::default()
+        };
+        let f = fixture_with(true, config);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("activate a", Some(Mode::Sleep(200 * MS)));
+
+        let report = f.go("a").await;
+
+        f.fake.set("activate a", None);
+        let error = &report.not_activated[&id("a")];
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("exceeded the time limit"));
+        assert_eq!(f.state("a"), Some(Failed));
+        assert_eq!(f.registered("a").await, (false, false));
+        assert_eq!(f.fake.count("unload a"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dependent_whose_deactivation_failed_in_a_crash_is_restarted_with_its_dependency() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.add("c", &["b"]);
+        f.host.discover().await.unwrap();
+        f.go("c").await;
+        f.changes().await;
+        f.fake.set("deactivate b", Some(Mode::Fail));
+
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+
+        assert_eq!(f.state("b"), Some(Failed));
+        f.fake.set("deactivate b", None);
+        assert_eq!(
+            f.until("c", Active).await,
+            [
+                "c: Active -> Inactive",
+                "b: Active -> Failed",
+                "a: Active -> Failed",
+                "a: Failed -> Active",
+                "b: Failed -> Active",
+                "c: Inactive -> Active",
+            ]
+        );
+        for owner in ["a", "b", "c"] {
+            assert_eq!(f.registered(owner).await, (true, true));
+        }
+    }
+
+    #[test]
+    fn an_operation_outside_a_runtime_is_an_error_and_not_a_panic() {
+        use std::task::{Context, Poll, Waker};
+        let f = fixture(true);
+        f.add("a", &[]);
+        // Without a runtime, each operation ends in its first poll.
+        let mut context = Context::from_waker(Waker::noop());
+
+        let discover = std::pin::pin!(f.host.discover());
+        let Poll::Ready(found) = discover.poll(&mut context) else {
+            panic!("`discover` waits");
+        };
+        let error = found.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("Tokio runtime"), "{error}");
+        let a = id("a");
+        let unload = std::pin::pin!(f.host.unload(&a));
+        let Poll::Ready(Err(error)) = unload.poll(&mut context) else {
+            panic!("`unload` waits or succeeds");
+        };
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        let trigger = std::pin::pin!(f.go("a"));
+        assert!(trigger.poll(&mut context).is_ready());
+        let shutdown = std::pin::pin!(f.host.shutdown());
+        assert!(shutdown.poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn a_runtime_that_stops_during_an_operation_gives_an_error_and_not_a_panic() {
+        let runtime = || {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(1).enable_all().build().unwrap()
+        };
+        let (stopping, caller) = (runtime(), runtime());
+        let f = fixture(true);
+        f.add("a", &[]);
+        stopping.block_on(f.host.discover()).unwrap();
+        f.fake.set("activate a", Some(Mode::Wait));
+
+        let report = caller.block_on(async {
+            let mut trigger = std::pin::pin!(f.go("a"));
+            {
+                // The operation starts in the runtime that stops.
+                let _stopping = stopping.enter();
+                let ready = std::future::poll_fn(|context| {
+                    std::task::Poll::Ready(trigger.as_mut().poll(context).is_ready())
+                });
+                assert!(!ready.await);
+            }
+            f.fake.called("activate a").await;
+            stopping.shutdown_background();
+            trigger.await
+        });
+
+        let error = &report.not_activated[&id("a")];
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(error.message().contains("runtime stopped"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocking_job_that_ignores_the_cancel_request_does_not_stop_the_unload() {
+        let grace = crate::jobs::JobConfig::default().cancel_grace;
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("blocking a", Some(Mode::Hang));
+        f.go("a").await;
+        f.fake.called("blocking a").await;
+        let host = Arc::clone(&f.host);
+        let stop = tokio::spawn(async move { host.deactivate(&id("a")).await });
+        // The clock does not advance by itself while blocking work runs.
+        // The steps are small: only the grace period must end, not the
+        // time limit of the `deactivate` call.
+        while !stop.is_finished() {
+            tokio::time::advance(grace / 5).await;
+        }
+        let stopped = stop.await.unwrap();
+        let unloaded = f.host.unload(&id("a")).await;
+
+        let jobs = f.services.jobs.jobs();
+        let blocking = jobs.iter().find(|job| job.kind == "blocking").unwrap();
+        let running = f.services.jobs.aborted_running(&id("a"));
+        // Lets the code end, so that the runtime of the test can stop.
+        f.fake.set("blocking a", None);
+        // The documented limit: the host waited for the abort, not for the
+        // code. The job is `Cancelled` and its code still ran.
+        stopped.unwrap();
+        unloaded.unwrap();
+        assert_eq!(f.state("a"), None);
+        assert_eq!(f.fake.count("unload a"), 1);
+        assert_eq!(blocking.state, crate::jobs::JobState::Cancelled);
+        assert_eq!(running, 1);
+        assert_eq!(f.registered("a").await, (false, false));
     }
 }
