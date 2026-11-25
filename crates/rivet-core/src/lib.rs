@@ -5,6 +5,7 @@ pub mod bus;
 pub mod host;
 pub mod jobs;
 pub mod logging;
+pub mod package;
 pub mod permissions;
 pub mod registry;
 pub mod resolve;
