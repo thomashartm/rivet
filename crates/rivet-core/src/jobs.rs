@@ -193,6 +193,8 @@ impl<T> JobHandle<T> {
 /// | `jobs.max_per_extension` | 8 | [`max_per_extension`](Self::max_per_extension) |
 /// | `jobs.retain_finished` | 100 | [`retain_finished`](Self::retain_finished) |
 /// | `jobs.cancel_grace_ms` | 5000 | [`cancel_grace`](Self::cancel_grace) |
+///
+/// `jobs.cancel_grace_ms` is from 1 to 60000.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobConfig {
     /// How many jobs run at the same time.
@@ -207,6 +209,10 @@ pub struct JobConfig {
     /// scheduler aborts it. The setting is in milliseconds.
     pub cancel_grace: Duration,
 }
+
+/// The longest grace period that the settings accept: a release of an
+/// extension waits this long for a job that ignores the cancel request.
+const MAX_CANCEL_GRACE_MS: u64 = 60_000;
 
 impl Default for JobConfig {
     fn default() -> Self {
@@ -225,14 +231,35 @@ impl JobConfig {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if a value has the wrong type, or if
-    /// `jobs.max_concurrent` or `jobs.max_per_extension` is `0`.
+    /// Returns a `user` error if a value has the wrong type, if
+    /// `jobs.max_concurrent`, `jobs.max_per_extension` or
+    /// `jobs.cancel_grace_ms` is `0`, or if `jobs.cancel_grace_ms` is more
+    /// than 60000 (one minute).
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         let default = Self::default();
-        let max_concurrent = settings.get("jobs.max_concurrent")?;
-        let max_per_extension = settings.get("jobs.max_per_extension")?;
+        let invalid = |problem: String| Error::user(format!("invalid settings: {problem}"));
+        // Read as a plain integer, so that the error for `0` names the key.
+        let not_zero = |key: &str| -> Result<Option<NonZeroUsize>> {
+            let value = settings.get::<usize>(key)?.map(NonZeroUsize::new);
+            match value {
+                Some(None) => Err(invalid(format!("`{key}` must not be 0"))),
+                Some(value) => Ok(value),
+                None => Ok(None),
+            }
+        };
+        let max_concurrent = not_zero("jobs.max_concurrent")?;
+        let max_per_extension = not_zero("jobs.max_per_extension")?;
         let retain_finished = settings.get("jobs.retain_finished")?;
-        let cancel_grace = settings.get("jobs.cancel_grace_ms")?;
+        let cancel_grace = settings.get::<u64>("jobs.cancel_grace_ms")?;
+        match cancel_grace {
+            Some(0) => return Err(invalid("`jobs.cancel_grace_ms` must not be 0".into())),
+            Some(millis) if millis > MAX_CANCEL_GRACE_MS => {
+                return Err(invalid(format!(
+                    "`jobs.cancel_grace_ms` must not be more than {MAX_CANCEL_GRACE_MS}"
+                )));
+            }
+            _ => {}
+        }
         Ok(Self {
             max_concurrent: max_concurrent.unwrap_or(default.max_concurrent),
             max_per_extension: max_per_extension.or(default.max_per_extension),
@@ -1287,6 +1314,41 @@ mod tests {
             assert_eq!(handle.join().await.unwrap(), round);
             assert_eq!(watch.borrow().state, JobState::Succeeded);
         }
+    }
+
+    #[test]
+    fn zero_and_too_long_grace_in_the_settings_are_refused_with_the_key() {
+        use crate::settings::Layer;
+        let read = |jobs: &str| {
+            let mut settings = Settings::new();
+            let text = format!("schema_version = 1\n[jobs]\n{jobs}");
+            settings.set_layer(Layer::User, "test", &text).unwrap();
+            JobConfig::from_settings(&settings)
+        };
+        for (invalid, message) in [
+            (
+                "max_concurrent = 0",
+                "invalid settings: `jobs.max_concurrent` must not be 0",
+            ),
+            (
+                "max_per_extension = 0",
+                "invalid settings: `jobs.max_per_extension` must not be 0",
+            ),
+            (
+                "cancel_grace_ms = 0",
+                "invalid settings: `jobs.cancel_grace_ms` must not be 0",
+            ),
+            (
+                "cancel_grace_ms = 60001",
+                "invalid settings: `jobs.cancel_grace_ms` must not be more than 60000",
+            ),
+        ] {
+            let error = read(invalid).expect_err(invalid);
+            assert_eq!(error.category(), ErrorCategory::User, "{invalid}");
+            assert_eq!(error.message(), message);
+        }
+        let longest = read("cancel_grace_ms = 60000").unwrap();
+        assert_eq!(longest.cancel_grace, Duration::from_secs(60));
     }
 
     #[test]
