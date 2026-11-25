@@ -95,10 +95,11 @@
 //! text of the host that names the extension. So the text of the component
 //! cannot imitate a message of the host.
 //!
-//! Wasmtime quotes names from the component in the cause of a load error.
-//! So the source of a load error is that cause as one text, with the rules
-//! of the guest text: redacted, cleaned and cut. The source of a trap error
-//! has no backtrace: a backtrace has the function names of the component.
+//! Wasmtime can quote names from the component in the cause of an error.
+//! So the source of a load error, and of an error of guest code, is that
+//! cause as one text, with the rules of the guest text: redacted, cleaned
+//! and cut. It is not the error value of Wasmtime. A trap has no backtrace:
+//! a backtrace has the function names of the component.
 //!
 //! After a trap, a limit violation or a panic of the host in an import
 //! (ARCHITECTURE.md §5.6) the instance cannot be used: each later call gives
@@ -410,9 +411,9 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
     text
 }
 
-/// The reason that Wasmtime gives for a component that it refuses, with its
-/// causes, as one text. Wasmtime quotes names from the component in it, so
-/// it has the rules of [`guest_text`].
+/// The reason that Wasmtime gives for a component that it refuses or for a
+/// failure of guest code, with its causes, as one text. Wasmtime can quote
+/// names from the component in it, so it has the rules of [`guest_text`].
 fn refusal_text(redactor: &Redactor, error: &wasmtime::Error) -> String {
     guest_text(redactor, &format!("{error:#}"))
 }
@@ -483,8 +484,10 @@ async fn blocking<T: Send + 'static>(
 /// The `action` of [`failure`] for the instantiation.
 const INSTANTIATE: &str = "instantiate";
 
-/// Turns a failure of Wasmtime in guest code into an `internal` error.
-fn failure(id: &ExtensionId, action: &str, error: wasmtime::Error) -> Error {
+/// Turns a failure of Wasmtime in guest code into an `internal` error. The
+/// source is the cause as cleaned text ([`refusal_text`]), not the error of
+/// Wasmtime: no source is raw text of a guest (ADR-0018).
+fn failure(state: &State, action: &str, error: wasmtime::Error) -> Error {
     let reason = if error.is::<MemoryLimitExceeded>() {
         "the memory limit was exceeded"
     } else {
@@ -498,7 +501,11 @@ fn failure(id: &ExtensionId, action: &str, error: wasmtime::Error) -> Error {
             None => "the call broke the rules of the component model",
         }
     };
-    Error::internal(format!("extension `{id}`: {action} failed: {reason}")).with_source(error)
+    Error::internal(format!(
+        "extension `{}`: {action} failed: {reason}",
+        state.id
+    ))
+    .with_source(refusal_text(&state.redactor, &error))
 }
 
 /// Runs one call into a component with a new fuel budget, a new time limit
@@ -706,7 +713,7 @@ impl WasmRuntime {
             store.limiter(|state| state);
             store.set_hostcall_fuel(MAX_GUEST_CALL_BYTES);
             let extension = limited(&mut store, &limits, |store| component.instantiate(store))
-                .map_err(|error| failure(&id, INSTANTIATE, error))?;
+                .map_err(|error| failure(store.data(), INSTANTIATE, error))?;
             Ok(WasmInstance {
                 inner: Arc::new(Mutex::new(Inner {
                     store,
@@ -820,7 +827,7 @@ impl WasmInstance {
                 Ok(Err(error)) => Err(guest_error(store.data(), action, &error)),
                 Err(error) => {
                     *failed = true;
-                    Err(failure(&store.data().id, action, error))
+                    Err(failure(store.data(), action, error))
                 }
             }
         })
@@ -2251,62 +2258,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_error_of_guest_code_has_no_text_of_the_guest() {
-        // T-1 (ADR-0018): a function name of the name section, and a custom
-        // section, for each kind of failure of guest code.
+    async fn no_kind_of_failure_keeps_text_of_the_guest_as_source() {
+        // T-1 (ADR-0018). The guest gives its text where a module can have
+        // a name: a function name and an export name with a line break, an
+        // escape character and a secret; a table name, a global name and a
+        // custom section with the secret.
         let redactor = Redactor::new();
         redactor.register(&Secret::from("hunter2-value".to_owned()));
         let name = format!("{}\\nERROR forged\\1b[2J hunter2-value", "n".repeat(10000));
         let named = |body: &str, more: &str| {
             format!(
                 r#"(@custom "hunter2-value" "hunter2-value")
-                   (func $named (@name "{name}") {body})
+                   (table $hunter2-value 1 funcref)
+                   (global $hunter2-value (mut i32) (i32.const 0))
+                   (func $named (@name "{name}") (export "{name}") {body})
                    {more}"#
             )
         };
         let wild = r#"(data (i32.const 32) "\01\00\00\00\00\00\00\00\00\00\ff\7f\04\00\00\00")"#;
         let call = "(call $named) (i32.const 0)";
+        let endless = "(loop $l (br $l))";
         let cases = [
+            ("the component trapped", named("unreachable", "")),
             (
-                "activate failed: the component trapped",
-                guest(&named("unreachable", ""), call),
+                "the component trapped",
+                named(
+                    "(drop (i32.div_u (i32.const 1) (global.get $hunter2-value)))",
+                    "",
+                ),
+            ),
+            (
+                "the component trapped",
+                named("(drop (i32.load (i32.const -1)))", ""),
+            ),
+            (
+                "the component trapped",
+                named("(call_indirect $hunter2-value (i32.const 0))", ""),
+            ),
+            (
+                "the component trapped",
+                named("(call_indirect $hunter2-value (i32.const 9))", ""),
             ),
             (
                 "instantiate failed: the component trapped",
-                guest(&named("unreachable", "(start $named)"), call),
+                named("unreachable", "(start $named)"),
             ),
             (
                 "the component could not be instantiated",
-                guest(&named("", &"(table 0 funcref) ".repeat(65)), call),
+                named("", &"(table 0 funcref) ".repeat(64)),
             ),
             (
-                "the call broke the rules of the component model",
-                guest(&named("", wild), "(call $named) (i32.const 32)"),
+                "the memory limit was exceeded",
+                named("(drop (memory.grow (i32.const 3)))", ""),
+            ),
+            ("the CPU limit was exceeded", named(endless, "")),
+            (
+                "the component passed too much data to the host",
+                named(
+                    "(drop (memory.grow (i32.const 1)))
+                     (call $log (i32.const 2) (i32.const 0) (i32.const 100000))",
+                    "",
+                ),
             ),
         ];
-        let runtime = runtime_with(SMALL, &redactor);
+        let model = (
+            "the call broke the rules of the component model",
+            guest(&named("", wild), "(call $named) (i32.const 32)"),
+        );
+        let cases = cases.map(|(reason, data)| (reason, guest(&data, call)));
+        let hurried = Limits {
+            call_timeout: Duration::from_millis(100),
+            ..HURRIED
+        };
+        let time = (
+            "the call time limit was exceeded",
+            guest(&named(endless, ""), call),
+        );
+
+        // Three pages: one more than `SMALL`, for the table and the message.
+        let limits = Limits {
+            memory_bytes: 3 * 65536,
+            ..SMALL
+        };
+        let runtime = runtime_with(limits, &redactor);
+        let hurried = runtime_with(hurried, &redactor);
         let hosted = hosted(Arc::new(runtime.clone()));
-        for (reason, bytes) in cases {
+        let all = cases
+            .iter()
+            .chain([&model])
+            .map(|case| (&runtime, true, case))
+            .chain([(&hurried, false, &time)]);
+        for (runtime, through_host, (reason, bytes)) in all {
             let component = runtime.load(bytes.clone()).await.unwrap();
             let direct = match runtime.instantiate(&component, id("acme.named")).await {
                 Ok(instance) => instance.activate().await.unwrap_err(),
                 Err(error) => error,
             };
-            hosted.install("acme.named", "1.0.0", &bytes);
-            let report = hosted.start("acme.named").await;
-            hosted.host.unload(&id("acme.named")).await.unwrap();
-            for error in [&direct, &report.not_activated[&id("acme.named")]] {
+            let mut errors = vec![direct];
+            if through_host {
+                hosted.install("acme.named", "1.0.0", bytes);
+                let mut report = hosted.start("acme.named").await;
+                hosted.host.unload(&id("acme.named")).await.unwrap();
+                errors.extend(report.not_activated.remove(&id("acme.named")));
+                assert_eq!(errors.len(), 2);
+            }
+            for error in &errors {
+                assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
                 assert!(error.message().contains(reason), "{error}");
                 let texts = all_text(error);
                 println!("{texts:#?}");
-                // The cause that Wasmtime gives stays.
-                assert_eq!(texts.len(), 3, "{texts:?}");
                 for text in &texts {
                     assert!(text.len() < 1000, "{} bytes", text.len());
                     for guest in ["nnnn", "forged", "hunter2", "\n", "\u{1b}"] {
                         assert!(!text.contains(guest), "{guest:?} in {text:?}");
                     }
                 }
+                // The cause that Wasmtime gives stays, as one cleaned text:
+                // the source is not the error value of Wasmtime.
+                let source = std::error::Error::source(error).unwrap();
+                assert!(source.source().is_none(), "{texts:?}");
+                assert_eq!(format!("{source:?}"), format!("{:?}", source.to_string()));
             }
         }
     }
