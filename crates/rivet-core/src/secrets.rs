@@ -5,6 +5,7 @@
 //! for cloud secret managers are extensions and are registered at runtime
 //! (§3.3).
 
+use crate::Owner;
 use crate::logging::Redactor;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::secret::{Secret, SecretUri};
@@ -117,7 +118,8 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
 
 /// Resolves secret URIs. One backend is registered per URI scheme.
 ///
-/// - `keychain` is registered from the start ([`KeychainBackend`]).
+/// - `keychain` is registered from the start ([`KeychainBackend`]). It has
+///   no owner, so it cannot be removed.
 /// - The store keeps no secret values. Each call reads the backend again
 ///   (§6.4).
 /// - All methods take `&self` and are safe for concurrent use. Share the
@@ -148,21 +150,30 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
 ///
 /// # async fn example() -> rivet_sdk::error::Result<()> {
 /// let store = SecretStore::new();
-/// store.register("aws-sm", Arc::new(Fixed))?;
+/// store.register("acme.aws".parse()?, "aws-sm", Arc::new(Fixed))?;
 /// let secret = store.resolve(&"aws-sm://prod/db/password".parse()?).await?;
 /// assert_eq!(secret.expose(), "s3cr3t");
 /// # Ok(())
 /// # }
 /// ```
 pub struct SecretStore {
-    backends: RwLock<HashMap<String, Arc<dyn SecretBackend>>>,
+    backends: RwLock<HashMap<String, Registration>>,
     redactor: Option<Redactor>,
+}
+
+struct Registration {
+    /// `None` for the built-in backend.
+    owner: Option<Owner>,
+    backend: Arc<dyn SecretBackend>,
 }
 
 impl SecretStore {
     /// Creates a store with the keychain backend and without redaction.
     pub fn new() -> Self {
-        let keychain: Arc<dyn SecretBackend> = Arc::new(KeychainBackend);
+        let keychain = Registration {
+            owner: None,
+            backend: Arc::new(KeychainBackend),
+        };
         Self {
             backends: RwLock::new(HashMap::from([(KEYCHAIN_SCHEME.to_owned(), keychain)])),
             redactor: None,
@@ -178,13 +189,19 @@ impl SecretStore {
         }
     }
 
-    /// Registers `backend` for the URI scheme `scheme`, for example `aws-sm`.
+    /// Registers `backend` of the extension `owner` for the URI scheme
+    /// `scheme`, for example `aws-sm`.
     ///
     /// # Errors
     ///
     /// Returns an `internal` error if the scheme already has a backend. The
     /// first registration stays.
-    pub fn register(&self, scheme: &str, backend: Arc<dyn SecretBackend>) -> Result<()> {
+    pub fn register(
+        &self,
+        owner: Owner,
+        scheme: &str,
+        backend: Arc<dyn SecretBackend>,
+    ) -> Result<()> {
         let mut backends = self
             .backends
             .write()
@@ -194,10 +211,26 @@ impl SecretStore {
                 "a secret backend for the scheme `{scheme}` is already registered"
             ))),
             Entry::Vacant(free) => {
-                free.insert(backend);
+                free.insert(Registration {
+                    owner: Some(owner),
+                    backend,
+                });
                 Ok(())
             }
         }
+    }
+
+    /// Removes every backend of `owner`. Returns how many were removed.
+    ///
+    /// The built-in keychain backend has no owner and stays.
+    pub fn unregister_owner(&self, owner: &Owner) -> usize {
+        let mut backends = self
+            .backends
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let before = backends.len();
+        backends.retain(|_, registration| registration.owner.as_ref() != Some(owner));
+        before - backends.len()
     }
 
     /// Reads the secret that `uri` references from the backend of its scheme.
@@ -213,7 +246,7 @@ impl SecretStore {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(uri.scheme())
-            .cloned()
+            .map(|registration| Arc::clone(&registration.backend))
             .ok_or_else(|| {
                 Error::user(format!(
                     "no secret backend is registered for the scheme `{}`",
@@ -275,6 +308,10 @@ mod tests {
         }
     }
 
+    fn owner() -> Owner {
+        "acme.aws".parse().unwrap()
+    }
+
     fn uri(text: &str) -> SecretUri {
         text.parse().expect(text)
     }
@@ -294,10 +331,18 @@ mod tests {
     async fn the_backend_is_chosen_by_the_uri_scheme() {
         let store = SecretStore::new();
         store
-            .register("aws-sm", InMemory::with(&[("prod/db", "aws-value")]))
+            .register(
+                owner(),
+                "aws-sm",
+                InMemory::with(&[("prod/db", "aws-value")]),
+            )
             .unwrap();
         store
-            .register("gcp-sm", InMemory::with(&[("prod/db", "gcp-value")]))
+            .register(
+                owner(),
+                "gcp-sm",
+                InMemory::with(&[("prod/db", "gcp-value")]),
+            )
             .unwrap();
 
         let aws = store.resolve(&uri("aws-sm://prod/db")).await.unwrap();
@@ -332,19 +377,59 @@ mod tests {
     #[test]
     fn a_second_backend_for_a_scheme_fails_and_the_first_stays() {
         let store = SecretStore::new();
-        store.register("aws-sm", InMemory::with(&[])).unwrap();
+        store
+            .register(owner(), "aws-sm", InMemory::with(&[]))
+            .unwrap();
         for scheme in ["aws-sm", KEYCHAIN_SCHEME] {
-            let error = store.register(scheme, InMemory::with(&[])).unwrap_err();
+            let error = store
+                .register(owner(), scheme, InMemory::with(&[]))
+                .unwrap_err();
             assert_eq!(error.category(), ErrorCategory::Internal);
             assert!(error.message().contains(scheme), "{error}");
         }
     }
 
     #[tokio::test]
+    async fn unregister_owner_removes_the_backends_of_that_owner_only() {
+        let store = SecretStore::new();
+        let other: Owner = "acme.gcp".parse().unwrap();
+        for scheme in ["aws-sm", "aws-ps"] {
+            store
+                .register(owner(), scheme, InMemory::with(&[("a", "value")]))
+                .unwrap();
+        }
+        store
+            .register(other.clone(), "gcp-sm", InMemory::with(&[("a", "value")]))
+            .unwrap();
+
+        assert_eq!(store.unregister_owner(&owner()), 2);
+        assert_eq!(store.unregister_owner(&owner()), 0);
+
+        for scheme in ["aws-sm", "aws-ps"] {
+            let error = store
+                .resolve(&uri(&format!("{scheme}://a")))
+                .await
+                .unwrap_err();
+            assert!(error.message().contains("no secret backend"), "{error}");
+        }
+        store.resolve(&uri("gcp-sm://a")).await.unwrap();
+        // The scheme is free again, and the keychain backend is still there.
+        store
+            .register(other, "aws-sm", InMemory::with(&[]))
+            .unwrap();
+        let keychain = store.register(owner(), KEYCHAIN_SCHEME, InMemory::with(&[]));
+        assert!(keychain.is_err());
+    }
+
+    #[tokio::test]
     async fn the_error_of_a_failing_backend_does_not_contain_a_secret_value() {
         let store = SecretStore::new();
         store
-            .register("aws-sm", InMemory::with(&[("prod/db", "hunter2-value")]))
+            .register(
+                owner(),
+                "aws-sm",
+                InMemory::with(&[("prod/db", "hunter2-value")]),
+            )
             .unwrap();
         let error = store
             .resolve(&uri("aws-sm://prod/other"))
@@ -425,6 +510,7 @@ mod tests {
         let store = SecretStore::with_redactor(redactor.clone());
         store
             .register(
+                owner(),
                 "aws-sm",
                 InMemory::with(&[("prod/db", "hunter2-\"value\"")]),
             )
@@ -454,7 +540,11 @@ mod tests {
     async fn a_store_without_a_redactor_resolves_and_forgets() {
         let store = SecretStore::default();
         store
-            .register("aws-sm", InMemory::with(&[("prod/db", "hunter2-value")]))
+            .register(
+                owner(),
+                "aws-sm",
+                InMemory::with(&[("prod/db", "hunter2-value")]),
+            )
             .unwrap();
         let secret = store.resolve(&uri("aws-sm://prod/db")).await.unwrap();
         assert_eq!(secret.expose(), "hunter2-value");
@@ -465,7 +555,11 @@ mod tests {
     async fn the_store_is_shared_between_tasks() {
         let store = Arc::new(SecretStore::with_redactor(Redactor::new()));
         store
-            .register("aws-sm", InMemory::with(&[("prod/db", "hunter2-value")]))
+            .register(
+                owner(),
+                "aws-sm",
+                InMemory::with(&[("prod/db", "hunter2-value")]),
+            )
             .unwrap();
         let tasks: Vec<_> = (0..32)
             .map(|_| {
