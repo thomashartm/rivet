@@ -16,6 +16,7 @@ Grammar of a secret URI (as built, PR #108):
 - Form: `<scheme>://<path>`.
 - Scheme: one lowercase letter, then lowercase letters, digits, `+`, `-` or `.`. Uppercase is not accepted, so a scheme has one spelling.
 - Path: not empty and not only white space (`path.trim().is_empty()` in `secret.rs` is refused).
+- Keychain on Windows only: a `.` in the service part of a `keychain` URI is refused with a `user` error that says why. A `.` in the account part is permitted. Reason: the Windows store names an entry `<account>.<service>`, so `keychain://b.c/a` and `keychain://c/a.b` would name one entry, and a grant for one namespace would read a secret of another. macOS and Linux do not change. (Review finding R-78; not on `main` on this date. The entry name rule was read by the fix agent in the sources of the keyring crates, not checked for this record. CI does not run on Windows.)
 - Any well-formed scheme parses. The three schemes above are the built-in names; they are not a closed list.
 - A scheme without a registered backend fails when the secret is resolved, not when the URI is parsed.
 
