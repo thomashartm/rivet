@@ -21,6 +21,7 @@
 //! - Job state lives in memory only (§6.2).
 //!
 //! ```
+//! // The job model is in `rivet_sdk::job`. This module re-exports it.
 //! use rivet_core::jobs::{JobScheduler, JobState, Progress};
 //! use std::num::NonZeroUsize;
 //!
@@ -37,10 +38,12 @@
 //!     Ok("3 rows")
 //! })?;
 //!
-//! let watch = job.watch();
+//! let (watch, job_id) = (job.watch(), job.id());
 //! assert_eq!(job.join().await?, "3 rows");
 //! assert_eq!(watch.borrow().state, JobState::Succeeded);
 //! assert_eq!(watch.borrow().progress.completed, 3);
+//! let same_type: rivet_sdk::job::JobId = job_id;
+//! assert_eq!(scheduler.jobs()[0].id, same_type);
 //! # Ok(())
 //! # }
 //! ```
@@ -49,7 +52,6 @@ use crate::Owner;
 use crate::settings::Settings;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,95 +61,9 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
-/// The id of a job. It is unique in one [`JobScheduler`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct JobId(u64);
-
-impl fmt::Display for JobId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// The state of a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum JobState {
-    /// The job waits for a free slot.
-    Queued,
-    /// The job runs.
-    Running,
-    /// The job returned a value.
-    Succeeded,
-    /// The job returned an error or panicked.
-    Failed,
-    /// The job was cancelled before it started, or it stopped after a
-    /// cancel request.
-    Cancelled,
-}
-
-impl JobState {
-    /// Returns `true` for `Succeeded`, `Failed` and `Cancelled`. A finished
-    /// job does not change its state again.
-    pub fn is_finished(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
-    }
-}
-
-/// How far a job is. The unit is chosen by the job, for example rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Progress {
-    /// The number of units that are done.
-    pub completed: u64,
-    /// The number of units in total, if the job knows it.
-    pub total: Option<u64>,
-    /// A short text for the user, for example the current step.
-    pub message: Option<String>,
-}
-
-impl Progress {
-    /// Creates a progress without a message.
-    pub fn new(completed: u64, total: Option<u64>) -> Self {
-        Self {
-            completed,
-            total,
-            message: None,
-        }
-    }
-
-    /// Sets the message.
-    #[must_use]
-    pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-}
-
-/// The state and the progress of a job at one moment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobStatus {
-    /// The state of the job.
-    pub state: JobState,
-    /// The last progress that the job reported.
-    pub progress: Progress,
-}
-
-/// A copy of the data of one job, as [`JobScheduler::jobs`] returns it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobSnapshot {
-    /// The id of the job.
-    pub id: JobId,
-    /// What the job does, for example `query` or `export`.
-    pub kind: String,
-    /// The extension that started the job.
-    pub owner: Owner,
-    /// The state of the job.
-    pub state: JobState,
-    /// The last progress that the job reported.
-    pub progress: Progress,
-    /// The error text of a `Failed` or `Cancelled` job. The value of a
-    /// successful job goes to its [`JobHandle`] only.
-    pub error: Option<String>,
-}
+// The job model is plain data in the SDK, so that an extension can use it
+// (§3.2). This re-export keeps the paths `rivet_core::jobs::JobId`, etc.
+pub use rivet_sdk::job::{JobId, JobSnapshot, JobState, JobStatus, Progress};
 
 /// Tells a job that it must stop. Clones share the same state.
 ///
@@ -507,14 +423,13 @@ impl JobScheduler {
         let jobs = self.inner.lock();
         let active = jobs.active.iter().map(|(id, job)| {
             let status = job.status.borrow();
-            JobSnapshot {
-                id: *id,
-                kind: job.kind.clone(),
-                owner: job.owner.clone(),
-                state: status.state,
-                progress: status.progress.clone(),
-                error: None,
-            }
+            JobSnapshot::new(
+                *id,
+                job.kind.clone(),
+                job.owner.clone(),
+                status.state,
+                status.progress.clone(),
+            )
         });
         active.chain(jobs.finished.iter().cloned()).collect()
     }
@@ -530,12 +445,10 @@ impl JobScheduler {
         let runtime = Handle::try_current().map_err(|error| {
             Error::internal("a job can start only inside the Tokio runtime").with_source(error)
         })?;
-        let id = JobId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = JobId::new(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (cancel, cancel_requests) = watch::channel(false);
-        let (status, status_watch) = watch::channel(JobStatus {
-            state: JobState::Queued,
-            progress: Progress::default(),
-        });
+        let (status, status_watch) =
+            watch::channel(JobStatus::new(JobState::Queued, Progress::default()));
         let (result_sender, result) = oneshot::channel();
         {
             // One lock for the count and the insert: two spawns at the same
@@ -682,14 +595,10 @@ impl Inner {
         let Some(job) = jobs.active.remove(&id) else {
             return;
         };
-        jobs.finished.push_back(JobSnapshot {
-            id,
-            kind: job.kind,
-            owner: job.owner,
-            state,
-            progress: status.borrow().progress.clone(),
-            error: error.map(ToString::to_string),
-        });
+        let progress = status.borrow().progress.clone();
+        let mut snapshot = JobSnapshot::new(id, job.kind, job.owner, state, progress);
+        snapshot.error = error.map(ToString::to_string);
+        jobs.finished.push_back(snapshot);
         while jobs.finished.len() > self.retain_finished {
             jobs.finished.pop_front();
         }

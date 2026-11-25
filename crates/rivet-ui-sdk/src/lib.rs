@@ -18,12 +18,30 @@ use rivet_sdk::manifest::ExtensionPoint;
 /// The identity of a UI contribution. The UI shell uses it to register the
 /// contribution and to show it to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UiDescriptor {
     /// The name of the contribution inside the extension. It is the `id` of
     /// the contribution in the manifest.
     pub id: String,
     /// The text that the UI shell shows for the contribution.
     pub title: String,
+}
+
+impl UiDescriptor {
+    /// Creates a descriptor.
+    ///
+    /// ```
+    /// use rivet_ui_sdk::UiDescriptor;
+    ///
+    /// let descriptor = UiDescriptor::new("grid", "Result grid");
+    /// assert_eq!(descriptor.title, "Result grid");
+    /// ```
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+        }
+    }
 }
 
 /// The contract of [`ExtensionPoint::UiView`]: a view in the main area of a

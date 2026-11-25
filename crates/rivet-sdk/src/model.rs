@@ -55,6 +55,7 @@ pub type ExtensionFields = BTreeMap<String, ExtensionValue>;
 /// `secrets`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProviderRef {
     /// The id under which the extension registered the implementation.
     pub id: String,
@@ -76,11 +77,26 @@ impl ProviderRef {
             secrets: BTreeMap::new(),
         }
     }
+
+    /// Sets the settings.
+    #[must_use]
+    pub fn with_settings(mut self, settings: ExtensionFields) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Sets the secret references.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: BTreeMap<String, SecretUri>) -> Self {
+        self.secrets = secrets;
+        self
+    }
 }
 
 /// The network address of a database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Endpoint {
     /// The host name or IP address.
     pub host: String,
@@ -92,9 +108,36 @@ pub struct Endpoint {
     pub database: Option<String>,
 }
 
+impl Endpoint {
+    /// Creates an endpoint with the default port and the default database of
+    /// the engine.
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: None,
+            database: None,
+        }
+    }
+
+    /// Sets the port.
+    #[must_use]
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    /// Sets the database to open.
+    #[must_use]
+    pub fn with_database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
+        self
+    }
+}
+
 /// A client certificate for mutual TLS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ClientCertificate {
     /// The path of the certificate file. A certificate is public.
     pub certificate: PathBuf,
@@ -102,10 +145,22 @@ pub struct ClientCertificate {
     pub private_key: SecretUri,
 }
 
+impl ClientCertificate {
+    /// Creates a client certificate from the path of the certificate file and
+    /// the reference to the private key.
+    pub fn new(certificate: impl Into<PathBuf>, private_key: SecretUri) -> Self {
+        Self {
+            certificate: certificate.into(),
+            private_key,
+        }
+    }
+}
+
 /// The TLS settings of a profile (§7.5). TLS is on unless `enabled` is set to
 /// `false` explicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct TlsSettings {
     /// `false` permits a plaintext connection. Every interface shows such a
     /// profile as insecure.
@@ -135,12 +190,42 @@ impl Default for TlsSettings {
     }
 }
 
+impl TlsSettings {
+    /// Creates the default settings: TLS on, system trust store, no client
+    /// certificate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets `enabled`. `false` permits a plaintext connection.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Sets the CA certificate file. Only this CA is trusted then.
+    #[must_use]
+    pub fn with_ca_certificate(mut self, ca_certificate: impl Into<PathBuf>) -> Self {
+        self.ca_certificate = Some(ca_certificate.into());
+        self
+    }
+
+    /// Sets the client certificate.
+    #[must_use]
+    pub fn with_client_certificate(mut self, client_certificate: ClientCertificate) -> Self {
+        self.client_certificate = Some(client_certificate);
+        self
+    }
+}
+
 /// How to reach and open one database (§5.3, §6.1).
 ///
 /// A profile contains no secret values. Each secret is a [`SecretUri`], so a
 /// profile can be stored as a plain file and committed (§6.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ConnectionProfile {
     /// The database driver.
     pub engine: ProviderRef,
@@ -167,6 +252,86 @@ pub struct ConnectionProfile {
     /// The environment tag, for example `production`.
     #[serde(default)]
     pub environment: Option<String>,
+}
+
+impl ConnectionProfile {
+    /// Creates a profile with the required fields. The other fields have the
+    /// same values as in a profile file that does not set them: no credential
+    /// source, no tunnels, TLS on, writes permitted without confirmation, no
+    /// environment tag.
+    ///
+    /// ```
+    /// use rivet_sdk::model::{ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
+    ///
+    /// let profile = ConnectionProfile::new(
+    ///     ProviderRef::new("postgres"),
+    ///     Endpoint::new("db.example.com").with_port(5432),
+    ///     ProviderRef::new("password"),
+    /// )
+    /// .with_read_only(true)
+    /// .with_environment("production");
+    ///
+    /// assert_eq!(profile.endpoint.port, Some(5432));
+    /// assert_eq!(profile.tls, TlsSettings::new());
+    /// assert!(profile.read_only);
+    /// ```
+    pub fn new(engine: ProviderRef, endpoint: Endpoint, auth: ProviderRef) -> Self {
+        Self {
+            engine,
+            endpoint,
+            auth,
+            credential_source: None,
+            tunnels: Vec::new(),
+            tls: TlsSettings::default(),
+            read_only: false,
+            confirm_on_write: false,
+            environment: None,
+        }
+    }
+
+    /// Sets the credential source that the auth method uses.
+    #[must_use]
+    pub fn with_credential_source(mut self, credential_source: ProviderRef) -> Self {
+        self.credential_source = Some(credential_source);
+        self
+    }
+
+    /// Sets the tunnels, in order from the client to the database.
+    #[must_use]
+    pub fn with_tunnels(mut self, tunnels: impl IntoIterator<Item = ProviderRef>) -> Self {
+        self.tunnels = tunnels.into_iter().collect();
+        self
+    }
+
+    /// Sets the TLS settings.
+    #[must_use]
+    pub fn with_tls(mut self, tls: TlsSettings) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Sets `read_only`. `true` makes the engine reject statements that
+    /// write.
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Sets `confirm_on_write`. `true` makes the engine ask for confirmation
+    /// before a statement that writes.
+    #[must_use]
+    pub fn with_confirm_on_write(mut self, confirm_on_write: bool) -> Self {
+        self.confirm_on_write = confirm_on_write;
+        self
+    }
+
+    /// Sets the environment tag.
+    #[must_use]
+    pub fn with_environment(mut self, environment: impl Into<String>) -> Self {
+        self.environment = Some(environment.into());
+        self
+    }
 }
 
 /// The kind of a [`CatalogObject`] (§6.1).
@@ -201,6 +366,7 @@ pub enum CatalogObjectKind {
 /// One object in the catalog of a database, with the objects it contains.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CatalogObject {
     /// The kind of the object.
     pub kind: CatalogObjectKind,
@@ -217,17 +383,72 @@ pub struct CatalogObject {
     pub children: Vec<CatalogObject>,
 }
 
+impl CatalogObject {
+    /// Creates an object with no definition, no extension fields and no
+    /// children.
+    ///
+    /// ```
+    /// use rivet_sdk::model::{Catalog, CatalogObject, CatalogObjectKind};
+    ///
+    /// let schema = CatalogObject::new(CatalogObjectKind::Schema, "public")
+    ///     .with_children([CatalogObject::new(CatalogObjectKind::Table, "users")]);
+    /// let catalog = Catalog::new([schema]);
+    /// assert_eq!(catalog.objects[0].children[0].name, "users");
+    /// ```
+    pub fn new(kind: CatalogObjectKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            definition: None,
+            extensions: ExtensionFields::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Sets the statement that creates the object.
+    #[must_use]
+    pub fn with_definition(mut self, definition: impl Into<String>) -> Self {
+        self.definition = Some(definition.into());
+        self
+    }
+
+    /// Sets the details that only the engine extension understands.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: ExtensionFields) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// Sets the objects inside this object.
+    #[must_use]
+    pub fn with_children(mut self, children: impl IntoIterator<Item = CatalogObject>) -> Self {
+        self.children = children.into_iter().collect();
+        self
+    }
+}
+
 /// The catalog of a database: a tree of [`CatalogObject`]s.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Catalog {
     /// The objects at the top level.
     #[serde(default)]
     pub objects: Vec<CatalogObject>,
 }
 
+impl Catalog {
+    /// Creates a catalog from the objects at the top level.
+    pub fn new(objects: impl IntoIterator<Item = CatalogObject>) -> Self {
+        Self {
+            objects: objects.into_iter().collect(),
+        }
+    }
+}
+
 /// What the database reports about one column of a result set.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ColumnMetadata {
     /// The type name in the database, for example `varchar(40)`.
     pub source_type: String,
@@ -235,6 +456,24 @@ pub struct ColumnMetadata {
     pub nullable: bool,
     /// Details that only the engine extension understands.
     pub extensions: ExtensionFields,
+}
+
+impl ColumnMetadata {
+    /// Creates the metadata of a column with no extension fields.
+    pub fn new(source_type: impl Into<String>, nullable: bool) -> Self {
+        Self {
+            source_type: source_type.into(),
+            nullable,
+            extensions: ExtensionFields::new(),
+        }
+    }
+
+    /// Sets the details that only the engine extension understands.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: ExtensionFields) -> Self {
+        self.extensions = extensions;
+        self
+    }
 }
 
 /// A stream of Arrow record batches (§5.5). An `Err` item ends the result.
