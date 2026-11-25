@@ -40,7 +40,9 @@
 //! ```
 
 use rivet_sdk::error::Error;
-use rivet_sdk::manifest::{ActivationEvent, ExtensionId, ExtensionPoint, Manifest, Version};
+use rivet_sdk::manifest::{
+    ActivationEvent, ExtensionId, ExtensionPoint, Manifest, Version, VersionReq,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The result of resolution for one extension (§4.4 state diagram).
@@ -85,6 +87,10 @@ impl Resolution {
     }
 }
 
+/// The largest number of extensions that one rejection reason names as
+/// conflict parties.
+pub const MAX_CONFLICT_PARTIES: usize = 5;
+
 /// Resolves the dependencies of `manifests` for a host with the SDK version
 /// `host_sdk` (§4.5).
 ///
@@ -98,11 +104,21 @@ impl Resolution {
 /// 2. It is in a dependency cycle. The reason names the cycle.
 /// 3. Its SDK range does not include `host_sdk`.
 /// 4. A dependency is not present.
-/// 5. A dependency is present in a version outside the range. If other
-///    extensions depend on the same extension with a different range, the
-///    ranges are in conflict: the reason also names each of these extensions
-///    and its range, sorted by id. An extension whose range includes the
-///    present version is not rejected for this.
+/// 5. A dependency is present in a version outside the range. An extension
+///    whose range includes the present version is not rejected for this.
+///
+///    The reason also names the conflicts: each other extension that depends
+///    on the same extension with a conflicting range, and its range, sorted
+///    by id.
+///    - Two ranges conflict when no release version satisfies both. Thus
+///      `^1` and `^2` conflict; `^1`, `^1.0` and `>=1.0.0, <2.0.0` do not,
+///      and `^1` and `^1.2` do not.
+///    - Limit: versions with a pre-release tag are not tried. Two ranges
+///      that have only pre-release versions in common are named as a
+///      conflict.
+///    - An extension that is rejected for another reason is not named.
+///    - At most [`MAX_CONFLICT_PARTIES`] extensions are named. The reason
+///      gives the number of the others.
 /// 6. A dependency is rejected.
 ///
 /// Reasons 4 to 6 are checked for one dependency after the other, sorted by
@@ -169,6 +185,8 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
     let unsorted = unique.keys().copied().filter(|&id| stuck(id));
 
     let mut resolved = Vec::new();
+    // (dependent, dependency): the range rejects the present version.
+    let mut mismatches: Vec<(&ExtensionId, &ExtensionId)> = Vec::new();
     for id in sorted.iter().copied().chain(unsorted) {
         let Some(&manifest) = unique.get(id) else {
             continue;
@@ -202,27 +220,12 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
                          `{dependency}` is not present"
                     )),
                     Some(found) if !range.matches(&found.version) => {
-                        let mut message = format!(
+                        mismatches.push((id, dependency));
+                        Some(format!(
                             "extension `{id}` depends on `{dependency}` `{range}`, but \
                              `{dependency}` {} is present",
                             found.version
-                        );
-                        let others = unique.values().filter_map(|other| {
-                            let other_range = other.dependencies.get(dependency)?;
-                            (other_range != range).then(|| {
-                                format!(
-                                    "extension `{}`, which depends on `{dependency}` \
-                                     `{other_range}`",
-                                    other.id
-                                )
-                            })
-                        });
-                        let others: Vec<String> = others.collect();
-                        if !others.is_empty() {
-                            message +=
-                                &format!("; this is a conflict with {}", others.join(" and "));
-                        }
-                        Some(message)
+                        ))
                     }
                     _ => is_rejected(dependency).then(|| {
                         format!("extension `{id}` depends on `{dependency}`, which is rejected")
@@ -235,7 +238,74 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
         }
         outcomes.insert(id.clone(), outcome);
     }
+
+    // The conflict parties of reason 5. This needs the outcome of each
+    // extension, so it comes after the loop.
+    for &(id, dependency) in &mismatches {
+        let (Some(manifest), Some(Outcome::Rejected { reason })) =
+            (unique.get(id), outcomes.get(id))
+        else {
+            continue;
+        };
+        let Some(range) = manifest.dependencies.get(dependency) else {
+            continue;
+        };
+        let others: Vec<String> = unique
+            .values()
+            .filter(|other| other.id != *id)
+            .filter_map(|other| {
+                let other_range = other.dependencies.get(dependency)?;
+                let takes_part = matches!(outcomes.get(&other.id), Some(Outcome::Resolved))
+                    || mismatches.contains(&(&other.id, dependency));
+                (takes_part && ranges_conflict(range, other_range)).then(|| {
+                    format!(
+                        "extension `{}`, which depends on `{dependency}` `{other_range}`",
+                        other.id
+                    )
+                })
+            })
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        let named = others.len().min(MAX_CONFLICT_PARTIES);
+        let mut message = format!(
+            "{}; this is a conflict with {}",
+            reason.message(),
+            others[..named].join(" and ")
+        );
+        if others.len() > named {
+            message += &format!(" and {} more extensions", others.len() - named);
+        }
+        outcomes.insert(id.clone(), reject(message));
+    }
     Resolution { outcomes, resolved }
+}
+
+/// `true` if no release version satisfies both ranges.
+///
+/// Versions with a pre-release tag are not tried: two ranges that have only
+/// pre-release versions in common are reported as a conflict.
+fn ranges_conflict(a: &VersionReq, b: &VersionReq) -> bool {
+    // If a version satisfies both ranges, the smallest such version is 0.0.0,
+    // the version of a comparator, or the next patch, minor or major version
+    // after it (`>1.2.3`, `>1.2`, `>1`). To try these is enough.
+    let after = |number: u64| number.saturating_add(1);
+    let comparators = a.comparators.iter().chain(&b.comparators);
+    let mut candidates = comparators
+        .flat_map(|comparator| {
+            let major = comparator.major;
+            let minor = comparator.minor.unwrap_or(0);
+            let patch = comparator.patch.unwrap_or(0);
+            [
+                Version::new(major, minor, patch),
+                Version::new(major, minor, after(patch)),
+                Version::new(major, after(minor), 0),
+                Version::new(after(major), 0, 0),
+            ]
+        })
+        .chain([Version::new(0, 0, 0)]);
+    !candidates.any(|version| a.matches(&version) && b.matches(&version))
 }
 
 /// Finds the shortest dependency cycle through `start`. The result starts at
@@ -603,6 +673,114 @@ mod tests {
             "c",
             &[&format!("conflict with {a} and {b} and {d}")],
         );
+    }
+
+    /// R-46: `^1`, `^1.0` and `>=1.0.0, <2.0.0` are one range in three
+    /// spellings, and `^1.2` has versions in common with them.
+    #[test]
+    fn ranges_with_a_common_version_are_not_a_conflict() {
+        let dependents = |lib: &str| {
+            resolve_all(&[
+                ext("a", "1.0.0", &[("lib", "^1")]),
+                ext("b", "1.0.0", &[("lib", "^1.0")]),
+                ext("c", "1.0.0", &[("lib", ">=1.0.0, <2.0.0")]),
+                ext("d", "1.0.0", &[("lib", "^1.2")]),
+                ext("lib", lib, &[]),
+            ])
+        };
+        let resolution = dependents("3.0.0");
+        for id in ["a", "b", "c", "d"] {
+            let message = rejected(&resolution, id, &["3.0.0 is present"]);
+            assert!(!message.contains("conflict"), "{message}");
+        }
+        let resolution = dependents("1.1.0");
+        let message = rejected(&resolution, "d", &["1.1.0 is present"]);
+        assert!(!message.contains("conflict"), "{message}");
+    }
+
+    #[test]
+    fn ranges_conflict_when_no_release_version_satisfies_both() {
+        let conflict = |a: &str, b: &str| {
+            let (a, b) = (a.parse().expect(a), b.parse().expect(b));
+            assert_eq!(ranges_conflict(&a, &b), ranges_conflict(&b, &a));
+            ranges_conflict(&a, &b)
+        };
+        for (a, b) in [
+            ("^1", "^2"),
+            ("<1.0.0", ">=1.0.0"),
+            ("=1.2.3", "^1.3"),
+            ("~1.2", "^1.3"),
+            (">1", "<=1.9"),
+            (">1.2.3", "<=1.2.3"),
+            ("^0.1", "^0.2"),
+        ] {
+            assert!(conflict(a, b), "{a} and {b}");
+        }
+        for (a, b) in [
+            ("^1", "^1.0"),
+            ("^1", ">=1.0.0, <2.0.0"),
+            ("^1", "^1.2"),
+            ("<2.0.0", "<1.0.0"),
+            (">1.0.0", "<2.0.0"),
+            (">1.2.3", "<1.2.5"),
+            (">1.2", "<1.4"),
+            (">1", "<3"),
+            ("*", "^7"),
+            ("=1.2.3", "~1.2"),
+        ] {
+            assert!(!conflict(a, b), "{a} and {b}");
+        }
+    }
+
+    #[test]
+    fn conflict_names_at_most_five_extensions_and_counts_the_others() {
+        let mut manifests = vec![
+            ext("a", "1.0.0", &[("lib", "^1")]),
+            ext("lib", "9.0.0", &[]),
+        ];
+        for major in 2..=8 {
+            let range = format!("^{major}");
+            manifests.push(ext(&format!("e{major}"), "1.0.0", &[("lib", &range)]));
+        }
+        let resolution = resolve_all(&manifests);
+        let message = rejected(
+            &resolution,
+            "a",
+            &[
+                "conflict with extension `e2`",
+                "`e6`",
+                "and 2 more extensions",
+            ],
+        );
+        assert!(!message.contains("`e7`"), "{message}");
+        assert!(!message.contains("`e8`"), "{message}");
+    }
+
+    #[test]
+    fn extension_that_is_rejected_for_another_reason_is_not_a_conflict_party() {
+        let mut manifests = vec![
+            ext("a", "1.0.0", &[("lib", "^1")]),
+            // Rejected for the SDK range.
+            ext("b", "1.0.0", &[("lib", "^2")]),
+            // Rejected for a dependency that is not present.
+            ext("c", "1.0.0", &[("absent", "^1"), ("lib", "^3")]),
+            // Rejected for the range of another dependency.
+            ext("d", "1.0.0", &[("base", "^2"), ("lib", "^4")]),
+            ext("e", "1.0.0", &[("lib", "^5")]),
+            ext("base", "1.0.0", &[]),
+            ext("lib", "9.0.0", &[]),
+        ];
+        manifests[1].sdk = "^9".parse().expect("valid range");
+        let resolution = resolve_all(&manifests);
+        let e = "extension `e`, which depends on `lib` `^5`";
+        let message = rejected(&resolution, "a", &[&format!("conflict with {e}")]);
+        for other in ["`b`", "`c`", "`d`"] {
+            assert!(!message.contains(other), "{message}");
+        }
+        rejected(&resolution, "b", &["SDK"]);
+        rejected(&resolution, "c", &["`absent` is not present"]);
+        let message = rejected(&resolution, "d", &["`base`"]);
+        assert!(!message.contains("conflict"), "{message}");
     }
 
     #[test]
