@@ -29,6 +29,12 @@ Weak keys (review fix, not on `main` on this date):
 - A signature whose point R has a small order is accepted when the key is valid. Only the owner of the secret key can make it, so it is not a forgery. The project does not need one unique signature per package, so there is no check for it.
 - The check is a fixed list of encodings in `package.rs`. No new crate. The list was not checked for this ADR; the tests of the fix must show that each listed encoding is refused and that the forged signature of the review finding does not verify.
 
+Key id and file mode (review fixes R-59 and R-68b, not on `main` on this date):
+
+- A signature whose key id differs from the key id of the key gives its own `policy` error. The text says that the package was signed with another key or that the pinned text has a wrong key id.
+- A pin with the key bytes of the pinned key and another text is refused with a `policy` error. Nothing is kept or replaced without a message. The replace call after a review stays the way to change the text.
+- On Unix, a trust store file that the group or others can write is not loaded (`user` error with the mode and the fix `chmod 600`). The engine itself writes the file with mode `0600`. A file made by hand with a umask of `002` is refused; this is intended. The owner and the mode of the parent directory are not checked. There is no such check on Windows.
+
 ## Consequences
 
 - A package cannot name another publisher to replace that publisher's extension.
