@@ -4,7 +4,7 @@
 use rivet_core::bus::{CommandBus, EventBus, Received, Subscription};
 use rivet_core::host::{
     ExtensionContext, ExtensionHost, ExtensionInstance, ExtensionRuntime, ExtensionStateChanged,
-    MANIFEST_FILE, Services,
+    HostConfig, MANIFEST_FILE, Services,
 };
 use rivet_core::jobs::JobScheduler;
 use rivet_core::registry::ServiceRegistry;
@@ -223,9 +223,10 @@ impl TestEngine {
             sdk_version,
             vec![directory.path().to_owned()],
             true,
+            HostConfig::default(),
         );
         Ok(Self {
-            host: Arc::new(host),
+            host,
             services,
             shared,
             events,
