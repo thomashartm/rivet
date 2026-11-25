@@ -1186,6 +1186,9 @@ mod tests {
              cancel_grace_ms = 250\n",
         )
         .unwrap();
+        assert_eq!(config.max_concurrent, NonZeroUsize::MIN);
+        assert_eq!(config.max_per_extension, NonZeroUsize::new(2));
+        assert_eq!(config.retain_finished, 1);
         assert_eq!(config.cancel_grace, Duration::from_millis(250));
 
         // The settings limit the jobs of the scheduler.
