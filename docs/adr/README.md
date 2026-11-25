@@ -22,6 +22,7 @@
 | [0018](0018-wasm-runtime-parameters.md) | WASM runtime parameters | Proposed |
 | [0019](0019-publisher-identity-and-trust-store.md) | Publisher identity and trust store | Proposed |
 | [0020](0020-permission-matching-rules.md) | Permission matching rules | Proposed |
+| [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Proposed |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
