@@ -11,6 +11,7 @@ pub mod registry;
 pub mod resolve;
 pub mod secrets;
 pub mod settings;
+pub mod wasm;
 
 /// The extension that owns a registration.
 pub type Owner = rivet_sdk::manifest::ExtensionId;
