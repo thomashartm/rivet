@@ -2273,6 +2273,16 @@ mod tests {
         }
     }
 
+    /// Removes the mode `.1` when it is dropped. A failed assert must end
+    /// a call that blocks a thread: the drop of the runtime waits for it.
+    struct Open<'a>(&'a Fake, &'static str);
+
+    impl Drop for Open<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.1, None);
+        }
+    }
+
     struct FakeRuntime(Arc<Fake>);
 
     impl ExtensionRuntime for FakeRuntime {
@@ -2352,11 +2362,24 @@ mod tests {
                         }
                         Err(Error::cancelled("stopped"))
                     })?;
+                // `stall <id>`: the call blocks its async worker, without a
+                // yield after the start of the job, until the test removes
+                // the mode `hold stall <id>`.
+                let hold = format!("hold stall {owner}");
+                if self.fake.mode(&format!("stall {owner}")).is_some() {
+                    self.fake.log(&format!("stall {owner}"));
+                    while self.fake.mode(&hold).is_some() {
+                        std::thread::sleep(MS);
+                    }
+                }
                 // `blocking <id>`: a blocking job that ignores the cancel
-                // request. It runs until the test removes the mode.
+                // request. It runs until the test removes the mode. With
+                // `blocking <id> late`, it then calls `register_late` and
+                // logs `blocking <id> ended`.
                 let blocking = format!("blocking {owner}");
                 if self.fake.mode(&blocking).is_some() {
                     let fake = Arc::clone(&self.fake);
+                    let (again, of) = (services.clone(), owner.clone());
                     services
                         .jobs
                         .spawn_blocking(owner.clone(), "blocking", move |_| {
@@ -2364,6 +2387,10 @@ mod tests {
                             while fake.mode(&blocking).is_some() {
                                 std::thread::sleep(MS);
                             }
+                            if fake.mode(&format!("{blocking} late")).is_some() {
+                                register_late(&fake, &again, &of);
+                            }
+                            fake.log(&format!("{blocking} ended"));
                             Ok(())
                         })?;
                 }
@@ -3348,6 +3375,36 @@ mod tests {
         );
         assert_eq!(f.registered("b").await, (false, false));
         assert_eq!(f.job_end("b").await, ErrorCategory::Cancelled);
+    }
+
+    // R-124: a `deactivate` call that ends after the time limit. The
+    // shutdown unloads the dependent before its dependency, and it returns
+    // with no instance left.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "waits for ruling"]
+    async fn a_shutdown_unloads_a_dependent_whose_deactivation_ended_late_first() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.host.discover().await.unwrap();
+        f.go("b").await;
+        f.fake.take_calls();
+        f.fake.set("deactivate b", Some(Mode::Wait));
+        // The call of `b` ends one second after the time limit.
+        let fake = Arc::clone(&f.fake);
+        let late = HostConfig::default().call_timeout + Duration::from_secs(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(late).await;
+            fake.gate.notify_one();
+        });
+
+        let failures = f.host.shutdown().await;
+
+        assert!(failures.contains_key(&id("b")), "{failures:?}");
+        assert_eq!(
+            f.fake.take_calls(),
+            ["deactivate b", "unload b", "deactivate a", "unload a"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4926,15 +4983,7 @@ mod tests {
             f.fake.set("activate a", Some(Mode::Block));
             f.fake.set("hold activate a", Some(Mode::Fail));
             f.fake.set("late a", Some(Mode::Fail));
-            // A failed assert must end the old call: the drop of the
-            // runtime waits for it.
-            struct Open<'a>(&'a Fake);
-            impl Drop for Open<'_> {
-                fn drop(&mut self) {
-                    self.0.set("hold activate a", None);
-                }
-            }
-            let _open = Open(&f.fake);
+            let _open = Open(&f.fake, "hold activate a");
 
             let report = f.go("a").await;
 
@@ -5135,5 +5184,82 @@ mod tests {
         assert_eq!(lines.len(), 1, "{log}");
         assert!(lines[0].contains("WARN"), "{log}");
         assert!(lines[0].contains("extension=a jobs=1"), "{log}");
+    }
+
+    // R-122: what the code of an aborted job registers after the unload of
+    // its extension is released when that code ends.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "waits for ruling"]
+    async fn what_an_aborted_job_registers_after_the_unload_is_released() {
+        let grace = crate::jobs::JobConfig::default().cancel_grace;
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.fake.set("blocking a", Some(Mode::Hang));
+        f.fake.set("blocking a late", Some(Mode::Fail));
+        let _open = Open(&f.fake, "blocking a");
+        f.go("a").await;
+        f.fake.called("blocking a").await;
+        let host = Arc::clone(&f.host);
+        let stop = tokio::spawn(async move { host.deactivate(&id("a")).await });
+        // As in the test above: only the grace period must end.
+        while !stop.is_finished() {
+            tokio::time::advance(grace / 5).await;
+        }
+        stop.await.unwrap().unwrap();
+        f.host.unload(&id("a")).await.unwrap();
+
+        // The code of the job ends and registers.
+        f.fake.set("blocking a", None);
+        f.fake.called("blocking a ended").await;
+        let any = semver::VersionReq::STAR;
+        let released = tokio::time::timeout(Duration::from_secs(60), async {
+            while f.services.registry.lookup::<str>("a.late", &any).is_ok() {
+                tokio::time::sleep(MS).await;
+            }
+        })
+        .await;
+
+        assert!(released.is_ok(), "the service `a.late` stays registered");
+        assert_eq!(f.late("a").await, (0, false, false, false));
+    }
+
+    // R-123: a call that starts a job and then blocks its async worker
+    // without a yield. The release of the job must end in its time limit.
+    #[test]
+    #[ignore = "waits for ruling"]
+    fn a_call_that_blocks_its_worker_after_the_start_of_a_job_does_not_stop_the_host() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config = HostConfig {
+                call_timeout: 50 * MS,
+                backoff_initial: Duration::from_secs(3600),
+                backoff_max: Duration::from_secs(3600),
+                ..HostConfig::default()
+            };
+            let f = fixture_with(true, config);
+            f.add("a", &[]);
+            f.host.discover().await.unwrap();
+            // An activation without a load: Tokio then runs the job of the
+            // call next on the blocked worker (its LIFO slot). After a
+            // `load` call it can go to a queue that other workers take from.
+            f.go("a").await;
+            f.host.deactivate(&id("a")).await.unwrap();
+            f.fake.set("stall a", Some(Mode::Fail));
+            f.fake.set("hold stall a", Some(Mode::Fail));
+            let _open = Open(&f.fake, "hold stall a");
+
+            // The time limit of the call and the grace period are less
+            // than 6 s.
+            let report = tokio::time::timeout(Duration::from_secs(20), f.go("a")).await;
+
+            assert_eq!(f.fake.count("stall a"), 1);
+            let report = report.expect("the release of the job did not end");
+            assert!(report.not_activated.contains_key(&id("a")));
+        });
     }
 }

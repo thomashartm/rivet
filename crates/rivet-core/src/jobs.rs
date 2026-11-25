@@ -1312,6 +1312,39 @@ mod tests {
         next.unwrap().join().await.unwrap();
     }
 
+    // R-126 a: async code that ignores the cancel request stops with the
+    // abort. Right after `stop_owner` it must not count as code that still
+    // runs: the host then warns that it can register again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "waits for ruling"]
+    async fn an_aborted_async_job_does_not_count_as_running_after_stop_owner() {
+        const ROUNDS: usize = 200;
+        let scheduler = JobScheduler::with_config(JobConfig {
+            cancel_grace: Duration::from_millis(1),
+            ..JobConfig::default()
+        });
+        let owner = owner("ext.a");
+        let mut counted = 0;
+        for _ in 0..ROUNDS {
+            let stubborn = scheduler
+                .spawn(owner.clone(), "query", |_| {
+                    std::future::pending::<Result<()>>()
+                })
+                .unwrap();
+            wait_for(&stubborn, JobState::Running).await;
+
+            assert_eq!(scheduler.stop_owner(&owner).await, 1);
+
+            if scheduler.aborted_running(&owner) > 0 {
+                counted += 1;
+            }
+        }
+        assert_eq!(
+            counted, 0,
+            "counted as running in {counted} of {ROUNDS} rounds"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn aborted_job_whose_code_still_runs_is_cancelled_but_keeps_its_slot() {
         let config = JobConfig {
