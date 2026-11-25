@@ -862,6 +862,8 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             .iter()
             .find(|(entry_name, _)| entry_name.as_bytes() == path)
         else {
+            // Not `logging::shown`: the name is bytes that can be no UTF-8,
+            // so the cut is before the conversion to text. The mark is `...`.
             let (shown, cut) = match path.get(..ENTRY_NAME_SHOWN_BYTES) {
                 Some(start) if start.len() < path.len() => (start, "..."),
                 _ => (&path[..], ""),

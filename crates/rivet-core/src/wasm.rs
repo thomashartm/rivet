@@ -407,6 +407,8 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
             c => c,
         })
         .collect();
+    // Not `logging::shown`: no escape and no mark, so the result has the
+    // limit as its true maximum, and step 2 replaced the unsafe characters.
     text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
     text
 }
