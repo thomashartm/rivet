@@ -401,11 +401,10 @@ impl fmt::Debug for ExtensionSecrets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::{Capture, Level, LogFormat};
+    use crate::logging::{Capture, Level, LogFormat, capture_logs};
     use rivet_sdk::error::ErrorCategory;
     use rivet_sdk::manifest::Manifest;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tracing::dispatcher::with_default;
     use tracing::info;
 
     /// A backend that holds its secrets in memory.
@@ -658,11 +657,12 @@ mod tests {
 
         for format in [LogFormat::Human, LogFormat::Json] {
             let capture = Capture::default();
-            with_default(&capture.dispatch(Level::INFO, format, &redactor), || {
+            {
+                let _guard = capture_logs(&capture.dispatch(Level::INFO, format, &redactor));
                 // The mistake: code logs the exposed value.
                 info!("connecting with password {}", secret.expose());
                 info!(password = secret.expose(), debug = ?secret.expose(), "connecting");
-            });
+            }
             let output = capture.text();
             assert_eq!(output.lines().count(), 2, "{output}");
             assert!(output.contains("connecting"), "{output}");
