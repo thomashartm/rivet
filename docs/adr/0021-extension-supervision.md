@@ -1,11 +1,11 @@
 # ADR-0021: Extension supervision: restart, timeouts and job limit
 
-- Status: Proposed
+- Status: Accepted (maintainer, 2026-11-25). The points that the text marks as open or as a proposal stay open.
 - Date: 2026-11-25
 
 ## Context
 
-ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 requires that a restart of a failed extension takes less than 1 s. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is on `main` (PR #121). The ten setting keys and their defaults below were compared with `HostConfig` in `host.rs` and `JobConfig` in `jobs.rs`: they are equal. The behaviour rules were not compared with the code line by line.
+ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 required, when this ADR was written, that a restart of a failed extension takes less than 1 s; the maintainer dropped that target on 2026-11-25. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is on `main` (PR #121). The ten setting keys and their defaults below were compared with `HostConfig` in `host.rs` and `JobConfig` in `jobs.rs`: they are equal. The behaviour rules were not compared with the code line by line.
 
 ## Decision
 
@@ -52,7 +52,7 @@ Behaviour:
 
 ## Consequences
 
-- The §9 target "a restart of a failed extension takes < 1 s" is read as: for the first restart, the time from the failure to the state `Active` is below 1 s. That is the delay of 100 ms plus the restart call. Later attempts add their backoff delay on purpose; the target does not apply to them.
+- §9 has no time target for a restart (decided by the maintainer on 2026-11-25; review finding R-40). Before, §9 said "< 1 s". The first restart waits 100 ms and then runs the restart call; later attempts add their backoff delay on purpose.
 - With the defaults the delays are 100, 200, 400, 800 and 1000 ms. The time of the restart call is not measured yet, so the target is not proven.
 - An earlier text of this ADR had `backoff_max_ms` = 60000. That value gave a fifth delay of 1600 ms and was never reached with 5 restarts.
 - The defaults are not measured. They are settings and can change without a contract change.
