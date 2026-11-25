@@ -49,6 +49,7 @@
 //! <data>/store/<id>/<id>-<version>.rivetpkg.minisig
 //! <data>/store/<id>/previous             the version for a rollback
 //! <data>/store/<id>/pending              the journal of a change that is not complete
+//! <data>/store/<id>/.lock                the lock of the id; never renamed, never deleted
 //! ```
 //!
 //! `<data>` MUST be a directory of the user that other users cannot write.
@@ -69,7 +70,8 @@
 //!    with [`Outcome::NeedsReview`]. The active version does not change.
 //! 6. Make the staged directory the active directory.
 //!
-//! An error in step 1 to 5 changes nothing in `<data>/extensions`.
+//! An error in step 1 to 5 changes nothing in `<data>/extensions`. Step 6
+//! has a point of no return: see the next section.
 //!
 //! # Why a failed change leaves the old version usable
 //!
@@ -94,6 +96,26 @@
 //! version. One exception: if rename 3 was done, the new version is complete
 //! and stays, and the recovery only writes `previous`.
 //!
+//! Rename 3 is the point of no return. An error before it leaves the old
+//! version active, and the operation returns the error. After it the new
+//! version is active and the operation returns `Ok`. If step 4 then fails
+//! (for example on a full disk), the operation writes a warning to the log
+//! and `pending` stays. The next operation on the id or the next
+//! [`Installer::recover`] does step 4 again.
+//!
+//! # One operation on an id at a time
+//!
+//! [`Installer::install`], [`Installer::update`], [`Installer::rollback`],
+//! [`Installer::activate_after_review`] and [`Installer::recover`] hold an
+//! exclusive lock on `<data>/store/<id>/.lock` from start to end. A second
+//! operation on the same id, in another thread or in another process, does
+//! not wait: it changes nothing and fails at once with a `retryable` error
+//! (ADR-0023). Operations on different ids do not stop each other. Thus a
+//! recovery never deletes the staging directory or the journal of an
+//! operation that runs. The lock is released when the operation ends or the
+//! process stops. The lock is advisory: a program that does not take it is
+//! not stopped.
+//!
 //! # The caller must do this
 //!
 //! - **Blocking I/O.** Each method reads and writes files. From async code,
@@ -105,8 +127,6 @@
 //! - **First install.** [`Installer::install`] activates the package without
 //!   a review. The extension has no access until the caller grants its
 //!   capabilities: the permission service denies by default.
-//! - **One writer.** Two processes MUST NOT change the same id at the same
-//!   time.
 //! - **Pinned keys.** The trust store file is `trust.toml` in the user
 //!   configuration directory ([`trust_store_path`]). The installer reads no
 //!   other file, and no method takes another path. Thus a workspace
@@ -173,6 +193,7 @@ const SIGNATURE_MAX_BYTES: u64 = 16 * 1024;
 const PENDING_FILE: &str = "pending";
 const PREVIOUS_FILE: &str = "previous";
 const STAGING_PREFIX: &str = ".staging-";
+const LOCK_FILE: &str = ".lock";
 
 /// The result of an install, an update or a rollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,10 +291,12 @@ impl Installer {
     /// - `policy`: the signature does not verify, the publisher has no
     ///   pinned key, or the package breaks a rule of the
     ///   [package format](self#hostile-content).
+    /// - `retryable`: another operation on `id` runs.
     ///
     /// Each error installs nothing.
     pub fn install(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        self.recover(id)?;
+        let _lock = lock(&self.store(id))?;
+        self.repair(id)?;
         if let Some(installed) = self.installed(id)? {
             return Err(Error::user(format!(
                 "extension `{id}` is installed in version {}; update it instead",
@@ -292,10 +315,14 @@ impl Installer {
     ///
     /// - `user`: the extension is not installed, or `version` is not newer
     ///   than the active version.
-    /// - See [`install`](Self::install). Each error leaves the active
-    ///   version as it was.
+    /// - See [`install`](Self::install).
+    ///
+    /// Each error leaves the active version as it was. After the
+    /// [point of no return](self#why-a-failed-change-leaves-the-old-version-usable)
+    /// no error is returned.
     pub fn update(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        self.recover(id)?;
+        let _lock = lock(&self.store(id))?;
+        self.repair(id)?;
         match self.installed(id)? {
             None => Err(Error::user(format!(
                 "extension `{id}` is not installed; install it first"
@@ -318,10 +345,14 @@ impl Installer {
     /// # Errors
     ///
     /// - `user`: there is no previous version.
-    /// - See [`install`](Self::install). Each error leaves the active
-    ///   version as it was.
+    /// - See [`install`](Self::install).
+    ///
+    /// Each error leaves the active version as it was. After the
+    /// [point of no return](self#why-a-failed-change-leaves-the-old-version-usable)
+    /// no error is returned.
     pub fn rollback(&self, id: &ExtensionId) -> Result<Outcome> {
-        self.recover(id)?;
+        let _lock = lock(&self.store(id))?;
+        self.repair(id)?;
         let path = self.store(id).join(PREVIOUS_FILE);
         let none = || Error::user(format!("extension `{id}` has no previous version"));
         let previous = match fs::read_to_string(&path) {
@@ -344,7 +375,8 @@ impl Installer {
     ///   is active already.
     /// - See [`install`](Self::install).
     pub fn activate_after_review(&self, id: &ExtensionId, version: &Version) -> Result<()> {
-        self.recover(id)?;
+        let _lock = lock(&self.store(id))?;
+        self.repair(id)?;
         self.activate(id, version, Source::Store, false).map(|_| ())
     }
 
@@ -354,9 +386,16 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error that names the file if a file cannot be read,
-    /// moved or written.
+    /// - `user`: a file cannot be read, moved or written. The error names
+    ///   the file.
+    /// - `retryable`: another operation on `id` runs.
     pub fn recover(&self, id: &ExtensionId) -> Result<()> {
+        let _lock = lock(&self.store(id))?;
+        self.repair(id)
+    }
+
+    /// The recovery. The caller holds the lock of `id`.
+    fn repair(&self, id: &ExtensionId) -> Result<()> {
         let store = self.store(id);
         let pending = store.join(PENDING_FILE);
         let text = match fs::read_to_string(&pending) {
@@ -399,7 +438,8 @@ impl Installer {
     }
 
     /// Steps 1 to 6 of the [module documentation](self). `review` is `true`
-    /// when added capabilities stop the operation.
+    /// when added capabilities stop the operation. The caller holds the lock
+    /// of `id`.
     fn activate(
         &self,
         id: &ExtensionId,
@@ -485,10 +525,14 @@ impl Installer {
             .retire(id, old.as_ref())
             .and_then(|()| self.promote(id, &content));
         if let Err(error) = moved {
-            self.recover(id)?;
+            self.repair(id)?;
             return Err(error);
         }
-        self.finish(id, old.as_ref())?;
+        // The point of no return: the new version is active. The journal
+        // stays if the clean-up fails, and the next recovery completes it.
+        if let Err(error) = self.finish(id, old.as_ref()) {
+            tracing::warn!(extension = %id, %version, %error, "the version is active, but the clean-up did not complete");
+        }
         tracing::info!(extension = %id, %version, "extension version activated");
         Ok(Outcome::Activated)
     }
@@ -606,6 +650,44 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
     {
         Some((missing, _)) => Err(refused(format!("the entry `{missing}` is missing"))),
         None => Ok(()),
+    }
+}
+
+/// The held lock of an id.
+struct IdLock(File);
+
+impl Drop for IdLock {
+    fn drop(&mut self) {
+        // To close the file is not sufficient. A child process that another
+        // thread starts at this moment holds a copy of the file handle until
+        // its `exec`, and the lock would stay for that time.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Takes the exclusive lock of the id with the store directory `store`, or
+/// returns a `retryable` error if another operation holds it. To drop the
+/// result releases the lock.
+///
+/// Each call opens the file again: the lock belongs to the open file, so it
+/// also stops a second thread of this process.
+fn lock(store: &Path) -> Result<IdLock> {
+    fs::create_dir_all(store)
+        .map_err(|error| io_error(store, "cannot create the directory", error))?;
+    let path = store.join(LOCK_FILE);
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| io_error(&path, "cannot open the lock file", error))?;
+    match file.try_lock() {
+        Ok(()) => Ok(IdLock(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(Error::retryable(format!(
+            "{}: another install operation on this extension runs; try again",
+            path.display()
+        ))),
+        Err(fs::TryLockError::Error(error)) => Err(io_error(&path, "cannot lock the file", error)),
     }
 }
 
@@ -790,7 +872,7 @@ mod tests {
             let kept: Vec<_> = fs::read_dir(self.store())
                 .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
                 .unwrap_or_default();
-            assert!(kept.is_empty(), "{kept:?}");
+            assert_eq!(kept, [LOCK_FILE]);
         }
 
         /// Installs 1.0.0, then stages 2.0.0 by hand for a crash test.
@@ -881,9 +963,9 @@ mod tests {
         let kept = f.store().join("acme.postgres-1.0.0.rivetpkg");
         assert_eq!(fs::read(&kept).unwrap(), package);
         assert!(kept.with_extension("rivetpkg.minisig").is_file());
-        // No staging directory and no journal stay.
+        // No staging directory and no journal stay: only the lock file.
         assert!(!f.store().join(PENDING_FILE).exists());
-        assert_eq!(fs::read_dir(f.store()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3);
     }
 
     #[test]
@@ -1091,6 +1173,165 @@ mod tests {
         assert!(!f.store().join("1.0.0").exists());
         assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    // R-70: the second rename is the point of no return.
+
+    #[test]
+    fn a_failed_clean_up_after_the_second_rename_is_not_an_error() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        // `previous` cannot be written: a directory has its name.
+        fs::create_dir(f.store().join(PREVIOUS_FILE)).unwrap();
+
+        assert_eq!(
+            f.update("1.1.0", &package("1.1.0", "")).unwrap(),
+            Outcome::Activated
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+        assert!(f.store().join(PENDING_FILE).exists());
+
+        // The next recovery completes the clean-up from the journal.
+        fs::remove_dir(f.store().join(PREVIOUS_FILE)).unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert!(!f.store().join(PENDING_FILE).exists());
+        assert!(!f.store().join("1.0.0").exists());
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    // R-69: the operations on one id run one after the other.
+
+    #[test]
+    fn concurrent_updates_of_one_id_keep_one_complete_active_version() {
+        const THREADS: usize = 8;
+        let versions: Vec<String> = (1..=THREADS).map(|minor| format!("1.{minor}.0")).collect();
+        let (mut lost, mut incomplete, mut journal, mut staging, mut errors) = (0, 0, 0, 0, 0);
+        for _round in 0..40 {
+            let f = fixture();
+            f.install("1.0.0", &package("1.0.0", "")).unwrap();
+            for version in &versions {
+                f.publish(version, &package(version, ""));
+            }
+            let start = std::sync::Barrier::new(THREADS);
+            let results: Vec<Result<Outcome>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = versions
+                    .iter()
+                    .map(|version| {
+                        let (start, installer) = (&start, &f.installer);
+                        scope.spawn(move || {
+                            start.wait();
+                            installer.update(&id(), &v(version))
+                        })
+                    })
+                    .collect();
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect()
+            });
+
+            // A thread that found the lock taken got a `retryable` error. A
+            // thread that ran after a newer version got a `user` error.
+            errors += usize::from(results.iter().any(|result| match result {
+                Ok(outcome) => *outcome != Outcome::Activated,
+                Err(error) => {
+                    error.category() != ErrorCategory::Retryable
+                        && !error.to_string().contains("is not newer")
+                }
+            }));
+            let active = f.installer.active(&id());
+            match f.installer.installed(&id()).ok().flatten() {
+                Some(manifest) if versions.contains(&manifest.version.to_string()) => {
+                    let complete = ENTRIES.iter().all(|(name, _)| active.join(name).is_file());
+                    incomplete += usize::from(!complete);
+                }
+                _ => lost += 1,
+            }
+            journal += usize::from(f.store().join(PENDING_FILE).exists());
+            staging += usize::from(fs::read_dir(f.store()).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name();
+                name.to_string_lossy().starts_with(STAGING_PREFIX)
+            }));
+        }
+        assert_eq!(
+            (lost, incomplete, journal, staging, errors),
+            (0, 0, 0, 0, 0),
+            "rounds of 40 with (no active version, an incomplete active version, a journal \
+             left, a staging directory left, an unexpected result)"
+        );
+    }
+
+    #[test]
+    fn the_lock_of_one_id_stops_a_second_operation_but_not_another_id() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.publish("1.1.0", &package("1.1.0", ""));
+        let held = lock(&f.store()).unwrap();
+
+        // Each operation opens the lock file again and does not get the lock.
+        let part = "another install operation";
+        let (id, new) = (id(), v("1.1.0"));
+        assert_error(
+            f.installer.install(&id, &new),
+            ErrorCategory::Retryable,
+            part,
+        );
+        assert_error(
+            f.installer.update(&id, &new),
+            ErrorCategory::Retryable,
+            part,
+        );
+        assert_error(f.installer.rollback(&id), ErrorCategory::Retryable, part);
+        assert_error(f.installer.recover(&id), ErrorCategory::Retryable, part);
+        assert_error(
+            f.installer.activate_after_review(&id, &new),
+            ErrorCategory::Retryable,
+            part,
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+        // An operation on another id is not stopped.
+        let other: ExtensionId = "acme.mysql".parse().unwrap();
+        f.installer.recover(&other).unwrap();
+
+        drop(held);
+        assert_eq!(f.installer.update(&id, &new).unwrap(), Outcome::Activated);
+    }
+
+    /// Runs two times: the test, and a child process of the test that holds
+    /// the lock of the store directory in `RIVET_TEST_LOCK_STORE`.
+    #[test]
+    fn the_lock_of_one_id_stops_a_second_process() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        const STORE: &str = "RIVET_TEST_LOCK_STORE";
+        const NAME: &str = "install::tests::the_lock_of_one_id_stops_a_second_process";
+
+        if let Some(store) = std::env::var_os(STORE) {
+            let _held = lock(Path::new(&store)).unwrap();
+            println!("locked");
+            // Holds the lock until the parent closes the pipe.
+            let _ = io::stdin().read(&mut [0]);
+            return;
+        }
+        let f = fixture();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(STORE, f.store())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(lines.any(|line| line.unwrap().contains("locked")));
+
+        let own = File::open(f.store().join(LOCK_FILE)).unwrap();
+        assert!(matches!(own.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        // The process stopped: the lock is free.
+        own.try_lock().unwrap();
     }
 
     // Criterion 4: an update that adds capabilities.
