@@ -24,9 +24,7 @@ pub const KEYCHAIN_SCHEME: &str = "keychain";
 
 /// The schemes that only a built-in extension can register: an extension
 /// whose id starts with the segment [`BUILT_IN_PUBLISHER`] (ADR-0020).
-// shortcut: `settings.rs` has the same names in the private
-// `BUILT_IN_SECRET_SCHEMES`; make one of them `pub(crate)` and use it in both.
-const BUILT_IN_SCHEMES: [&str; 2] = ["aws-sm", "gcp-sm"];
+pub(crate) const BUILT_IN_SCHEMES: [&str; 2] = ["aws-sm", "gcp-sm"];
 
 /// The publisher segment of the built-in extensions.
 const BUILT_IN_PUBLISHER: &str = "rivet";
@@ -43,9 +41,8 @@ pub const MAX_VALUES_PER_OWNER: usize = 256;
 
 /// Text that an extension controls (a URI, the error text of a backend) is
 /// cut to this length in an error.
-// shortcut: this is `MAX_RESOURCE_BYTES` of `permissions.rs`, which is
-// private; make it `pub(crate)` and use it here.
-const MAX_SHOWN_BYTES: usize = 1024;
+/// The same limit as for a resource in a permission error.
+const MAX_SHOWN_BYTES: usize = crate::permissions::MAX_RESOURCE_BYTES;
 
 /// Returns `text` for an error message: cut to [`MAX_SHOWN_BYTES`], and with
 /// each control character escaped so that it cannot start a line in a log.
