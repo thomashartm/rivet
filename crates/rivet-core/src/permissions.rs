@@ -1032,11 +1032,19 @@ mod tests {
     }
 
     /// ADR-0020: the form `scheme://...` is reserved for a later per-scheme
-    /// namespace. Until then it grants nothing.
+    /// namespace. Until then it grants nothing. `Manifest::parse` rejects
+    /// such a namespace, so it is set after the parse (defence in depth).
     #[test]
     fn a_secret_namespace_with_a_scheme_grants_nothing() {
-        let (permissions, id) =
-            granted("[capabilities]\nsecrets = [\"aws-sm://prod\", \"a://b\", \"other\"]\n");
+        let mut manifest = manifest("[capabilities]\nsecrets = [\"other\"]\n");
+        manifest.capabilities.secrets = ["aws-sm://prod", "a://b", "other"]
+            .map(str::to_owned)
+            .into();
+        let permissions = Permissions::new();
+        permissions
+            .grant(&manifest, manifest.capabilities.clone())
+            .unwrap();
+        let id = manifest.id;
         for denied in [
             "aws-sm://prod/password",
             "aws-sm://prod",
