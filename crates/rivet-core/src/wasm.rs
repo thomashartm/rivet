@@ -95,6 +95,11 @@
 //! text of the host that names the extension. So the text of the component
 //! cannot imitate a message of the host.
 //!
+//! Wasmtime quotes names from the component in the cause of a load error.
+//! So the source of a load error is that cause as one text, with the rules
+//! of the guest text: redacted, cleaned and cut. The source of a trap error
+//! has no backtrace: a backtrace has the function names of the component.
+//!
 //! After a trap, a limit violation or a panic of the host in an import
 //! (ARCHITECTURE.md §5.6) the instance cannot be used: each later call gives
 //! an `internal` error. Other instances are not affected.
@@ -405,6 +410,13 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
     text
 }
 
+/// The reason that Wasmtime gives for a component that it refuses, with its
+/// causes, as one text. Wasmtime quotes names from the component in it, so
+/// it has the rules of [`guest_text`].
+fn refusal_text(redactor: &Redactor, error: &wasmtime::Error) -> String {
+    guest_text(redactor, &format!("{error:#}"))
+}
+
 /// Makes a path safe for an error message: the rules of [`guest_text`], and a
 /// cut to the last [`MAX_PATH_TEXT_BYTES`]: the end of a path names the file.
 /// The name of a directory is untrusted.
@@ -543,6 +555,9 @@ impl WasmRuntime {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        // A backtrace has the function names that the component chose: it
+        // must not be in the source of a trap error.
+        config.wasm_backtrace_max_frames(None);
         let engine = Engine::new(&config).map_err(unusable)?;
         let weak = engine.weak();
         std::thread::Builder::new()
@@ -586,13 +601,15 @@ impl WasmRuntime {
         }
         let engine = self.engine.clone();
         let linker = Arc::clone(&self.linker);
+        let redactor = self.redactor.clone();
         blocking(move || {
             // shortcut: no time limit for the compilation, it is bounded by the
             // size limit only (4 MiB, ADR-0018: 16 MiB compiled for 43 s on one
             // thread); add a compile cache or parallel compilation when a
             // component of the allowed size compiles for too long.
             let component = Component::new(&engine, &bytes).map_err(|error| {
-                Error::user("the file is not a valid WASM component").with_source(error)
+                Error::user("the file is not a valid WASM component")
+                    .with_source(refusal_text(&redactor, &error))
             })?;
             linker
                 .instantiate_pre(&component)
@@ -600,13 +617,19 @@ impl WasmRuntime {
                 .map(WasmComponent)
                 .map_err(|error| {
                     let kind = component.component_type();
-                    let message = match kind.imports(&engine).find(|(name, _)| name.starts_with("wasi:")) {
+                    let message = match kind
+                        .imports(&engine)
+                        .find(|(name, _)| name.starts_with("wasi:"))
+                    {
                         Some((name, _)) => format!(
-                            "the WASM component imports `{name}`, but the host gives no WASI interface"
+                            "the WASM component imports `{}`, but the host gives no WASI interface",
+                            guest_text(&redactor, name)
                         ),
-                        None => "the WASM component does not fit the world `rivet:extension`".to_owned(),
+                        None => {
+                            "the WASM component does not fit the world `rivet:extension`".to_owned()
+                        }
                     };
-                    Error::user(message).with_source(error)
+                    Error::user(message).with_source(refusal_text(&redactor, &error))
                 })
         })
         .await
@@ -2170,6 +2193,91 @@ mod tests {
             let head = "extension `acme.liar`: activate failed: the component returned an error: ";
             assert!(text.contains(&format!("{head}{forged}")), "{text}");
             assert!(!text.starts_with(forged), "{text}");
+        }
+    }
+
+    /// The message of `error`, the text of each source, and the `Debug` text.
+    fn all_text(error: &Error) -> Vec<String> {
+        let mut texts = vec![error.message().to_owned(), format!("{error:?}")];
+        let mut cause = std::error::Error::source(error);
+        while let Some(source) = cause {
+            texts.push(source.to_string());
+            cause = source.source();
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn a_name_of_the_guest_in_a_load_error_is_redacted() {
+        // T-2: the name of an import, and a name in a component that is not
+        // valid, are text of the guest.
+        let redactor = Redactor::new();
+        redactor.register(&Secret::from("hunter2-value".to_owned()));
+        let runtime = runtime_with(SMALL, &redactor);
+        let import = r#"(import "wasi:hunter2-value/x@0.2.6" (instance (export "f" (func))))"#;
+        let refused = guest_with(import, "", "(i32.const 0)");
+        let invalid = wat::parse_str(
+            r#"(component (import "hunter2-value" (func)) (import "hunter2-value" (func)))"#,
+        )
+        .unwrap();
+
+        let error = runtime.load(refused.clone()).await.err().unwrap();
+        assert!(
+            error
+                .message()
+                .contains("imports `wasi:[REDACTED]/x@0.2.6`"),
+            "{error}"
+        );
+        let other = runtime.load(invalid).await.err().unwrap();
+        for text in all_text(&error).into_iter().chain(all_text(&other)) {
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+        // The cause that Wasmtime gives stays.
+        assert!(
+            all_text(&error)[2..]
+                .concat()
+                .contains("implementation is missing")
+        );
+        assert!(all_text(&other)[2..].concat().contains("[REDACTED]"));
+
+        let hosted = hosted(Arc::new(runtime));
+        hosted.install("acme.import", "1.0.0", &refused);
+        let report = hosted.start("acme.import").await;
+        let reason = hosted.status("acme.import").unwrap().reason.unwrap();
+        assert!(reason.contains("wasi:[REDACTED]/x@0.2.6"), "{reason}");
+        for text in all_text(&report.not_activated[&id("acme.import")]) {
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trap_error_has_no_text_of_the_guest() {
+        // T-1: a function name of the name section, and a custom section.
+        let redactor = Redactor::new();
+        redactor.register(&Secret::from("hunter2-value".to_owned()));
+        let name = format!("{}\\nERROR forged\\1b[2J hunter2-value", "n".repeat(10000));
+        let data = format!(
+            r#"(@custom "hunter2-value" "hunter2-value")
+               (func $boom (@name "{name}") unreachable)"#
+        );
+        let bytes = guest(&data, "(call $boom) (i32.const 0)");
+        let runtime = runtime_with(SMALL, &redactor);
+        let direct = instance(&runtime, bytes.clone(), "acme.trap").await;
+        let direct = direct.activate().await.unwrap_err();
+
+        let hosted = hosted(Arc::new(runtime));
+        hosted.install("acme.trap", "1.0.0", &bytes);
+        let report = hosted.start("acme.trap").await;
+        for error in [&direct, &report.not_activated[&id("acme.trap")]] {
+            let texts = all_text(error);
+            for text in &texts {
+                assert!(text.len() < 1000, "{} bytes", text.len());
+                for guest in ["nnnn", "forged", "hunter2", "\n", "\u{1b}"] {
+                    assert!(!text.contains(guest), "{guest:?} in {text:?}");
+                }
+            }
+            // The cause that Wasmtime gives stays.
+            assert!(texts[2..].concat().contains("`unreachable`"), "{texts:?}");
         }
     }
 
