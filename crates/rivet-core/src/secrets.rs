@@ -8,6 +8,7 @@
 use crate::Owner;
 use crate::logging::{MIN_REDACTED_LEN, Redactor};
 use crate::permissions::Permissions;
+use crate::registry::ClosedOwners;
 use crate::wasm::guest_text;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::manifest::ExtensionId;
@@ -229,6 +230,7 @@ pub struct SecretStore {
     /// that read them: one registration for each entry. Empty without a
     /// redactor.
     read_by: Mutex<HashMap<Owner, Vec<Secret>>>,
+    closed: ClosedOwners,
 }
 
 struct Registration {
@@ -248,6 +250,7 @@ impl SecretStore {
             backends: RwLock::new(HashMap::from([(KEYCHAIN_SCHEME.to_owned(), keychain)])),
             redactor: None,
             read_by: Mutex::default(),
+            closed: ClosedOwners::default(),
         }
     }
 
@@ -263,6 +266,10 @@ impl SecretStore {
     /// Registers `backend` of the extension `owner` for the URI scheme
     /// `scheme`, for example `acme-vault`.
     ///
+    /// Known limit (ADR-0021): the store takes `owner` from the caller and
+    /// does not prove it. The binding code must give the id of the extension
+    /// that calls.
+    ///
     /// # Errors
     ///
     /// - Returns a `user` error if `scheme` is not a scheme that a
@@ -271,6 +278,7 @@ impl SecretStore {
     ///   this name. See [Scheme names](Self#scheme-names).
     /// - Returns a `policy` error if the scheme already has a backend. The
     ///   first registration stays.
+    /// - Returns a `policy` error while the host stops the extension `owner`.
     pub fn register(
         &self,
         owner: Owner,
@@ -309,6 +317,7 @@ impl SecretStore {
             .backends
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        self.closed.check(&owner)?;
         match backends.entry(scheme.to_owned()) {
             Entry::Occupied(_) => Err(Error::policy(format!(
                 "a secret backend for the scheme `{scheme}` is already registered"
@@ -321,6 +330,18 @@ impl SecretStore {
                 Ok(())
             }
         }
+    }
+
+    /// Refuses each new backend of `owner` until
+    /// [`open_owner`](Self::open_owner). The host calls it when it starts
+    /// to stop the extension.
+    pub(crate) fn close_owner(&self, owner: &Owner) {
+        self.closed.close(owner);
+    }
+
+    /// Accepts the backends of `owner` again.
+    pub(crate) fn open_owner(&self, owner: &Owner) {
+        self.closed.open(owner);
     }
 
     /// Removes every backend of `owner`. Returns how many were removed.
@@ -794,6 +815,26 @@ mod tests {
                 .register(owner(), scheme, InMemory::with(&[]))
                 .expect(scheme);
         }
+    }
+
+    #[test]
+    fn a_closed_owner_cannot_register_a_backend_until_it_is_open_again() {
+        let store = SecretStore::new();
+        let other: Owner = "acme.vault".parse().unwrap();
+
+        store.close_owner(&owner());
+
+        let error = store
+            .register(owner(), "rivet-ps", InMemory::with(&[]))
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert!(error.message().contains("`rivet.aws` stops"), "{error}");
+        // Only this owner is refused, and the scheme stays free.
+        store.register(other, "acme", InMemory::with(&[])).unwrap();
+        store.open_owner(&owner());
+        store
+            .register(owner(), "rivet-ps", InMemory::with(&[]))
+            .unwrap();
     }
 
     #[tokio::test]
