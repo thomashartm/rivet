@@ -13,7 +13,8 @@
 //! - A denied access returns a `policy` error and writes one `warn` log
 //!   event. Both name the extension, the capability and the requested
 //!   resource. A resource is a host and port, a path, a secret URI or a
-//!   clipboard operation. It is never a secret value.
+//!   clipboard operation. It is never a secret value. A requested host is
+//!   cut to 255 bytes (the maximum length of a DNS name) in both.
 //!
 //! # Network
 //!
@@ -21,7 +22,8 @@
 //!   case. There is no wildcard and a subdomain is not included.
 //! - If the two hosts are IP addresses, the addresses are compared, so
 //!   `[::1]`, `::1` and `0:0:0:0:0:0:0:1` are equal. Only the standard text
-//!   forms are addresses; `127.1` is compared as text.
+//!   forms are addresses; `127.1` is compared as text. Brackets are valid
+//!   for an IPv6 address only: `[127.0.0.1]` is not `127.0.0.1`.
 //! - The port must be in the port list of that host.
 //! - The service does no name resolution. A granted name does not grant the
 //!   addresses of the name, and a granted address does not grant its names.
@@ -30,7 +32,12 @@
 //! # Filesystem
 //!
 //! - A scope path is absolute, or starts with `~`, the home directory of the
-//!   user. Any other scope path grants nothing.
+//!   user. Any other scope path grants nothing, and so does a scope path
+//!   with a `..` component.
+//! - The home directory is read one time, when the service is created
+//!   ([`Permissions::new`]). It comes from the operating system or the
+//!   process environment only. A later change of the home directory does
+//!   not move a `~` scope: it needs a restart of the process.
 //! - The requested path must be absolute.
 //! - The requested path and the scope path are resolved before they are
 //!   compared: symbolic links and `..` are followed with
@@ -43,6 +50,8 @@
 //! - [`FilesystemAccess::Read`] is allowed in each scope.
 //!   [`FilesystemAccess::ReadWrite`] (each operation that changes the
 //!   filesystem) is allowed only in a `read-write` scope.
+//! - Limit: the test for symbolic links runs on Unix only. The symbolic
+//!   link rules are not tested on Windows.
 //!
 //! # Secrets
 //!
@@ -61,7 +70,16 @@
 //!   nothing. This form is reserved for a later namespace that is limited
 //!   to one scheme (ADR-0020).
 //! - The comparison is exact and case-sensitive. A URI path with a `.` or
-//!   `..` segment is denied.
+//!   `..` segment, an empty segment (`//`, or a `/` at the end) or a `%`
+//!   (an encoded segment) is denied: a backend can read such a path as a
+//!   path out of the namespace.
+//!
+//! # Update review
+//!
+//! The service stores the capabilities that the installed manifest
+//! requested, together with the grant. [`Permissions::review_update`]
+//! compares a new manifest with that request, not with the grant, so a
+//! partial grant does not cause a new review (ADR-0020).
 //!
 //! # Clipboard
 //!
@@ -97,7 +115,7 @@ use rivet_sdk::manifest::{Capabilities, ClipboardAccess, ExtensionId, Filesystem
 use rivet_sdk::secret::SecretUri;
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 use tracing::warn;
@@ -107,15 +125,41 @@ use tracing::warn;
 ///
 /// All methods take `&self` and are safe for concurrent use. Share the
 /// service in an [`Arc`](std::sync::Arc). Grants are kept in memory only.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Permissions {
-    grants: RwLock<HashMap<ExtensionId, Capabilities>>,
+    grants: RwLock<HashMap<ExtensionId, Grant>>,
+    /// The directory that `~` in a scope path refers to.
+    home: Option<PathBuf>,
+}
+
+/// What the service stores for one extension.
+#[derive(Debug)]
+struct Grant {
+    /// The capabilities that the installed manifest requested.
+    requested: Capabilities,
+    /// The part of `requested` that the user granted.
+    granted: Capabilities,
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Permissions {
-    /// Creates a service without grants.
+    /// Creates a service without grants. Reads the home directory of the
+    /// user here, one time; `~` in a scope path refers to it for the life of
+    /// the service.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_home(std::env::home_dir())
+    }
+
+    fn with_home(home: Option<PathBuf>) -> Self {
+        Self {
+            grants: RwLock::default(),
+            home,
+        }
     }
 
     /// Sets the grant of the extension of `manifest`. A grant that the
@@ -137,7 +181,11 @@ impl Permissions {
                 manifest.id
             )));
         }
-        self.write().insert(manifest.id.clone(), capabilities);
+        let grant = Grant {
+            requested: manifest.capabilities.clone(),
+            granted: capabilities,
+        };
+        self.write().insert(manifest.id.clone(), grant);
         Ok(())
     }
 
@@ -147,13 +195,15 @@ impl Permissions {
         self.write().remove(extension).is_some()
     }
 
-    /// Does the update review for a new manifest version (§4.7). Returns the
-    /// capabilities that `manifest` adds to the current grant of the
-    /// extension; see [`added_capabilities`].
+    /// Does the update review for a new manifest version (§4.7, ADR-0020).
+    /// Returns the capabilities that `manifest` adds to the capabilities
+    /// that the installed manifest requested (the manifest of the last
+    /// [`grant`](Self::grant) or review); see [`added_capabilities`].
     ///
-    /// - It adds nothing: the grant is carried over. It is set to the
-    ///   capabilities of `manifest`, so a capability that the new version no
-    ///   longer requests is removed.
+    /// - It adds nothing: the grant of the user is kept, also a partial
+    ///   grant. A capability that the new version no longer requests is
+    ///   removed from the grant. A `read-write` scope that the new version
+    ///   requests as `read` becomes `read`.
     /// - It adds one or more capabilities: the grant is removed. The
     ///   extension has no access until a new [`grant`](Self::grant) after
     ///   the review.
@@ -161,12 +211,13 @@ impl Permissions {
     ///   returned and no grant is created.
     pub fn review_update(&self, manifest: &Manifest) -> Capabilities {
         let mut grants = self.write();
-        let Some(granted) = grants.get_mut(&manifest.id) else {
+        let Some(grant) = grants.get_mut(&manifest.id) else {
             return manifest.capabilities.clone();
         };
-        let added = added_capabilities(granted, &manifest.capabilities);
+        let added = added_capabilities(&grant.requested, &manifest.capabilities);
         if added == Capabilities::default() {
-            *granted = manifest.capabilities.clone();
+            grant.requested = manifest.capabilities.clone();
+            cut_to(&mut grant.granted, &manifest.capabilities);
         } else {
             grants.remove(&manifest.id);
         }
@@ -180,7 +231,14 @@ impl Permissions {
     /// Returns a `policy` error if the host and port are not granted.
     pub fn check_network(&self, extension: &ExtensionId, host: &str, port: u16) -> Result<()> {
         let allowed = self.granted(extension, |granted| allows_network(granted, host, port));
-        allow(allowed, extension, "network", &format!("{host}:{port}"))
+        // `host` comes from the extension: its length has no limit.
+        let resource = if host.len() > MAX_HOST_BYTES {
+            let cut = &host[..host.floor_char_boundary(MAX_HOST_BYTES)];
+            format!("{cut}…:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        allow(allowed, extension, "network", &resource)
     }
 
     /// Checks that `extension` may access `path` and returns the resolved
@@ -215,13 +273,12 @@ impl Permissions {
     ) -> Result<PathBuf> {
         // The scopes are copied so that the lock is not held during file I/O.
         let scopes = self.granted(extension, |granted| granted.filesystem.clone());
-        let home = std::env::home_dir();
         resolve(path)
             .ok()
             .filter(|resolved| {
                 scopes.iter().flatten().any(|scope| {
                     covers(scope.access, access)
-                        && scope_root(&scope.path, home.as_deref())
+                        && scope_root(&scope.path, self.home.as_deref())
                             .and_then(|root| resolve(&root).ok())
                             .is_some_and(|root| resolved.starts_with(root))
                 })
@@ -275,10 +332,10 @@ impl Permissions {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(extension)
-            .map(read)
+            .map(|grant| read(&grant.granted))
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ExtensionId, Capabilities>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ExtensionId, Grant>> {
         self.grants.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -295,7 +352,8 @@ impl Permissions {
 ///
 /// - network: the host has the port in `granted`. The hosts are compared as
 ///   in a network check. The result lists only the ports that are not
-///   covered.
+///   covered. A host that is not in `granted` is not covered, also with an
+///   empty port list.
 /// - filesystem: `granted` has a scope with the same `path` text and the
 ///   same access or `read-write`. Paths are not resolved, so a path below a
 ///   granted path is reported as added.
@@ -309,7 +367,13 @@ pub fn added_capabilities(granted: &Capabilities, requested: &Capabilities) -> C
         missing
             .ports
             .retain(|port| !allows_network(granted, &scope.host, *port));
-        if !missing.ports.is_empty() {
+        let known_host = || {
+            granted
+                .network
+                .iter()
+                .any(|have| same_host(&have.host, &scope.host))
+        };
+        if !missing.ports.is_empty() || !known_host() {
             added.network.push(missing);
         }
     }
@@ -338,6 +402,40 @@ pub fn added_capabilities(granted: &Capabilities, requested: &Capabilities) -> C
         .collect();
     added
 }
+
+/// Removes from `granted` what `requested` does not contain. A `read-write`
+/// scope that is requested as `read` becomes `read`.
+fn cut_to(granted: &mut Capabilities, requested: &Capabilities) {
+    for scope in &mut granted.network {
+        let host = &scope.host;
+        scope
+            .ports
+            .retain(|port| allows_network(requested, host, *port));
+    }
+    granted.network.retain(|scope| !scope.ports.is_empty());
+    granted.filesystem.retain_mut(|have| {
+        let mut wanted = requested
+            .filesystem
+            .iter()
+            .filter(|want| want.path == have.path)
+            .peekable();
+        let keep = wanted.peek().is_some();
+        if !wanted.any(|want| covers(want.access, have.access)) {
+            have.access = FilesystemAccess::Read;
+        }
+        keep
+    });
+    granted
+        .secrets
+        .retain(|namespace| requested.secrets.contains(namespace));
+    granted
+        .clipboard
+        .retain(|access| requested.clipboard.contains(access));
+}
+
+/// The maximum length of a DNS name. A longer requested host is cut to it
+/// in the log and in the error.
+const MAX_HOST_BYTES: usize = 255;
 
 /// Turns a decision into a result. `None` (no grant) is a denial.
 fn allow(
@@ -378,13 +476,16 @@ fn same_host(granted: &str, requested: &str) -> bool {
     }
 }
 
-/// Parses an IP address literal, with or without the `[]` of a URL.
+/// Parses an IP address literal. An IPv6 address can have the `[]` of a
+/// URL; an IPv4 address in brackets is not an address.
 fn ip_address(host: &str) -> Option<IpAddr> {
-    host.strip_prefix('[')
+    match host
+        .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host)
-        .parse()
-        .ok()
+    {
+        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        None => host.parse().ok(),
+    }
 }
 
 /// `true` if a scope with the access `have` permits the access `want`.
@@ -394,17 +495,25 @@ fn covers(have: FilesystemAccess, want: FilesystemAccess) -> bool {
 
 fn in_namespace(namespace: &str, path: &str) -> bool {
     let mut segments = path.split('/');
-    // `://` is reserved for a per-scheme namespace (ADR-0020).
+    // `://` is reserved for a per-scheme namespace (ADR-0020). A backend can
+    // decode `%2e%2e` or drop an empty segment, so both are denied.
     !namespace.contains("://")
-        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+        && !path.contains('%')
+        && !path
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
         && namespace
             .split('/')
             .all(|part| segments.next() == Some(part))
 }
 
 /// The directory of a scope path: absolute, or `~` replaced by `home`.
+/// `None` for any other path and for a path with a `..` component.
 fn scope_root(path: &str, home: Option<&Path>) -> Option<PathBuf> {
     let path = Path::new(path);
+    if path.components().any(|part| part == Component::ParentDir) {
+        return None;
+    }
     match path.strip_prefix("~") {
         Ok(below_home) => home.map(|home| home.join(below_home)),
         Err(_) => path.is_absolute().then(|| path.to_path_buf()),
@@ -623,6 +732,43 @@ mod tests {
         }
     }
 
+    /// R-28e: brackets are the URL form of an IPv6 address only.
+    #[test]
+    fn brackets_are_not_removed_from_an_ipv4_address() {
+        let (permissions, id) =
+            granted("[[capabilities.network]]\nhost = \"127.0.0.1\"\nports = [5432]\n");
+        permissions.check_network(&id, "127.0.0.1", 5432).unwrap();
+        assert_denied(
+            permissions.check_network(&id, "[127.0.0.1]", 5432),
+            &["network", "[127.0.0.1]:5432"],
+        );
+    }
+
+    /// R-28f: the host comes from the extension and has no length limit.
+    #[test]
+    fn a_long_host_is_cut_in_the_error() {
+        let (permissions, id) = granted(ALL);
+        let error = permissions
+            .check_network(&id, &"a".repeat(100_000), 443)
+            .unwrap_err();
+        let cut = format!("{}…:443", "a".repeat(255));
+        assert!(error.message().contains(&cut), "{}", error.message().len());
+        assert!(!error.message().contains(&"a".repeat(256)));
+
+        // The cut is on a character boundary: `é` has 2 bytes.
+        let error = permissions
+            .check_network(&id, &"é".repeat(200), 443)
+            .unwrap_err();
+        let cut = format!("{}…:443", "é".repeat(127));
+        assert!(error.message().contains(&cut), "{error}");
+        assert!(!error.message().contains(&"é".repeat(128)));
+
+        // A host of the maximum length is not cut.
+        let host = "a".repeat(255);
+        let error = permissions.check_network(&id, &host, 443).unwrap_err();
+        assert!(error.message().contains(&format!("{host}:443")), "{error}");
+    }
+
     #[test]
     fn filesystem_access_stays_in_the_scope() {
         let dir = tempfile::tempdir().unwrap();
@@ -750,15 +896,88 @@ mod tests {
         assert_eq!(scope_root("~/.postgresql", None), None);
         assert_eq!(root("~other/.ssh"), None);
         assert_eq!(root("relative/dir"), None);
+        assert_eq!(root("/a/../b"), None);
+        assert_eq!(root("~/.."), None);
 
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(root(dir.path().to_str().unwrap()).unwrap(), dir.path());
+    }
 
-        // A relative scope grants nothing.
-        let (permissions, id) =
-            granted("[[capabilities.filesystem]]\npath = \"relative\"\naccess = \"read\"\n");
+    /// Defence in depth: `Manifest::parse` can reject these scope paths, so
+    /// they are set after the parse.
+    #[test]
+    fn a_relative_scope_path_or_one_with_a_parent_component_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        for scope in [
+            "relative".to_owned(),
+            format!("{}/..", home.display()),
+            "~/..".to_owned(),
+        ] {
+            let mut manifest = manifest(&filesystem(&[(Path::new("/"), "read")]));
+            manifest.capabilities.filesystem[0].path.clone_from(&scope);
+            let permissions = Permissions::with_home(Some(home.clone()));
+            permissions
+                .grant(&manifest, manifest.capabilities.clone())
+                .unwrap();
+            for path in [dir.path().join("relative"), home.join("file")] {
+                assert_denied(
+                    permissions.check_filesystem(&manifest.id, &path, FilesystemAccess::Read),
+                    &["filesystem read"],
+                );
+            }
+        }
+    }
+
+    /// R-26, R-27b: `~` is the home directory that the service got when it
+    /// was created. The test does not change the process environment.
+    #[test]
+    fn a_home_scope_uses_the_home_directory_of_the_service() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join(".postgresql")).unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let below =
+            manifest("[[capabilities.filesystem]]\npath = \"~/.postgresql\"\naccess = \"read\"\n");
+        let all = manifest("[[capabilities.filesystem]]\npath = \"~\"\naccess = \"read\"\n");
+        let service = |manifest: &Manifest, home: Option<PathBuf>| {
+            let permissions = Permissions::with_home(home);
+            permissions
+                .grant(manifest, manifest.capabilities.clone())
+                .unwrap();
+            permissions
+        };
+        let id = &below.id;
+
+        let permissions = service(&below, Some(home.path().to_path_buf()));
+        let read = |path: PathBuf| permissions.check_filesystem(id, &path, FilesystemAccess::Read);
+        assert_eq!(
+            read(home.path().join(".postgresql/root.crt")).unwrap(),
+            root.join(".postgresql/root.crt")
+        );
+        let mut denied = vec![
+            home.path().join(".ssh/id"),
+            outside.path().join(".postgresql/root.crt"),
+        ];
+        // The home directory of the process is not a scope.
+        denied.extend(std::env::home_dir().map(|home| home.join(".postgresql/root.crt")));
+        for path in denied {
+            assert_denied(read(path), &["filesystem read"]);
+        }
+
+        let permissions = service(&all, Some(home.path().to_path_buf()));
+        assert_eq!(
+            permissions
+                .check_filesystem(id, &home.path().join(".ssh/id"), FilesystemAccess::Read)
+                .unwrap(),
+            root.join(".ssh/id")
+        );
+
+        // Without a home directory, `~` grants nothing.
+        let permissions = service(&all, None);
         assert_denied(
-            permissions.check_filesystem(&id, &dir.path().join("relative"), FilesystemAccess::Read),
+            permissions.check_filesystem(id, home.path(), FilesystemAccess::Read),
             &["filesystem read"],
         );
     }
@@ -786,6 +1005,24 @@ mod tests {
             "aws-sm://prod",
             "keychain://acme-postgres/../other/prod",
             "keychain://acme-postgres/./prod",
+        ] {
+            assert_denied(
+                permissions.check_secret(&id, &uri(denied)),
+                &["acme.postgres", "secrets", denied],
+            );
+        }
+    }
+
+    /// R-28b: a backend can decode `%2e%2e` or drop an empty segment, and
+    /// then read a secret out of the namespace.
+    #[test]
+    fn a_secret_path_with_an_empty_or_encoded_segment_is_denied() {
+        let (permissions, id) = granted("[capabilities]\nsecrets = [\"acme-postgres\"]\n");
+        for denied in [
+            "keychain://acme-postgres/%2e%2e/other",
+            "keychain://acme-postgres//other",
+            "keychain://acme-postgres/",
+            "keychain://acme-postgres/a%2Fb",
         ] {
             assert_denied(
                 permissions.check_secret(&id, &uri(denied)),
@@ -887,6 +1124,30 @@ mod tests {
         );
     }
 
+    /// R-28a: a host without ports gives no access now, but it is not in
+    /// the manifest.
+    #[test]
+    fn a_grant_cannot_contain_a_host_that_the_manifest_does_not_request() {
+        let requested = manifest(REQUESTED);
+        let permissions = Permissions::new();
+        let host_without_ports = |host: &str| {
+            let mut capabilities = manifest(&format!(
+                "[[capabilities.network]]\nhost = \"{host}\"\nports = [1]\n"
+            ))
+            .capabilities;
+            capabilities.network[0].ports.clear();
+            capabilities
+        };
+        let error = permissions
+            .grant(&requested, host_without_ports("other.example.com"))
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        permissions
+            .grant(&requested, host_without_ports("DB.example.com"))
+            .unwrap();
+        assert_no_access(&permissions, &requested.id);
+    }
+
     #[test]
     fn added_capabilities_lists_what_the_grant_does_not_cover() {
         let old = manifest(REQUESTED).capabilities;
@@ -981,6 +1242,66 @@ mod tests {
         assert_denied(
             permissions.check_network(&id, "db.example.com", 5432),
             &["network"],
+        );
+    }
+
+    /// R-24: the review compares the new request with the old request, not
+    /// with the grant.
+    #[test]
+    fn an_update_that_adds_nothing_keeps_a_partial_grant() {
+        const REQUEST: &str =
+            "[capabilities]\nsecrets = [\"acme-postgres\"]\nclipboard = [\"read\", \"write\"]\n";
+        let requested = manifest(REQUEST);
+        let id = &requested.id;
+        let partial = || manifest("[capabilities]\nsecrets = [\"acme-postgres\"]\n").capabilities;
+        let secret = uri("keychain://acme-postgres/prod");
+        let permissions = Permissions::new();
+        permissions.grant(&requested, partial()).unwrap();
+
+        assert_eq!(
+            permissions.review_update(&requested),
+            Capabilities::default()
+        );
+        permissions.check_secret(id, &secret).unwrap();
+        // The review does not grant what the user did not grant.
+        assert_denied(
+            permissions.check_clipboard(id, ClipboardAccess::Read),
+            &["clipboard"],
+        );
+
+        // Only what the new version adds to the old request is returned.
+        let more =
+            manifest(&REQUEST.replace("[\"acme-postgres\"]", "[\"acme-postgres\", \"aws\"]"));
+        assert_eq!(
+            permissions.review_update(&more),
+            manifest("[capabilities]\nsecrets = [\"aws\"]\n").capabilities
+        );
+        assert_no_access(&permissions, id);
+
+        // The new version requests less: the partial grant is cut.
+        permissions.grant(&requested, partial()).unwrap();
+        let less = manifest("[capabilities]\nclipboard = [\"read\", \"write\"]\n");
+        assert_eq!(permissions.review_update(&less), Capabilities::default());
+        assert_no_access(&permissions, id);
+        // The cut request is the base of the next review.
+        assert_eq!(permissions.review_update(&requested), partial());
+    }
+
+    #[test]
+    fn an_update_that_requests_less_access_to_a_path_cuts_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (permissions, id) = granted(&filesystem(&[(dir.path(), "read-write")]));
+        let read_only = manifest(&filesystem(&[(dir.path(), "read")]));
+        assert_eq!(
+            permissions.review_update(&read_only),
+            Capabilities::default()
+        );
+        permissions
+            .check_filesystem(&id, dir.path(), FilesystemAccess::Read)
+            .unwrap();
+        assert_denied(
+            permissions.check_filesystem(&id, dir.path(), FilesystemAccess::ReadWrite),
+            &["filesystem read-write"],
         );
     }
 
