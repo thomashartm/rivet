@@ -741,11 +741,24 @@ fn reject_in_value(
             "holds text with a secret parameter (for example `password=`); put the value in a \
              secret store and use a secret URI (for example keychain://)",
         )
-    } else if let Some((name, _)) = secret_key.filter(|_| text.parse::<SecretUri>().is_err()) {
+    } else if let Some((name, is_about)) = secret_key.filter(|_| text.parse::<SecretUri>().is_err())
+    {
+        // `[credentials] file`: the flat key `credentials_file` is about the
+        // secret, so it accepts the value. Not for an item of an array, and
+        // not if a table is between the two keys.
+        let flat_key = path
+            .rsplit_once('.')
+            .filter(|(table, key)| {
+                is_about && !key.ends_with(']') && table.rsplit('.').next() == Some(name)
+            })
+            .map(|(_, key)| format!("{name}_{key}"))
+            .filter(|flat_key| !is_secret_key(flat_key))
+            .map(|flat_key| format!(", or use the flat key `{flat_key}`"))
+            .unwrap_or_default();
         format!(
             "must hold a secret URI (for example keychain://), because the key name `{name}` \
              marks a secret; settings do not accept a secret value. If the value is not a \
-             secret, use a key name that does not mark one"
+             secret, use a key name that does not mark one{flat_key}"
         )
     } else {
         return Ok(());
@@ -1720,6 +1733,7 @@ mod tests {
             "tokens_per_page = 50\n",
             "[credentials]\nretries = 3\n",
             "[credentials]\npassword_file = \"/run/x\"\n",
+            "credentials_file = \"/etc/creds\"\n",
             "opt = \"password_encryption=scram-sha-256\"\n",
             "show_password = true\n",
             // A table under a secret key.
@@ -1727,6 +1741,34 @@ mod tests {
             "[password]\nsize = 12\nfile = \"keychain://db/prod\"\n",
             "password = { max = 64, show = true }\n",
         ]);
+        // The error names the flat key, which is the other fix (ADR-0008).
+        let message = |body: &str| {
+            let result = Settings::new().set_layer(
+                Layer::User,
+                "user.toml",
+                &format!("schema_version = 1\n{body}"),
+            );
+            assert_user_error(result, &["user.toml"])
+        };
+        let text = message("[credentials]\nfile = \"/etc/creds\"\n");
+        assert!(
+            text.contains("or use the flat key `credentials_file`"),
+            "{text}"
+        );
+        let text = message("[db.credentials]\nfile = \"/etc/creds\"\n");
+        assert!(
+            text.contains("or use the flat key `credentials_file`"),
+            "{text}"
+        );
+        // No flat key holds these values.
+        for body in [
+            "[tokens.limit]\nprod = \"hunter2\"\n",
+            "[password]\nfile = [\"hunter2\"]\n",
+            "password = \"hunter2\"\n",
+        ] {
+            let text = message(body);
+            assert!(!text.contains("flat key"), "{body}: {text}");
+        }
     }
 
     /// R-65 (b): a parameter about a secret, and a placeholder as the value.

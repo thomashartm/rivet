@@ -40,6 +40,21 @@ struct Registered {
     count: usize,
 }
 
+/// Cuts `text` to a maximum of `max` bytes at a character boundary. Returns
+/// the start of the text, and the mark `…` if the text was cut.
+pub(crate) fn cut(text: &str, max: usize) -> (&str, &'static str) {
+    let start = &text[..text.floor_char_boundary(max)];
+    (start, if start.len() < text.len() { "…" } else { "" })
+}
+
+/// Returns text from outside for an error message: cut to `max` bytes
+/// ([`cut`]), and with each control character escaped so that it cannot
+/// start a line in a log.
+pub(crate) fn shown(text: &str, max: usize) -> String {
+    let (start, mark) = cut(text, max);
+    format!("{}{mark}", start.escape_debug())
+}
+
 /// How many escapes on top of each other the redactor undoes: up to two by
 /// the log path (a field logged with `?` in the JSON format), and two by the
 /// application before it logs the text.
@@ -489,6 +504,17 @@ mod tests {
             log();
         }
         capture.text()
+    }
+
+    #[test]
+    fn cut_and_shown_keep_whole_characters_and_mark_a_cut_text() {
+        assert_eq!(cut("abc", 3), ("abc", ""));
+        assert_eq!(cut("abcd", 3), ("abc", "…"));
+        // `é` has 2 bytes: a cut in its middle moves to its start.
+        assert_eq!(cut("aéb", 2), ("a", "…"));
+        assert_eq!(cut("", 0), ("", ""));
+        assert_eq!(shown("a\nb\u{1b}'\"", 64), "a\\nb\\u{1b}\\'\\\"");
+        assert_eq!(shown("a\nbc", 2), "a\\n…");
     }
 
     #[test]

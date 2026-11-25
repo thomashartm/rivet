@@ -494,14 +494,8 @@ fn allow(
 /// Logs a denied access and builds its error.
 fn denied(extension: &ExtensionId, capability: &str, resource: &str) -> Error {
     // `resource` comes from an untrusted extension: its length has no limit.
-    let cut;
-    let resource = if resource.len() > MAX_RESOURCE_BYTES {
-        let start = &resource[..resource.floor_char_boundary(MAX_RESOURCE_BYTES)];
-        cut = format!("{start}…");
-        cut.as_str()
-    } else {
-        resource
-    };
+    let (start, mark) = crate::logging::cut(resource, MAX_RESOURCE_BYTES);
+    let resource = format!("{start}{mark}");
     // The debug form escapes control characters, so `resource` cannot add a
     // line to the log.
     warn!(extension = %extension, capability, resource = ?resource, "permission denied");
