@@ -6,7 +6,8 @@ members = ["crates/*", "xtask"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
-license = "AGPL-3.0-only"
+# No licence field: the project licence is not decided yet.
+publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
