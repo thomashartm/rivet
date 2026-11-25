@@ -195,7 +195,7 @@
 //! # Ok::<(), rivet_sdk::error::Error>(())
 //! ```
 
-use crate::host::MANIFEST_FILE;
+use crate::host::{MANIFEST_FILE, MAX_MANIFEST_BYTES};
 use crate::package::{
     Origin, PACKAGE_MAX_BYTES, PROJECT_PUBLISHER, PublicKey, TrustStore, open_regular,
     read_text_file,
@@ -341,7 +341,8 @@ impl Installer {
                 path.display()
             ))
         };
-        let text = fs::read_to_string(&path)
+        // A regular file within the limit of the host: a FIFO would block.
+        let text = read_text_file(&path, "extension manifest", MAX_MANIFEST_BYTES)
             .map_err(|error| broken("cannot read the manifest").with_source(error))?;
         Manifest::parse(&text)
             .map(Some)
@@ -2519,9 +2520,21 @@ mod tests {
                 fs::remove_file(path).unwrap();
                 fs::create_dir(path).unwrap();
             }),
+            ("above the size limit", |path| {
+                let mut text = manifest("acme.postgres", "1.1.0", "");
+                text.push_str(&"#".repeat(MAX_MANIFEST_BYTES as usize));
+                fs::write(path, text).unwrap();
+            }),
         ];
         #[cfg(unix)]
         shapes.push(("mode 000", |path| set_mode(path, 0o000)));
+        #[cfg(unix)]
+        shapes.push(("a symbolic link", |path| {
+            // A valid manifest out of the active directory.
+            let outside = path.parent().unwrap().with_extension("outside");
+            fs::rename(path, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, path).unwrap();
+        }));
         for (shape, damage) in shapes {
             let f = fixture();
             f.install("1.0.0", &package("1.0.0", "")).unwrap();
@@ -2546,6 +2559,54 @@ mod tests {
             // Only the lock file and the package and signature of 1.2.0 stay.
             assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3, "{shape}");
         }
+    }
+
+    /// Runs `operation` on another thread. Fails the test if it does not
+    /// return in 10 seconds: an open of a FIFO without a writer blocks.
+    fn within_10_seconds<T: Send + 'static>(
+        f: &std::sync::Arc<Fixture>,
+        operation: fn(&Installer) -> Result<T>,
+    ) -> Result<T> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let f = std::sync::Arc::clone(f);
+        std::thread::spawn(move || {
+            let _ = send.send(operation(&f.installer));
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the operation must return")
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_active_manifest_that_is_a_fifo_is_not_read() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let manifest = f.installer.active(&id()).join(MANIFEST_FILE);
+        fs::remove_file(&manifest).unwrap();
+        mkfifo(&manifest);
+
+        let way_out = "install a version of `acme.postgres` to replace it";
+        let installed = within_10_seconds(&f, |installer| installer.installed(&id()));
+        assert_error(installed, ErrorCategory::User, way_out);
+        let rollback = within_10_seconds(&f, |installer| installer.rollback(&id()));
+        assert_error(rollback, ErrorCategory::User, way_out);
+        let update = within_10_seconds(&f, |installer| installer.update(&id(), &v("1.2.0")));
+        assert_error(update, ErrorCategory::User, way_out);
+        let install = within_10_seconds(&f, |installer| installer.install(&id(), &v("1.2.0")));
+        assert_eq!(install.unwrap(), Outcome::Activated);
+        assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
     }
 
     // R-110: symbolic links, the lock file, temporary files, a journal
