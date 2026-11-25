@@ -331,6 +331,7 @@ impl SecretStore {
     /// through its [`ExtensionSecrets`]. Call it when the extension can no
     /// longer run code: a read of `owner` that ends after this call
     /// registers its value again, and that value stays until the next call.
+    /// This is a known limit (ADR-0020): the log then hides more, not less.
     pub fn unregister_owner(&self, owner: &Owner) -> usize {
         let read = self
             .read_by

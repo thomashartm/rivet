@@ -206,12 +206,15 @@ impl Permissions {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if `capabilities` breaks the rules of
-    /// [`Capabilities::validate`]: the constructors of the capability types
-    /// do not validate. Returns a `policy` error if `capabilities` contains
-    /// more than the manifest requests. In both cases the grant of the
-    /// extension does not change.
+    /// Returns a `user` error if `capabilities` or the capabilities that
+    /// `manifest` requests (a manifest that [`Manifest::parse`] did not
+    /// build) break the rules of [`Capabilities::validate`]: the
+    /// constructors of the capability types do not validate, and the
+    /// requested capabilities are stored for the update review. Returns a
+    /// `policy` error if `capabilities` contains more than the manifest
+    /// requests. In each case the grant of the extension does not change.
     pub fn grant(&self, manifest: &Manifest, capabilities: Capabilities) -> Result<()> {
+        manifest.capabilities.validate()?;
         capabilities.validate()?;
         if !added_capabilities(&manifest.capabilities, &capabilities).is_empty() {
             return Err(Error::policy(format!(
@@ -742,6 +745,25 @@ mod tests {
             permissions.check_network(&manifest.id, "evil host/..", 0),
             &["network"],
         );
+    }
+
+    // R-107: the requested capabilities are stored, so they are checked too.
+    #[test]
+    fn grant_refuses_a_manifest_that_requests_an_invalid_capability() {
+        let mut manifest = manifest("");
+        manifest.capabilities =
+            Capabilities::new().with_network([NetworkScope::new("evil host/..", [0])]);
+        let permissions = Permissions::new();
+        let error = permissions
+            .grant(&manifest, Capabilities::new())
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        assert!(
+            error.message().contains("capabilities.network[0]"),
+            "{error}"
+        );
+        // Nothing is stored.
+        assert!(!permissions.revoke(&manifest.id));
     }
 
     // R-85: a refused grant does not change the grant that the extension has.
