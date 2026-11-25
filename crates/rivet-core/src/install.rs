@@ -1143,16 +1143,23 @@ fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
 // (ADR-0023 accepts this).
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let write = || {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let mut file = tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .tempfile_in(dir)?;
+        let mut file = temp_file(path)?;
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(path).map_err(|error| error.error)?;
         Ok(())
     };
     write().map_err(|error| io_error(path, "cannot write the file", error))
+}
+
+/// Creates the temporary file of [`write_atomic`] next to `path`. Its name
+/// starts with [`TEMP_PREFIX`], so the recovery removes it when a stopped
+/// process left it.
+fn temp_file(path: &Path) -> io::Result<tempfile::NamedTempFile> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)
 }
 
 /// Removes a file. A file that does not exist is not an error.
@@ -2870,6 +2877,19 @@ mod tests {
         #[cfg(unix)]
         assert!(outside.is_file());
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn the_temporary_file_of_write_atomic_is_one_that_the_recovery_removes() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        // A process that stops after the create leaves the file.
+        let (_, left) = temp_file(&f.store().join(PREVIOUS_FILE))
+            .unwrap()
+            .keep()
+            .unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert!(!left.exists(), "{}", left.display());
     }
 
     #[test]
