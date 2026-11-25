@@ -31,8 +31,9 @@
 //! - An entry above its size limit. The bytes are counted during the copy.
 //! - A second entry with the same name. Thus a package has three entries at
 //!   most.
-//! - A byte that is not zero after the end mark of the archive. The file is
-//!   read to its end.
+//! - An archive without the end mark (two blocks of zeros) after the last
+//!   entry. After the entries only zeros are permitted: the end mark and
+//!   the padding of `tar` to a full record, thus less than 11264 bytes.
 //! - A package without one of the three entries.
 //! - A manifest whose id or version is not the id or version of the
 //!   signature.
@@ -154,8 +155,8 @@
 //!   the grant (to enforce in #51; no check exists). The installer only
 //!   checks that a review waits for this version: the last operation on the
 //!   id returned [`Outcome::NeedsReview`] for it. An install, update or
-//!   rollback of the id that gets to step 1 removes the record of an older
-//!   review.
+//!   rollback of the id whose package passes step 4 removes the record of
+//!   an older review. An operation that fails before that leaves it.
 //! - **First install.** [`Installer::install`] activates the package without
 //!   a review. The extension has no access until the caller grants its
 //!   capabilities: the permission service denies by default.
@@ -195,7 +196,7 @@ use crate::settings::user_settings_path;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::manifest::{Capabilities, ExtensionId, Manifest, Version};
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub use crate::wasm::COMPONENT_FILE;
@@ -219,6 +220,12 @@ const ENTRIES: [(&str, u64); 3] = [
 
 /// More than a minisign signature needs. The verification has its own limit.
 const SIGNATURE_MAX_BYTES: u64 = 16 * 1024;
+
+/// The end mark of a tar archive: two blocks of zeros.
+const END_MARK_BYTES: u64 = 2 * 512;
+
+/// The record size of `tar`. It fills the last record with zeros.
+const RECORD_BYTES: u64 = 20 * 512;
 
 const PENDING_FILE: &str = "pending";
 const PREVIOUS_FILE: &str = "previous";
@@ -456,7 +463,9 @@ impl Installer {
 
     /// Repairs `id` after a change that did not complete, for example after
     /// a crash. Each operation runs this first. A caller can run it at
-    /// start-up. It does nothing if no change is pending.
+    /// start-up. If no change is pending, it only removes a staging
+    /// directory that a stopped process left. For an id without a store
+    /// directory it does nothing and creates nothing.
     ///
     /// # Errors
     ///
@@ -467,6 +476,10 @@ impl Installer {
     ///   store has two or more retired directories. Nothing changes.
     /// - `retryable`: another operation on `id` runs.
     pub fn recover(&self, id: &ExtensionId) -> Result<()> {
+        // No store directory: no operation got to a change of this id.
+        if !self.store(id).is_dir() {
+            return Ok(());
+        }
         let _lock = self.lock(id)?;
         self.repair(id)
     }
@@ -508,6 +521,20 @@ impl Installer {
     /// The recovery. The caller holds the lock of `id`.
     fn repair(&self, id: &ExtensionId) -> Result<()> {
         let store = self.store(id);
+        // With the lock held, each staging directory is of an operation that
+        // stopped, with or without a journal.
+        if let Ok(entries) = fs::read_dir(&store) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STAGING_PREFIX)
+                {
+                    // Best effort: a staging directory that stays is never read.
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         let pending = store.join(PENDING_FILE);
         let text = match fs::read_to_string(&pending) {
             Ok(text) => text,
@@ -533,18 +560,6 @@ impl Installer {
             }
         };
 
-        if let Ok(entries) = fs::read_dir(&store) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(STAGING_PREFIX)
-                {
-                    // Best effort: a staging directory that stays is never read.
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-            }
-        }
         if active_missing {
             if let Some(old) = &old {
                 let retired = store.join(old.to_string());
@@ -584,10 +599,6 @@ impl Installer {
             )));
         }
         let store = self.store(id);
-        if source == Source::Registry || review {
-            // A new install, update or rollback: an older review is void.
-            remove_file(&store.join(REVIEW_FILE))?;
-        }
         let name = format!("{id}-{version}.{PACKAGE_EXTENSION}");
         let signature_name = format!("{name}.minisig");
         let (kept_package, kept_signature) = (store.join(&name), store.join(&signature_name));
@@ -638,6 +649,11 @@ impl Installer {
             )));
         }
 
+        if source == Source::Registry || review {
+            // A verified package of a new install, update or rollback: an
+            // older review is void. A refused package leaves it.
+            remove_file(&store.join(REVIEW_FILE))?;
+        }
         if source == Source::Registry {
             for (from, to) in [(&package, &kept_package), (&signature, &kept_signature)] {
                 fs::rename(from, to)
@@ -811,9 +827,12 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
         .map_err(|error| io_error(content, "cannot create the directory", error))?;
 
     let mut archive = tar::Archive::new(file);
+    // The position after the last entry.
+    let mut end = 0;
     // Raw: a long name entry or a PAX entry is an entry, with its own name.
     for entry in archive.entries().map_err(malformed)?.raw(true) {
         let mut entry = entry.map_err(malformed)?;
+        end = entry.raw_file_position() + entry.size().next_multiple_of(512);
         let path = entry.path_bytes().into_owned();
         // The target name is the constant, never the text of the archive.
         let Some(&(entry_name, limit)) = ENTRIES
@@ -857,19 +876,39 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             return Err(too_large());
         }
     }
-    // The archive library stops at the end mark. Only zero bytes may follow.
+    // The archive library stops at the first block of zeros and at the end
+    // of the file. The end mark and the padding of `tar` must follow the
+    // entries, and nothing else.
     let mut rest = archive.into_inner();
-    let mut block = [0; 8192];
-    loop {
-        let read = rest.read(&mut block).map_err(malformed)?;
-        if read == 0 {
-            break;
-        }
-        if block[..read].iter().any(|byte| *byte != 0) {
-            return Err(refused(
-                "the package has data after the end of the archive".to_owned(),
-            ));
-        }
+    let zeros = rest
+        .metadata()
+        .map_err(malformed)?
+        .len()
+        .saturating_sub(end);
+    if zeros < END_MARK_BYTES {
+        return Err(refused(
+            "the package does not end with the end mark of a tar archive (two blocks of zeros)"
+                .to_owned(),
+        ));
+    }
+    if zeros >= END_MARK_BYTES + RECORD_BYTES {
+        return Err(refused(format!(
+            "the package has {zeros} bytes after the entries; the end mark and the padding \
+             are less than {} bytes",
+            END_MARK_BYTES + RECORD_BYTES
+        )));
+    }
+    let mut tail = Vec::new();
+    rest.seek(SeekFrom::Start(end))
+        .and_then(|_| {
+            rest.take(END_MARK_BYTES + RECORD_BYTES)
+                .read_to_end(&mut tail)
+        })
+        .map_err(malformed)?;
+    if (tail.len() as u64) < END_MARK_BYTES || tail.iter().any(|byte| *byte != 0) {
+        return Err(refused(
+            "the package has data after the end of the archive".to_owned(),
+        ));
     }
     match ENTRIES
         .iter()
@@ -901,12 +940,16 @@ impl Drop for IdLock {
 fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
     create_private_dir(store)?;
     let path = store.join(LOCK_FILE);
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|error| io_error(&path, "cannot open the lock file", error))?;
+    // Does not follow a symbolic link and does not open a FIFO.
+    match File::create_new(&path) {
+        Err(error) if error.kind() != ErrorKind::AlreadyExists => {
+            return Err(io_error(&path, "cannot create the lock file", error));
+        }
+        _ => {}
+    }
+    // The lock file is empty. A planted symbolic link could lock or create
+    // a file out of the store; the open of a planted FIFO does not return.
+    let file = open_regular(&path, "lock", 0)?;
     match file.try_lock() {
         Ok(()) => Ok(IdLock(file)),
         Err(fs::TryLockError::WouldBlock) => Err(Error::retryable(format!(
@@ -1969,16 +2012,18 @@ mod tests {
             ErrorCategory::User,
             "(mode 0777)",
         );
-        assert_error(
-            f.installer.recover(&id()),
-            ErrorCategory::User,
-            "(mode 0777)",
-        );
         // Nothing was written to the directory.
         assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
 
         set_mode(&data, 0o755);
         f.installer.install(&id(), &v("1.0.0")).unwrap();
+        set_mode(&data, 0o777);
+        assert_error(
+            f.installer.recover(&id()),
+            ErrorCategory::User,
+            "(mode 0777)",
+        );
+        set_mode(&data, 0o755);
         f.installer.update(&id(), &v("1.1.0")).unwrap();
         // The kept package of a rollback is in a directory of the group.
         for dir in [f.store(), data.join("store"), f.installer.extensions_dir()] {
@@ -2048,6 +2093,143 @@ mod tests {
         fs::remove_dir(f.store().join("0.9.0")).unwrap();
         f.installer.recover(&id()).unwrap();
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    // R-100: the lock file, an id without a store, staging directories.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_that_is_not_a_regular_file_is_refused() {
+        let f = std::sync::Arc::new(fixture());
+        f.publish("1.0.0", &package("1.0.0", ""));
+        fs::create_dir_all(f.store()).unwrap();
+        let lock_file = f.store().join(LOCK_FILE);
+
+        // A symbolic link to a file out of the data directory.
+        let outside = f.dir.path().join("outside");
+        std::os::unix::fs::symlink(&outside, &lock_file).unwrap();
+        assert_error(
+            f.installer.install(&id(), &v("1.0.0")),
+            ErrorCategory::User,
+            "the lock file must not be a symbolic link",
+        );
+        assert!(!outside.exists());
+        fs::remove_file(&lock_file).unwrap();
+
+        // A FIFO: the open of a FIFO without a reader does not return.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&lock_file)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (send, receive) = std::sync::mpsc::channel();
+        let installer = std::sync::Arc::clone(&f);
+        std::thread::spawn(move || {
+            let _ = send.send(installer.installer.install(&id(), &v("1.0.0")));
+        });
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the install must return");
+        assert_error(
+            result,
+            ErrorCategory::User,
+            "the lock file is not a regular file",
+        );
+        assert_eq!(f.active_version(), None);
+
+        fs::remove_file(&lock_file).unwrap();
+        f.installer.install(&id(), &v("1.0.0")).unwrap();
+    }
+
+    #[test]
+    fn recover_of_an_id_without_a_store_directory_creates_nothing() {
+        let f = fixture();
+        f.installer.recover(&id()).unwrap();
+        assert!(!f.installer.data.exists());
+    }
+
+    #[test]
+    fn the_staging_directory_of_a_stopped_process_is_removed_without_a_journal() {
+        let f = fixture();
+        let content = f.staged_update();
+        assert!(!f.store().join(PENDING_FILE).exists());
+        f.installer.recover(&id()).unwrap();
+        assert!(!content.parent().unwrap().exists());
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    /// A child process that starts while the lock is held has a copy of the
+    /// file handle. The copy here stands for it.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_is_released_while_a_copy_of_its_file_handle_is_open() {
+        let f = fixture();
+        let held = lock(&f.store(), &id()).unwrap();
+        let _copy = held.0.try_clone().unwrap();
+        drop(held);
+        lock(&f.store(), &id()).unwrap();
+    }
+
+    // R-101: the review record, the end of the archive.
+
+    #[test]
+    fn a_failed_update_does_not_remove_the_review_that_waits() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        assert!(matches!(
+            f.update("1.1.0", &package("1.1.0", NETWORK)).unwrap(),
+            Outcome::NeedsReview { .. }
+        ));
+        // The package of 1.2.0 is refused: its manifest is for 1.2.1.
+        assert_error(
+            f.update("1.2.0", &package("1.2.1", "")),
+            ErrorCategory::Policy,
+            "the manifest is for",
+        );
+        f.installer
+            .activate_after_review(&id(), &v("1.1.0"))
+            .unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
+    fn a_package_needs_the_end_mark_and_no_more_zeros_than_one_record() {
+        let valid = package("1.0.0", "");
+        let entries = valid.len() - END_MARK_BYTES as usize;
+        let with_zeros = |zeros: usize| {
+            let mut bytes = valid[..entries].to_vec();
+            bytes.resize(entries + zeros, 0);
+            bytes
+        };
+        for zeros in [0, 512, 1023] {
+            let f = fixture();
+            assert_error(
+                f.install("1.0.0", &with_zeros(zeros)),
+                ErrorCategory::Policy,
+                "does not end with the end mark",
+            );
+            f.assert_nothing_installed();
+        }
+        let f = fixture();
+        assert_error(
+            f.install(
+                "1.0.0",
+                &with_zeros((END_MARK_BYTES + RECORD_BYTES) as usize),
+            ),
+            ErrorCategory::Policy,
+            "bytes after the entries",
+        );
+        f.assert_nothing_installed();
+
+        // The end mark, and the padding that `tar` writes to a full record.
+        let padded = (entries + END_MARK_BYTES as usize).next_multiple_of(RECORD_BYTES as usize);
+        for zeros in [END_MARK_BYTES as usize, padded - entries] {
+            let f = fixture();
+            assert_eq!(
+                f.install("1.0.0", &with_zeros(zeros)).unwrap(),
+                Outcome::Activated
+            );
+        }
     }
 
     #[test]
