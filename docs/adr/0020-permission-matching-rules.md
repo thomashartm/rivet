@@ -27,4 +27,6 @@ ARCHITECTURE.md §4.7 lists the capabilities and their scopes. It does not say h
 - The manifest needs a place to declare secret schemes. This is a manifest format change.
 - A swap of a parent directory for a symbolic link after the check cannot redirect an open, when part 2 is done. The crate for directory handles (candidate: `cap-std`) is not chosen; its licence and size are not checked.
 - A secret value that an extension already holds stays usable after a revoke. Only the next request is denied. To stop the use, the host must deactivate the extension.
+- A grant is the decision of the user at install or update review (§4.7). The extension host does not revoke it: it stays after deactivate, failure, restart, unload, reload, disable. Only an uninstall or the user revokes it. When an extension stops, the host removes what the extension holds: its secret backends, services, commands and jobs. This differs from one criterion of ticket #7 ("the host revokes grants on unload"); the owner decides.
+- The extension host holds the secret store itself. An extension never gets the secret store or the permission service through its context (§7.4).
 - A granted host name does not grant its addresses. The caller MUST connect to the host that was checked (to enforce in the network host import, #7 part 2; no check exists).
