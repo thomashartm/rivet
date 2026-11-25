@@ -1621,9 +1621,9 @@ impl ExtensionHost {
     /// decision of the user and ends only with an uninstall or a new review
     /// (§4.7, ADR-0020).
     ///
-    /// From its start to its end, the registry, the two buses and the job
-    /// scheduler refuse `owner`: code that still runs cannot register behind
-    /// the release (ADR-0021).
+    /// From its start to its end, the registry, the two buses, the job
+    /// scheduler and the secret store refuse `owner`: code that still runs
+    /// cannot register behind the release (ADR-0021).
     ///
     /// It waits until each job of `owner` has ended or was aborted. The job
     /// scheduler limits this wait: it aborts a job that ignores the cancel
@@ -1634,20 +1634,19 @@ impl ExtensionHost {
         self.services.commands.close_owner(owner);
         self.services.events.close_owner(owner);
         self.services.jobs.close_owner(owner);
+        self.secrets.close_owner(owner);
         self.services.jobs.stop_owner(owner).await;
         self.services.registry.unregister_owner(owner);
         self.services.commands.unregister_owner(owner);
         self.services.events.unsubscribe_owner(owner);
-        // After the jobs: a job that still runs could register a backend
-        // again after the removal, and that backend would stay (the secret
-        // store has no gate for an owner). Until its jobs have ended, the
-        // extension keeps complete backends; a resolve that runs holds its
-        // own reference to the backend.
+        // After the jobs, like the other registrations. A resolve that
+        // runs holds its own reference to the backend.
         self.secrets.unregister_owner(owner);
         self.services.registry.open_owner(owner);
         self.services.commands.open_owner(owner);
         self.services.events.open_owner(owner);
         self.services.jobs.open_owner(owner);
+        self.secrets.open_owner(owner);
         let running = self.services.jobs.aborted_running(owner);
         if running > 0 {
             tracing::warn!(extension = %owner, jobs = running, "the release of the extension ended, but the code of aborted jobs has not stopped: it can register again");
@@ -2127,7 +2126,14 @@ mod tests {
         let _ = services.commands.register(owner.clone(), &name, handler);
         let subscription = services.events.subscribe_owned(owner.clone());
         let mut subscriptions = fake.subscriptions.lock().unwrap();
-        subscriptions.insert(name, subscription);
+        subscriptions.insert(name.clone(), subscription);
+        // The scheme `<owner>.late2`: the job of the fake has `<owner>.late`.
+        let backend = fake
+            .secrets
+            .register(owner.clone(), &format!("{name}2"), Arc::new(Fixed));
+        if let Err(error) = backend {
+            fake.log(&format!("backend {name}2: {:?}", error.category()));
+        }
     }
 
     struct FakeRuntime(Arc<Fake>);
@@ -2198,11 +2204,12 @@ mod tests {
                             std::future::pending::<()>().await;
                         }
                         job.cancelled().await;
-                        secrets.register(
+                        // Refused while the host stops the extension.
+                        let _ = secrets.register(
                             backend_owner.clone(),
                             &format!("{backend_owner}.late"),
                             Arc::new(Fixed),
-                        )?;
+                        );
                         if answers {
                             register_late(&fake, &again, &of);
                         }
@@ -4323,6 +4330,10 @@ mod tests {
         f.host.deactivate(&id("a")).await.unwrap();
 
         assert_eq!(f.late("a").await, (0, false, false, false));
+        // The secret store refused the backend: it was never there.
+        assert_eq!(f.fake.count("backend a.late2: Policy"), 1);
+        let late = "a.late2://x".parse().unwrap();
+        assert!(f.fake.secrets.resolve(&late).await.is_err());
         f.host.unload(&id("a")).await.unwrap();
         assert_eq!(f.late("a").await, (0, false, false, false));
 
