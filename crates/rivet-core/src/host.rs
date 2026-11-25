@@ -65,9 +65,18 @@
 //! Limit: the abort cannot stop a blocking job, or a job that does not
 //! return to the runtime. Such code runs on after the stop and after a
 //! restart of the extension. It keeps its job slot, and it can register
-//! again with the id of the extension. The next stop of the extension
-//! removes what it registered. The host does not keep the extension stopped
-//! for it (ADR-0021).
+//! again with the id of the extension. The host does not keep the extension
+//! stopped for it (ADR-0021), but it writes a `warn` event with the number
+//! of such jobs. When their code has stopped, the host releases the
+//! extension again, unless it is `Active` at that time; then the next stop
+//! removes what the code registered. After [`ExtensionHost::unload`], the
+//! id stays refused until that second release.
+//!
+//! The host waits for the jobs not longer than two times the grace period:
+//! the task of the scheduler that aborts a job can wait behind an async
+//! worker that extension code blocks. Jobs that did not end then count as
+//! aborted jobs whose code runs on. On a runtime with one thread, or when
+//! each worker is blocked, no timer runs, and nothing limits this wait.
 //!
 //! # Time limit
 //!
@@ -121,12 +130,13 @@
 //!
 //! - [`HostConfig::call_timeout`] for each call: `load`, `activate`,
 //!   `deactivate` and the unload;
-//! - [`JobConfig::cancel_grace`](crate::jobs::JobConfig::cancel_grace) for
+//! - two times
+//!   [`JobConfig::cancel_grace`](crate::jobs::JobConfig::cancel_grace) for
 //!   each release of the jobs of the extension.
 //!
 //! The longest sequence for one extension is a reload whose new activation
 //! fails: five calls and two releases. With the defaults, that is not more
-//! than 160 s.
+//! than 170 s.
 //!
 //! [`ExtensionHost::discover`] and [`ExtensionHost::reload`] read the
 //! discovery directories before they wait for their turn. Thus a slow read
@@ -187,7 +197,7 @@
 
 use crate::Owner;
 use crate::bus::{CommandBus, EventBus};
-use crate::jobs::JobScheduler;
+use crate::jobs::{JobId, JobScheduler};
 use crate::package::read_text_file;
 use crate::registry::ServiceRegistry;
 use crate::resolve::{
@@ -1089,6 +1099,13 @@ impl ExtensionHost {
             let unloaded = {
                 let mut inner = host.inner();
                 let entry = host.unload_entry(&mut inner, &id)?;
+                // Until `release_again` has ended (ADR-0021): nothing can
+                // register with the id of an extension that is gone.
+                let running = host.services.jobs.running(&id);
+                if !running.is_empty() {
+                    host.close_owner(&id);
+                    host.release_again(&id, running);
+                }
                 let packages = inner.unloaded_packages();
                 let mut unloaded = Vec::from_iter(entry.map(|entry| (id.clone(), entry)));
                 unloaded.extend(host.reconcile(&mut inner, packages));
@@ -1838,15 +1855,19 @@ impl ExtensionHost {
     ///
     /// It waits until each job of `owner` has ended or was aborted. The job
     /// scheduler limits this wait: it aborts a job that ignores the cancel
-    /// request. The registrations are removed after that wait, so that the
+    /// request. The host limits it also, to two times the grace period of
+    /// the scheduler: the task that aborts a job can wait behind a blocked
+    /// worker. The registrations are removed after that wait, so that the
     /// state of the extension and its registrations change together.
+    ///
+    /// Job code that was not seen to stop can register again. When it has
+    /// stopped, the host releases `owner` one more time
+    /// ([`release_again`](Self::release_again)).
     async fn release(&self, owner: &Owner) {
-        self.services.registry.close_owner(owner);
-        self.services.commands.close_owner(owner);
-        self.services.events.close_owner(owner);
-        self.services.jobs.close_owner(owner);
-        self.secrets.close_owner(owner);
-        self.services.jobs.stop_owner(owner).await;
+        self.close_owner(owner);
+        let jobs = &self.services.jobs;
+        // The jobs that do not end in this time count as aborted below.
+        let _ = tokio::time::timeout(2 * jobs.cancel_grace(), jobs.stop_owner(owner)).await;
         self.services.registry.unregister_owner(owner);
         self.services.commands.unregister_owner(owner);
         self.services.events.unsubscribe_owner(owner);
@@ -1858,10 +1879,45 @@ impl ExtensionHost {
         self.services.events.open_owner(owner);
         self.services.jobs.open_owner(owner);
         self.secrets.open_owner(owner);
-        let running = self.services.jobs.aborted_running(owner);
-        if running > 0 {
-            tracing::warn!(extension = %owner, jobs = running, "the release of the extension ended, but the code of aborted jobs has not stopped: it can register again");
+        let running = jobs.running(owner);
+        if !running.is_empty() {
+            let count = running.len();
+            tracing::warn!(extension = %owner, jobs = count, "{count} aborted jobs were not seen to stop: their code can register again until the extension is released again");
+            self.release_again(owner, running);
         }
+    }
+
+    /// The registry, the two buses, the job scheduler and the secret store
+    /// refuse `owner` until the next release of `owner` ends.
+    fn close_owner(&self, owner: &Owner) {
+        self.services.registry.close_owner(owner);
+        self.services.commands.close_owner(owner);
+        self.services.events.close_owner(owner);
+        self.services.jobs.close_owner(owner);
+        self.secrets.close_owner(owner);
+    }
+
+    /// Releases `owner` again when the code of the jobs `running` has
+    /// stopped, with the rule of `follow`: not if the extension is `Active`
+    /// at that time. The task does not keep the host alive.
+    fn release_again(&self, owner: &Owner, running: Vec<JobId>) {
+        let (host, jobs, owner) = (self.this.clone(), self.services.jobs.clone(), owner.clone());
+        tokio::spawn(async move {
+            jobs.stopped(&running).await;
+            let Some(host) = host.upgrade() else {
+                return;
+            };
+            let _lifecycle = host.lifecycle.lock().await;
+            let active = {
+                let inner = host.inner();
+                let entry = inner.entries.get(&owner);
+                entry.is_some_and(|entry| entry.state == ExtensionState::Active)
+            };
+            if !active {
+                host.release(&owner).await;
+                tracing::debug!(extension = %owner, "the code of the aborted jobs stopped: the extension was released again");
+            }
+        });
     }
 
     /// Handles a failure of `id`: releases what it owns, puts it in the
@@ -2274,9 +2330,10 @@ mod tests {
 
         /// Runs `block`, which blocks its thread, inside a call that does
         /// not return to the runtime. On a runtime with more than one
-        /// thread, the runtime gets a new worker for that time: a blocked
-        /// worker can leave no thread that drives the timer, and then no
-        /// time limit ends.
+        /// thread, the runtime gets a new worker for that time. Without it,
+        /// the task that the call spawned last (for example the supervisor
+        /// of a job) stays in the LIFO slot of the blocked worker, which no
+        /// other worker takes from (Tokio: `MAX_LIFO_POLLS_PER_TICK`).
         fn blocking(&self, block: impl FnOnce()) {
             match Handle::current().runtime_flavor() {
                 tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -5287,7 +5344,7 @@ mod tests {
 
         let jobs = f.services.jobs.jobs();
         let blocking = jobs.iter().find(|job| job.kind == "blocking").unwrap();
-        let running = f.services.jobs.aborted_running(&id("a"));
+        let running = f.services.jobs.running(&id("a")).len();
         // Lets the code end, so that the runtime of the test can stop.
         f.fake.set("blocking a", None);
         // The documented limit: the host waited for the abort, not for the
@@ -5302,18 +5359,21 @@ mod tests {
         f.assert_no_backend("a").await;
         // The log has the limit, one time: the release of the deactivation.
         let log = log.text();
-        let limit = "the code of aborted jobs has not stopped";
+        let limit = "1 aborted jobs were not seen to stop";
         let lines: Vec<&str> = log.lines().filter(|line| line.contains(limit)).collect();
         assert_eq!(lines.len(), 1, "{log}");
         assert!(lines[0].contains("WARN"), "{log}");
         assert!(lines[0].contains("extension=a jobs=1"), "{log}");
     }
 
-    // R-122: what the code of an aborted job registers after the unload of
-    // its extension is released when that code ends.
-    #[tokio::test(start_paused = true)]
-    #[ignore = "waits for ruling"]
-    async fn what_an_aborted_job_registers_after_the_unload_is_released() {
+    /// Deactivates `a`, whose blocking job ignores the cancel request, with
+    /// the paused clock, and unloads it if `unload`. Then the job code ends
+    /// and tries to register again: the host must release `a` one more
+    /// time. Returns the log, with the `debug` events.
+    async fn aborted_job_code_ends_after_the_release(unload: bool) -> (Fixture, String) {
+        let capture = Capture::default();
+        let dispatch = capture.dispatch(Level::DEBUG, LogFormat::Human, &Redactor::new());
+        let _guard = capture_logs(&dispatch);
         let grace = crate::jobs::JobConfig::default().cancel_grace;
         let f = fixture(true);
         f.add("a", &[]);
@@ -5330,27 +5390,59 @@ mod tests {
             tokio::time::advance(grace / 5).await;
         }
         stop.await.unwrap().unwrap();
-        f.host.unload(&id("a")).await.unwrap();
+        if unload {
+            f.host.unload(&id("a")).await.unwrap();
+        }
 
-        // The code of the job ends and registers.
+        // The code of the job ends and tries to register.
         f.fake.set("blocking a", None);
         f.fake.called("blocking a ended").await;
-        let any = semver::VersionReq::STAR;
+        let again = "the extension was released again";
         let released = tokio::time::timeout(Duration::from_secs(60), async {
-            while f.services.registry.lookup::<str>("a.late", &any).is_ok() {
+            while !capture.text().contains(again) {
                 tokio::time::sleep(MS).await;
             }
         })
         .await;
 
-        assert!(released.is_ok(), "the service `a.late` stays registered");
+        assert!(released.is_ok(), "no second release: {}", capture.text());
+        drop(_open);
+        (f, capture.text())
+    }
+
+    // R-122: an unloaded extension stays closed until the second release.
+    #[tokio::test(start_paused = true)]
+    async fn what_an_aborted_job_registers_after_the_unload_is_released() {
+        let (f, log) = aborted_job_code_ends_after_the_release(true).await;
+
+        // The owner was closed: the job code could not register.
+        assert_eq!(f.fake.count("backend a.late2: Policy"), 1);
         assert_eq!(f.late("a").await, (0, false, false, false));
+        assert!(log.contains("DEBUG"), "{log}");
+        // The mark is gone: the id can register again.
+        let version = Version::new(1, 0, 0);
+        let service: Arc<str> = Arc::from("next");
+        let registry = &f.services.registry;
+        registry
+            .register(id("a"), "a.next", version, service)
+            .unwrap();
+    }
+
+    // R-122: what an aborted job registers after the release of an
+    // extension that is `Inactive` is released when the job code ends.
+    #[tokio::test(start_paused = true)]
+    async fn what_an_aborted_job_registers_after_the_deactivation_is_released() {
+        let (f, _) = aborted_job_code_ends_after_the_release(false).await;
+
+        // The registration was possible, and the second release removed it.
+        assert_eq!(f.fake.count("backend a.late2: Policy"), 0);
+        assert_eq!(f.late("a").await, (0, false, false, false));
+        assert_eq!(f.state("a"), Some(Inactive));
     }
 
     // R-123: a call that starts a job and then blocks its async worker
     // without a yield. The release of the job must end in its time limit.
     #[test]
-    #[ignore = "waits for ruling"]
     fn a_call_that_blocks_its_worker_after_the_start_of_a_job_does_not_stop_the_host() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(8)
@@ -5376,9 +5468,8 @@ mod tests {
             f.fake.set("hold stall a", Some(Mode::Fail));
             let _open = Open(&f.fake, "hold stall a");
 
-            // The time limit of the call and the grace period are less
-            // than 6 s.
-            let report = tokio::time::timeout(Duration::from_secs(20), f.go("a")).await;
+            // The time limit of the call and two grace periods: about 10 s.
+            let report = tokio::time::timeout(Duration::from_secs(30), f.go("a")).await;
 
             assert_eq!(f.fake.count("stall a"), 1);
             let report = report.expect("the release of the job did not end");

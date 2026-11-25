@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 // The job model is plain data in the SDK, so that an extension can use it
@@ -292,6 +292,8 @@ struct Inner {
     jobs: Mutex<Jobs>,
     /// The owners that the host stops: they cannot start a job.
     closed: ClosedOwners,
+    /// Notified when a job leaves `Jobs::active` or `Jobs::stopping`.
+    left: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -345,6 +347,7 @@ impl JobScheduler {
                 next_id: AtomicU64::new(1),
                 jobs: Mutex::default(),
                 closed: ClosedOwners::default(),
+                left: Notify::new(),
             }),
         }
     }
@@ -458,11 +461,44 @@ impl JobScheduler {
         count
     }
 
-    /// Returns how many aborted jobs of `owner` have code that has not
-    /// stopped. Such a job is `Cancelled`, but it keeps its slot.
-    pub(crate) fn aborted_running(&self, owner: &Owner) -> usize {
+    /// Returns the jobs of `owner` whose code can still run: the queued
+    /// and running jobs, and the aborted jobs whose code was not seen to
+    /// stop. An aborted job is `Cancelled`, but it keeps its slot until a
+    /// later task sees its code stop.
+    pub(crate) fn running(&self, owner: &Owner) -> Vec<JobId> {
         let jobs = self.inner.lock();
-        jobs.stopping.values().filter(|of| *of == owner).count()
+        let active = jobs.active.iter().filter(|(_, job)| &job.owner == owner);
+        let stopping = jobs.stopping.iter();
+        let stopping = stopping.filter(|(id, of)| *of == owner && !jobs.active.contains_key(id));
+        active
+            .map(|(id, _)| *id)
+            .chain(stopping.map(|(id, _)| *id))
+            .collect()
+    }
+
+    /// Waits until the code of none of `ids` can run any more (see
+    /// [`running`](Self::running)).
+    pub(crate) async fn stopped(&self, ids: &[JobId]) {
+        loop {
+            let left = self.inner.left.notified();
+            tokio::pin!(left);
+            left.as_mut().enable();
+            let runs = {
+                let jobs = self.inner.lock();
+                let runs =
+                    |id: &JobId| jobs.active.contains_key(id) || jobs.stopping.contains_key(id);
+                ids.iter().any(runs)
+            };
+            if !runs {
+                return;
+            }
+            left.await;
+        }
+    }
+
+    /// [`JobConfig::cancel_grace`] of this scheduler.
+    pub(crate) fn cancel_grace(&self) -> Duration {
+        self.inner.cancel_grace
     }
 
     /// Sends a cancel request to every queued or running job of `owner`.
@@ -626,6 +662,7 @@ impl Inner {
                     }
                     inner.lock().stopping.remove(&id);
                     drop(slot);
+                    inner.left.notify_waiters();
                 });
                 return Err(Error::cancelled(format!(
                     "job {id} did not stop in {grace:?} after the cancel request and was aborted"
@@ -664,6 +701,7 @@ impl Inner {
         let Some(job) = jobs.active.remove(&id) else {
             return;
         };
+        self.left.notify_waiters();
         let progress = status.borrow().progress.clone();
         let mut snapshot = JobSnapshot::new(id, job.kind, job.owner, state, progress);
         snapshot.error = error.map(ToString::to_string);
@@ -1312,37 +1350,36 @@ mod tests {
         next.unwrap().join().await.unwrap();
     }
 
-    // R-126 a: async code that ignores the cancel request stops with the
-    // abort. Right after `stop_owner` it must not count as code that still
-    // runs: the host then warns that it can register again.
+    // R-126 a: right after `stop_owner`, an aborted async job can still
+    // count as running: a later task sees its code stop. `stopped` waits
+    // for that task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "waits for ruling"]
-    async fn an_aborted_async_job_does_not_count_as_running_after_stop_owner() {
-        const ROUNDS: usize = 200;
+    async fn an_aborted_async_job_is_seen_to_stop_after_stop_owner() {
         let scheduler = JobScheduler::with_config(JobConfig {
             cancel_grace: Duration::from_millis(1),
             ..JobConfig::default()
         });
         let owner = owner("ext.a");
-        let mut counted = 0;
-        for _ in 0..ROUNDS {
+        for _ in 0..50 {
             let stubborn = scheduler
                 .spawn(owner.clone(), "query", |_| {
                     std::future::pending::<Result<()>>()
                 })
                 .unwrap();
             wait_for(&stubborn, JobState::Running).await;
-
             assert_eq!(scheduler.stop_owner(&owner).await, 1);
 
-            if scheduler.aborted_running(&owner) > 0 {
-                counted += 1;
-            }
+            let running = scheduler.running(&owner);
+            let stopped =
+                tokio::time::timeout(Duration::from_secs(10), scheduler.stopped(&running));
+
+            assert!(running.len() <= 1, "{running:?}");
+            assert!(
+                stopped.await.is_ok(),
+                "the aborted code was not seen to stop"
+            );
+            assert!(scheduler.running(&owner).is_empty());
         }
-        assert_eq!(
-            counted, 0,
-            "counted as running in {counted} of {ROUNDS} rounds"
-        );
     }
 
     #[tokio::test(start_paused = true)]
