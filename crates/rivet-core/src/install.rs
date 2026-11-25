@@ -48,8 +48,9 @@
 //! <registry>/<id>/<version>/<id>-<version>.rivetpkg.minisig
 //!
 //! <data>/extensions/<id>/                the active version (the host scans this)
-//! <data>/store/<id>/<id>-<version>.rivetpkg          each verified package is kept
-//! <data>/store/<id>/<id>-<version>.rivetpkg.minisig
+//! <data>/store/<id>/<id>-<version>.rivetpkg          the verified package of the active
+//! <data>/store/<id>/<id>-<version>.rivetpkg.minisig  version, of the previous version and
+//!                                                    of a version whose review waits
 //! <data>/store/<id>/previous             the version for a rollback
 //! <data>/store/<id>/pending              the journal of a change that is not complete
 //! <data>/store/<id>/review               the version whose review waits
@@ -57,6 +58,11 @@
 //! ```
 //!
 //! `<data>` MUST be a directory of the user that other users cannot write.
+//! On Unix each operation refuses, with a `user` error, a `<data>`,
+//! `<data>/store`, `<data>/store/<id>` or `<data>/extensions` that the group
+//! or other users can write. The installer creates these directories with
+//! mode 0700, so a kept package is verified again in a private directory.
+//! The owner of a directory is not checked. Windows has no check.
 //! `<data>/extensions` is the user discovery directory of the host
 //! ([`Installer::extensions_dir`]). The host does not scan `<data>/store`.
 //!
@@ -106,7 +112,24 @@
 //! version is active and the operation returns `Ok`. If step 4 then fails
 //! (for example on a full disk), the operation writes a warning to the log
 //! and `pending` stays. The next operation on the id or the next
-//! [`Installer::recover`] does step 4 again.
+//! [`Installer::recover`] does step 4 again. Step 4 also deletes the kept
+//! packages of all versions but the active and the previous one.
+//!
+//! A `pending` file that is not a journal of this module does not stop the
+//! recovery and does not lose the active version. The recovery then reads
+//! the directories: an active directory stays; if there is none, the one
+//! retired directory in the store goes back. With two or more retired
+//! directories the recovery changes nothing and returns an `internal` error.
+//! `previous` is not written in this case.
+//!
+//! An active version whose manifest is invalid cannot be updated or rolled
+//! back. [`Installer::install`] replaces it with a verified package and
+//! deletes it. A stop between the two renames of this change leaves no
+//! active version.
+//!
+//! The recovery of an id runs only when an operation names that id.
+//! [`Installer::recover_all`] recovers each id; no start-up code calls it
+//! yet.
 //!
 //! # One operation on an id at a time
 //!
@@ -280,23 +303,42 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if the manifest of the active version cannot
-    /// be read or is invalid.
+    /// Returns a `user` error that names the file if the manifest of the
+    /// active version cannot be read or is invalid.
     pub fn installed(&self, id: &ExtensionId) -> Result<Option<Manifest>> {
+        let Some(text) = self.active_manifest(id)? else {
+            return Ok(None);
+        };
+        // The way out of a broken active version: `install` replaces it.
+        let broken = |error: Error| {
+            Error::user(format!(
+                "{}: {}; install a version of `{id}` to replace it",
+                self.active(id).join(MANIFEST_FILE).display(),
+                error.message()
+            ))
+        };
+        Manifest::parse(&text).map(Some).map_err(broken)
+    }
+
+    /// Returns the manifest text of the active version of `id`, or `None`
+    /// if the extension is not installed.
+    fn active_manifest(&self, id: &ExtensionId) -> Result<Option<String>> {
         let path = self.active(id).join(MANIFEST_FILE);
         match fs::read_to_string(&path) {
-            Ok(text) => Manifest::parse(&text).map(Some),
+            Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) => Err(io_error(&path, "cannot read the manifest", error)),
         }
     }
 
-    /// Installs `version` of `id` from the registry and activates it.
+    /// Installs `version` of `id` from the registry and activates it. An
+    /// active version whose manifest is invalid is replaced and deleted.
     ///
     /// # Errors
     ///
-    /// - `user`: the extension is installed already (use
-    ///   [`update`](Self::update)), or the package or the signature is not
+    /// - `user`: a directory of the installer can be written by the group
+    ///   or by other users (Unix), or the extension is installed already
+    ///   (use [`update`](Self::update)), or the package or the signature is not
     ///   in the registry or cannot be read, or the package is not a tar
     ///   archive, or its manifest is invalid.
     /// - `policy`: the signature does not verify, the publisher has no
@@ -306,15 +348,22 @@ impl Installer {
     ///
     /// Each error installs nothing.
     pub fn install(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        let _lock = lock(&self.store(id), id)?;
+        let _lock = self.lock(id)?;
         self.repair(id)?;
-        if let Some(installed) = self.installed(id)? {
-            return Err(Error::user(format!(
-                "extension `{id}` is installed in version {}; update it instead",
-                installed.version
-            )));
-        }
-        self.activate(id, version, Source::Registry, false)
+        // An active version with an invalid manifest is replaced: no other
+        // operation can leave that state.
+        let broken = match self.installed(id) {
+            Ok(None) => false,
+            Ok(Some(installed)) => {
+                return Err(Error::user(format!(
+                    "extension `{id}` is installed in version {}; update it instead",
+                    installed.version
+                )));
+            }
+            Err(_) if self.active_manifest(id)?.is_some() => true,
+            Err(error) => return Err(error),
+        };
+        self.activate(id, version, Source::Registry, false, broken)
     }
 
     /// Updates `id` to the newer `version` from the registry.
@@ -334,7 +383,7 @@ impl Installer {
     /// ([the point of no return](self#why-a-failed-change-leaves-the-old-version-usable))
     /// no error is returned.
     pub fn update(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        let _lock = lock(&self.store(id), id)?;
+        let _lock = self.lock(id)?;
         self.repair(id)?;
         match self.installed(id)? {
             None => Err(Error::user(format!(
@@ -346,7 +395,7 @@ impl Installer {
                     installed.version
                 )))
             }
-            Some(_) => self.activate(id, version, Source::Registry, true),
+            Some(_) => self.activate(id, version, Source::Registry, true, false),
         }
     }
 
@@ -367,7 +416,7 @@ impl Installer {
     /// ([the point of no return](self#why-a-failed-change-leaves-the-old-version-usable))
     /// no error is returned.
     pub fn rollback(&self, id: &ExtensionId) -> Result<Outcome> {
-        let _lock = lock(&self.store(id), id)?;
+        let _lock = self.lock(id)?;
         self.repair(id)?;
         let path = self.store(id).join(PREVIOUS_FILE);
         let none = || Error::user(format!("extension `{id}` has no previous version"));
@@ -376,7 +425,7 @@ impl Installer {
             Err(error) if error.kind() == ErrorKind::NotFound => return Err(none()),
             Err(error) => return Err(io_error(&path, "cannot read the file", error)),
         };
-        self.activate(id, &previous, Source::Store, true)
+        self.activate(id, &previous, Source::Store, true, false)
     }
 
     /// Activates `version` of `id` from the package that the store kept,
@@ -392,7 +441,7 @@ impl Installer {
     ///   is active already.
     /// - See [`install`](Self::install).
     pub fn activate_after_review(&self, id: &ExtensionId, version: &Version) -> Result<()> {
-        let _lock = lock(&self.store(id), id)?;
+        let _lock = self.lock(id)?;
         self.repair(id)?;
         // A record that cannot be read or is for another version is no review.
         let record = fs::read_to_string(self.store(id).join(REVIEW_FILE)).unwrap_or_default();
@@ -401,7 +450,8 @@ impl Installer {
                 "extension `{id}`: no review waits for version {version}; update to it first"
             )));
         }
-        self.activate(id, version, Source::Store, false).map(|_| ())
+        self.activate(id, version, Source::Store, false, false)
+            .map(|_| ())
     }
 
     /// Repairs `id` after a change that did not complete, for example after
@@ -410,12 +460,49 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// - `user`: a file cannot be read, moved or written. The error names
-    ///   the file.
+    /// - `user`: a file cannot be read, moved or written, or a directory
+    ///   of the installer can be written by the group or by other users
+    ///   (Unix). The error names the file or the directory.
+    /// - `internal`: the journal is invalid, no version is active and the
+    ///   store has two or more retired directories. Nothing changes.
     /// - `retryable`: another operation on `id` runs.
     pub fn recover(&self, id: &ExtensionId) -> Result<()> {
-        let _lock = lock(&self.store(id), id)?;
+        let _lock = self.lock(id)?;
         self.repair(id)
+    }
+
+    /// Runs [`recover`](Self::recover) for each id that has a directory in
+    /// the store. Call it at start-up, before the host scans
+    /// [`extensions_dir`](Self::extensions_dir).
+    ///
+    /// # Errors
+    ///
+    /// An error of one id does not stop the recovery of the others. Each
+    /// error is logged. The first error is returned.
+    pub fn recover_all(&self) -> Result<()> {
+        let store = self.data.join("store");
+        let unreadable = |error| io_error(&store, "cannot read the directory", error);
+        let entries = match fs::read_dir(&store) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(unreadable(error)),
+        };
+        let mut first = None;
+        for entry in entries {
+            let entry = entry.map_err(unreadable)?;
+            // The installer makes one directory per id and nothing else.
+            let Ok(id) = entry.file_name().to_string_lossy().parse::<ExtensionId>() else {
+                continue;
+            };
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Err(error) = self.recover(&id) {
+                tracing::warn!(extension = %id, %error, "the recovery did not complete");
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// The recovery. The caller holds the lock of `id`.
@@ -427,10 +514,24 @@ impl Installer {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error(&pending, "cannot read the journal", error)),
         };
-        let journal: toml::Table = text.parse().unwrap_or_default();
-        let version = |key: &str| journal.get(key)?.as_str()?.parse::<Version>().ok();
-        let (old, new) = (version("old"), version("new"));
         tracing::warn!(extension = %id, "an install did not complete; recovering");
+        let active = self.active(id);
+        let active_missing = fs::symlink_metadata(&active).is_err();
+        let (old, new) = match parse_journal(&text) {
+            Some((old, new)) => (old, Some(new)),
+            // The journal cannot say which version was active. The
+            // directories can: a retired version has a directory in the
+            // store only while a change runs.
+            None => {
+                tracing::warn!(extension = %id, journal = %pending.display(), "the journal is invalid; recovering from the directories");
+                let retired = if active_missing {
+                    sole_retired(&store, &pending)?
+                } else {
+                    None
+                };
+                (retired, None)
+            }
+        };
 
         if let Ok(entries) = fs::read_dir(&store) {
             for entry in entries.flatten() {
@@ -444,8 +545,7 @@ impl Installer {
                 }
             }
         }
-        let active = self.active(id);
-        if fs::symlink_metadata(&active).is_err() {
+        if active_missing {
             if let Some(old) = &old {
                 let retired = store.join(old.to_string());
                 if retired.is_dir() {
@@ -454,24 +554,30 @@ impl Installer {
                     })?;
                 }
             }
-        } else if new.is_some() && self.installed(id)?.map(|manifest| manifest.version) == new {
+        } else if let Some(new) = &new
+            // An active manifest that is invalid is not the new version.
+            && let Some(text) = self.active_manifest(id)?
+            && Manifest::parse(&text).is_ok_and(|manifest| manifest.version == *new)
+        {
             // The second rename was done: the new version is complete.
-            return self.finish(id, old.as_ref());
+            return self.finish(id, old.as_ref(), new);
         }
         remove_file(&pending)
     }
 
     /// Steps 1 to 6 of the [module documentation](self). `review` is `true`
-    /// when added capabilities stop the operation. The caller holds the lock
-    /// of `id`.
+    /// when added capabilities stop the operation. `broken` is `true` when
+    /// the active version has an invalid manifest and the new version
+    /// replaces it. The caller holds the lock of `id`.
     fn activate(
         &self,
         id: &ExtensionId,
         version: &Version,
         source: Source,
         review: bool,
+        broken: bool,
     ) -> Result<Outcome> {
-        let installed = self.installed(id)?;
+        let installed = if broken { None } else { self.installed(id)? };
         if installed.as_ref().map(|manifest| &manifest.version) == Some(version) {
             return Err(Error::user(format!(
                 "extension `{id}`: version {version} is active already"
@@ -491,8 +597,7 @@ impl Installer {
             )));
         }
 
-        fs::create_dir_all(&store)
-            .map_err(|error| io_error(&store, "cannot create the directory", error))?;
+        create_private_dir(&store)?;
         // Deleted when it goes out of scope. On Unix only the owner can use it.
         let staging = tempfile::Builder::new()
             .prefix(STAGING_PREFIX)
@@ -550,16 +655,23 @@ impl Installer {
 
         let old = installed.map(|manifest| manifest.version);
         self.write_pending(id, old.as_ref(), version)?;
-        let moved = self
-            .retire(id, old.as_ref())
-            .and_then(|()| self.promote(id, &content));
+        // A broken version has no version name for the store. It goes to
+        // the staging directory and is deleted with it.
+        let discarded = staging.path().join("broken");
+        let retired = if broken {
+            fs::rename(self.active(id), &discarded)
+                .map_err(|error| io_error(&discarded, "cannot move the broken version", error))
+        } else {
+            self.retire(id, old.as_ref())
+        };
+        let moved = retired.and_then(|()| self.promote(id, &content));
         if let Err(error) = moved {
             self.repair(id)?;
             return Err(error);
         }
         // The point of no return: the new version is active. The journal
         // stays if the clean-up fails, and the next recovery completes it.
-        if let Err(error) = self.finish(id, old.as_ref()) {
+        if let Err(error) = self.finish(id, old.as_ref(), version) {
             tracing::warn!(extension = %id, %version, %error, "the version is active, but the clean-up did not complete");
         }
         tracing::info!(extension = %id, %version, "extension version activated");
@@ -592,18 +704,20 @@ impl Installer {
     /// The second rename: makes the staged directory the active directory.
     fn promote(&self, id: &ExtensionId, content: &Path) -> Result<()> {
         let active = self.active(id);
-        fs::create_dir_all(self.extensions_dir())
-            .and_then(|()| fs::rename(content, &active))
+        create_private_dir(&self.extensions_dir())?;
+        fs::rename(content, &active)
             .map_err(|error| io_error(&active, "cannot activate the new version", error))
     }
 
-    /// Completes a change after the second rename.
-    fn finish(&self, id: &ExtensionId, old: Option<&Version>) -> Result<()> {
+    /// Completes a change from `old` to `new` after the second rename.
+    fn finish(&self, id: &ExtensionId, old: Option<&Version>, new: &Version) -> Result<()> {
         let store = self.store(id);
         // The review, if one waited, was for the version that is active now.
         remove_file(&store.join(REVIEW_FILE))?;
-        if let Some(old) = old {
-            write_atomic(&store.join(PREVIOUS_FILE), &old.to_string())?;
+        match old {
+            Some(old) => write_atomic(&store.join(PREVIOUS_FILE), &old.to_string())?,
+            // A broken version was replaced: its `previous` is void.
+            None => remove_file(&store.join(PREVIOUS_FILE))?,
         }
         remove_file(&store.join(PENDING_FILE))?;
         if let Some(old) = old {
@@ -611,7 +725,70 @@ impl Installer {
             // rollback extracts the kept package and does not read it.
             let _ = fs::remove_dir_all(store.join(old.to_string()));
         }
+        self.prune(id, old, new);
         Ok(())
+    }
+
+    /// Deletes each kept package and signature of `id` that is not for the
+    /// active version `new` or the previous version `old`. No review waits
+    /// when a change completes. Best effort: a file that stays is deleted
+    /// after the next change.
+    fn prune(&self, id: &ExtensionId, old: Option<&Version>, new: &Version) {
+        let store = self.store(id);
+        let suffix = format!(".{PACKAGE_EXTENSION}");
+        let keep = [Some(new), old].map(|version| version.map(|v| format!("{id}-{v}{suffix}")));
+        let entries = match fs::read_dir(&store) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(extension = %id, store = %store.display(), %error, "cannot list the kept packages");
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let package = name.strip_suffix(".minisig").unwrap_or(&name);
+            if package.ends_with(&suffix)
+                && !keep.iter().flatten().any(|kept| kept == package)
+                && let Err(error) = fs::remove_file(entry.path())
+            {
+                tracing::warn!(extension = %id, file = %entry.path().display(), %error, "cannot delete an old kept package");
+            }
+        }
+    }
+
+    /// Takes the lock of `id`. Refuses first, with a `user` error, a
+    /// directory of the installer that the group or other users can write
+    /// (Unix): they could put another file in the place of a verified one.
+    /// The rule and the category are those of the trust store file
+    /// (ADR-0019, ADR-0023). The owner is not
+    /// checked. There is no check on Windows.
+    fn lock(&self, id: &ExtensionId) -> Result<IdLock> {
+        let store = self.store(id);
+        let dirs = [
+            self.data.clone(),
+            self.data.join("store"),
+            store.clone(),
+            self.extensions_dir(),
+        ];
+        #[cfg(unix)]
+        for dir in &dirs {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = match fs::metadata(dir) {
+                Ok(meta) => meta.permissions().mode() & 0o7777,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(dir, "cannot read the directory mode", error)),
+            };
+            if mode & 0o022 != 0 {
+                return Err(Error::user(format!(
+                    "{}: the directory can be written by the group or by other users \
+                     (mode {mode:04o}); permit the write for the owner only (`chmod 700`)",
+                    dir.display()
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = dirs;
+        lock(&store, id)
     }
 
     fn store(&self, id: &ExtensionId) -> PathBuf {
@@ -722,8 +899,7 @@ impl Drop for IdLock {
 /// Each call opens the file again: the lock belongs to the open file, so it
 /// also stops a second thread of this process.
 fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
-    fs::create_dir_all(store)
-        .map_err(|error| io_error(store, "cannot create the directory", error))?;
+    create_private_dir(store)?;
     let path = store.join(LOCK_FILE);
     let file = File::options()
         .create(true)
@@ -738,6 +914,61 @@ fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
         ))),
         Err(fs::TryLockError::Error(error)) => Err(io_error(&path, "cannot lock the file", error)),
     }
+}
+
+/// Creates the directory `dir` and each parent that is missing. On Unix,
+/// only the owner can use a directory that this creates (mode 0700).
+fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(dir)
+        .map_err(|error| io_error(dir, "cannot create the directory", error))
+}
+
+/// Reads the journal text: the old version, if one was active, and the new
+/// version. Returns `None` for a text that [`Installer::write_pending`]
+/// does not write.
+fn parse_journal(text: &str) -> Option<(Option<Version>, Version)> {
+    let journal: toml::Table = text.parse().ok()?;
+    let version = |key: &str| journal.get(key)?.as_str()?.parse::<Version>().ok();
+    let old = if journal.contains_key("old") {
+        Some(version("old")?)
+    } else {
+        None
+    };
+    Some((old, version("new")?))
+}
+
+/// Returns the version of the one retired directory in `store`, or `None`
+/// if there is none. This is the answer of the directories when the journal
+/// `journal` is invalid and the active directory is missing.
+///
+/// Returns an `internal` error, and changes nothing, if there are two or
+/// more: the directories do not say which version was active.
+fn sole_retired(store: &Path, journal: &Path) -> Result<Option<Version>> {
+    let unreadable = |error| io_error(store, "cannot read the directory", error);
+    let mut retired = Vec::new();
+    for entry in fs::read_dir(store).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        if let Ok(version) = entry.file_name().to_string_lossy().parse::<Version>()
+            && entry.path().is_dir()
+        {
+            retired.push(version);
+        }
+    }
+    if retired.len() > 1 {
+        return Err(Error::internal(format!(
+            "{}: the journal is invalid and {} has {} directories of retired versions; keep \
+             the directory of the version that was active, remove the others and try again",
+            journal.display(),
+            store.display(),
+            retired.len()
+        )));
+    }
+    Ok(retired.pop())
 }
 
 /// Copies the regular file `from` to the new file `to`. Refuses a symbolic
@@ -756,7 +987,8 @@ fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
 /// Replaces `path` with a file that holds `text`. The text goes to a
 /// temporary file in the same directory, and that file then replaces `path`.
 // shortcut: the directory is not synced, so a power loss can undo the last
-// rename; the journal then still describes a state that `recover` repairs.
+// rename; the journal then still describes a state that `recover` repairs
+// (ADR-0023 accepts this).
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let write = || {
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -1712,5 +1944,214 @@ mod tests {
             f.installer.install(&id(), &v("1.0.0")).unwrap(),
             Outcome::Activated
         );
+    }
+
+    // R-84 (f): the directories of the installer are private.
+
+    #[cfg(unix)]
+    fn set_mode(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_other_users_can_write_is_refused() {
+        let f = fixture();
+        f.publish("1.0.0", &package("1.0.0", ""));
+        f.publish("1.1.0", &package("1.1.0", ""));
+        let data = f.installer.data.clone();
+        fs::create_dir_all(&data).unwrap();
+        set_mode(&data, 0o777);
+
+        assert_error(
+            f.installer.install(&id(), &v("1.0.0")),
+            ErrorCategory::User,
+            "(mode 0777)",
+        );
+        assert_error(
+            f.installer.recover(&id()),
+            ErrorCategory::User,
+            "(mode 0777)",
+        );
+        // Nothing was written to the directory.
+        assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
+
+        set_mode(&data, 0o755);
+        f.installer.install(&id(), &v("1.0.0")).unwrap();
+        f.installer.update(&id(), &v("1.1.0")).unwrap();
+        // The kept package of a rollback is in a directory of the group.
+        for dir in [f.store(), data.join("store"), f.installer.extensions_dir()] {
+            set_mode(&dir, 0o770);
+            let error = f.installer.rollback(&id()).unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+            let part = format!("{}: the directory can be written", dir.display());
+            assert!(error.to_string().contains(&part), "{error}");
+            set_mode(&dir, 0o700);
+        }
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installer_creates_directories_for_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        for dir in [
+            f.installer.data.clone(),
+            f.installer.data.join("store"),
+            f.store(),
+            f.installer.extensions_dir(),
+        ] {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+    }
+
+    // R-84 (h): the journal, a broken active version, the kept packages.
+
+    #[test]
+    fn an_invalid_journal_does_not_lose_the_active_version() {
+        let pending = |f: &Fixture| f.store().join(PENDING_FILE);
+        for journal in ["not toml [", "new = 1", "old = \"x\"\nnew = \"2.0.0\""] {
+            // A stop between the two renames: the one retired version goes back.
+            let f = fixture();
+            let content = f.staged_update();
+            fs::write(pending(&f), journal).unwrap();
+            f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+            f.installer.recover(&id()).unwrap();
+            assert_eq!(f.active_version().as_deref(), Some("1.0.0"), "{journal}");
+            assert!(!pending(&f).exists());
+            assert!(!f.store().join("1.0.0").exists());
+            assert!(!content.exists());
+
+            // A stop before the first rename: the active version stays.
+            fs::write(pending(&f), journal).unwrap();
+            f.installer.recover(&id()).unwrap();
+            assert_eq!(f.active_version().as_deref(), Some("1.0.0"), "{journal}");
+            assert!(!pending(&f).exists());
+        }
+
+        // Two retired versions: the recovery cannot know which was active.
+        let f = fixture();
+        f.staged_update();
+        fs::write(pending(&f), "not toml [").unwrap();
+        f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+        fs::create_dir(f.store().join("0.9.0")).unwrap();
+        let part = format!("{}: the journal is invalid", pending(&f).display());
+        assert_error(f.installer.recover(&id()), ErrorCategory::Internal, &part);
+        assert!(pending(&f).exists());
+        assert!(f.store().join("1.0.0").join(MANIFEST_FILE).is_file());
+        // A person removes the wrong directory. The recovery then completes.
+        fs::remove_dir(f.store().join("0.9.0")).unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn recover_all_recovers_each_id_and_returns_the_first_error() {
+        let f = fixture();
+        // No store directory: nothing to do.
+        f.installer.recover_all().unwrap();
+
+        f.staged_update();
+        f.installer
+            .write_pending(&id(), Some(&v("1.0.0")), &v("2.0.0"))
+            .unwrap();
+        f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+        // A second id whose recovery fails, and a name that is not an id.
+        let other = f.installer.data.join("store/acme.mysql");
+        fs::create_dir_all(other.join(PENDING_FILE)).unwrap();
+        fs::write(f.installer.data.join("store/Not An Id"), "").unwrap();
+
+        assert_error(
+            f.installer.recover_all(),
+            ErrorCategory::User,
+            "cannot read the journal",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+        assert!(!f.store().join(PENDING_FILE).exists());
+
+        fs::remove_dir(other.join(PENDING_FILE)).unwrap();
+        f.installer.recover_all().unwrap();
+    }
+
+    #[test]
+    fn install_replaces_an_active_version_with_an_invalid_manifest() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", NETWORK));
+        let manifest = f.installer.active(&id()).join(MANIFEST_FILE);
+        fs::write(&manifest, "id = 1").unwrap();
+        // A journal is there too: the recovery must not stop on the manifest.
+        f.installer
+            .write_pending(&id(), Some(&v("1.1.0")), &v("1.2.0"))
+            .unwrap();
+
+        let part = format!("{}: invalid extension manifest", manifest.display());
+        assert_error(f.installer.installed(&id()), ErrorCategory::User, &part);
+        let way_out = "install a version of `acme.postgres` to replace it";
+        assert_error(f.installer.rollback(&id()), ErrorCategory::User, way_out);
+        assert_error(
+            f.installer.update(&id(), &v("1.2.0")),
+            ErrorCategory::User,
+            way_out,
+        );
+        assert!(!f.store().join(PENDING_FILE).exists());
+
+        assert_eq!(
+            f.installer.install(&id(), &v("1.2.0")).unwrap(),
+            Outcome::Activated
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
+        assert!(f.installer.active(&id()).join(COMPONENT_FILE).is_file());
+        // Only the lock file and the package and signature of 1.2.0 stay.
+        assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3);
+        assert_error(
+            f.installer.rollback(&id()),
+            ErrorCategory::User,
+            "no previous version",
+        );
+    }
+
+    #[test]
+    fn only_the_packages_of_the_active_and_the_previous_version_are_kept() {
+        let f = fixture();
+        let kept = |version: &str| {
+            let package = f.store().join(format!("acme.postgres-{version}.rivetpkg"));
+            let signature = package.with_extension("rivetpkg.minisig");
+            assert_eq!(package.is_file(), signature.is_file(), "{version}");
+            package.is_file()
+        };
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.update("1.2.0", &package("1.2.0", "")).unwrap();
+        assert_eq!(
+            [kept("1.0.0"), kept("1.1.0"), kept("1.2.0")],
+            [false, true, true]
+        );
+
+        // A version whose review waits is kept until a change completes.
+        assert!(matches!(
+            f.update("1.3.0", &package("1.3.0", NETWORK)).unwrap(),
+            Outcome::NeedsReview { .. }
+        ));
+        assert_eq!(
+            [kept("1.1.0"), kept("1.2.0"), kept("1.3.0")],
+            [true, true, true]
+        );
+        f.installer
+            .activate_after_review(&id(), &v("1.3.0"))
+            .unwrap();
+        assert_eq!(
+            [kept("1.1.0"), kept("1.2.0"), kept("1.3.0")],
+            [false, true, true]
+        );
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+        assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
+        assert_eq!([kept("1.2.0"), kept("1.3.0")], [true, true]);
     }
 }
