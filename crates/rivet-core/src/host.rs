@@ -574,6 +574,9 @@ struct Scan {
     /// Why the newest package of an id is not in `packages`: it is invalid,
     /// and a valid package of an earlier directory stays.
     refused: BTreeMap<ExtensionId, String>,
+    /// Folders in `invalid` that lost to the folder with the name of their
+    /// id in the same directory. They are not broken: the winner decides.
+    beaten: BTreeSet<PathBuf>,
 }
 
 impl Scan {
@@ -583,7 +586,9 @@ impl Scan {
     /// `packages` then has no package for `id`, or one of an earlier
     /// directory.
     fn broken(&self, id: &ExtensionId, directory: Option<&Path>) -> Option<&String> {
-        let here = |(folder, _): &&(PathBuf, String)| Some(folder.as_path()) == directory;
+        let here = |(folder, _): &&(PathBuf, String)| {
+            Some(folder.as_path()) == directory && !self.beaten.contains(folder)
+        };
         let in_use = self.invalid.iter().find(here).map(|(_, reason)| reason);
         in_use.or_else(|| self.refused.get(id))
     }
@@ -694,6 +699,7 @@ fn scan(directories: &[PathBuf]) -> Scan {
                              that has the name of the id is read",
                             root.display()
                         );
+                        scan.beaten.insert(other.directory.clone());
                         scan.invalid.push((other.directory, reason));
                     }
                     package
@@ -4268,6 +4274,41 @@ mod tests {
             events[0].contains(&new.join("a").display().to_string()),
             "{text}"
         );
+    }
+
+    // R-121: a folder in use that loses the duplicate rule is not broken. The
+    // reload loads the folder with the name of the id, unless that is invalid.
+    #[tokio::test]
+    async fn reload_goes_to_the_folder_with_the_name_of_the_id() {
+        let (log, dispatch) = log();
+        let _guard = capture_logs(&dispatch);
+        let f = fixture(true);
+        f.write(USER, "z-copy", &manifest("a", "1.0.0", &[], ""));
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        let user = f.roots[USER].path();
+
+        // The winner is invalid: the reload is refused and `z-copy` runs on.
+        f.write(USER, "a", "id = \"a\"\n");
+        let refused = f.host.reload(&id("a")).await.unwrap_err();
+        assert!(refused.message().contains("missing field"), "{refused}");
+        assert_eq!(f.status("a").unwrap().state, Active);
+        assert_eq!(f.status("a").unwrap().directory, user.join("z-copy"));
+
+        // The winner is valid: the reload loads it.
+        f.write(USER, "a", &manifest("a", "2.0.0", &[], ""));
+        f.fake.take_calls();
+        f.host.reload(&id("a")).await.unwrap();
+
+        assert_eq!(f.status("a").unwrap().directory, user.join("a"));
+        assert_eq!(f.status("a").unwrap().state, Active);
+        assert_eq!(f.fake.count("load a@2.0.0"), 1);
+        let text = log.text();
+        let events: Vec<&str> = text.lines().filter(|l| l.contains("changed")).collect();
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(events[0].contains("WARN"), "{text}");
+        assert!(events[0].contains(&user.join("z-copy").display().to_string()));
+        assert!(events[0].contains(&user.join("a").display().to_string()));
     }
 
     // The scan runs on the blocking pool, so the test calls it directly.
