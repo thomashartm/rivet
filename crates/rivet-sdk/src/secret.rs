@@ -238,6 +238,6 @@ mod tests {
         let text = toml::to_string(&holder).unwrap();
         assert_eq!(text, "password = \"aws-sm://prod/db/password\"\n");
         assert_eq!(toml::from_str::<Holder>(&text).unwrap(), holder);
-        assert!(toml::from_str::<Holder>("password = \"vault://x\"").is_err());
+        assert!(toml::from_str::<Holder>("password = \"hunter2\"").is_err());
     }
 }
