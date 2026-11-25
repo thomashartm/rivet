@@ -20,6 +20,7 @@ ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no vers
 | WIT package | `rivet:extension`, in `crates/rivet-sdk/wit/`. World `extension` with `activate` and `deactivate`. Interfaces of extension points go into the same package (ADR-0013). |
 | WIT version | Equal to the SDK crate version. A test checks it. |
 | Errors in WIT | The WIT has an `error` record with the categories of §5.6. Lifecycle functions return it. The host keeps the category of the guest. Trap and limit violation give `internal`. Invalid component gives `user`. |
+| Component file | The component of a package is the file `extension.wasm` in the package directory. The manifest has no field for it. (#4 part 2, not on `main` on this date.) |
 | Execution | Synchronous Wasmtime. Compile, instantiate and each call run on the blocking pool (§5.1). |
 
 ## Consequences
