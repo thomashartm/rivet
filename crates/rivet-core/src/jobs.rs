@@ -4,11 +4,20 @@
 //! - A job has an id, a kind, an owner, a state, a progress, a cancellation
 //!   token and a result.
 //! - At most `max_concurrent` jobs run at the same time. The other jobs wait
-//!   in the state [`JobState::Queued`]. The host reads this number from the
-//!   setting `jobs.max_concurrent`.
+//!   in the state [`JobState::Queued`].
+//! - One extension can have at most `max_per_extension` queued and running
+//!   jobs (§4.3). A job above the limit is refused.
+//! - The limits are settings with defaults: see [`JobConfig`].
 //! - Cancellation is cooperative: the job must watch its
-//!   [`CancellationToken`] and return. The scheduler does not stop a job
-//!   that ignores the token.
+//!   [`CancellationToken`] and return. A job that has not returned when
+//!   [`JobConfig::cancel_grace`] is over is aborted and ends in the state
+//!   [`JobState::Cancelled`] (§5.2).
+//! - The abort stops async work at its next `.await`. It cannot stop
+//!   blocking work, or async work that never reaches an `.await`. Such a
+//!   job is `Cancelled` also, but it keeps its slot of `max_concurrent`
+//!   and its place in `max_per_extension` until its code returns: the
+//!   limits count real work. If the code never returns, the slot is taken
+//!   until the process ends.
 //! - Job state lives in memory only (§6.2).
 //!
 //! ```
@@ -37,6 +46,7 @@
 //! ```
 
 use crate::Owner;
+use crate::settings::Settings;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -44,6 +54,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -232,7 +243,9 @@ impl<T> JobHandle<T> {
     }
 
     /// Asks the job to stop. A queued job never starts. A running job must
-    /// cooperate (see [`CancellationToken`]). No effect on a finished job.
+    /// cooperate (see [`CancellationToken`]); a job that does not is
+    /// aborted after [`JobConfig::cancel_grace`]. No effect on a finished
+    /// job.
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
     }
@@ -254,10 +267,72 @@ impl<T> JobHandle<T> {
     }
 }
 
+/// The limits of a [`JobScheduler`].
+///
+/// [`from_settings`](Self::from_settings) reads it from these settings.
+///
+/// | Setting | Default | Field |
+/// | --- | --- | --- |
+/// | `jobs.max_concurrent` | 4 | [`max_concurrent`](Self::max_concurrent) |
+/// | `jobs.max_per_extension` | 8 | [`max_per_extension`](Self::max_per_extension) |
+/// | `jobs.retain_finished` | 100 | [`retain_finished`](Self::retain_finished) |
+/// | `jobs.cancel_grace_ms` | 5000 | [`cancel_grace`](Self::cancel_grace) |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobConfig {
+    /// How many jobs run at the same time.
+    pub max_concurrent: NonZeroUsize,
+    /// How many queued and running jobs one extension can have at the same
+    /// time. `None` means no limit per extension.
+    pub max_per_extension: Option<NonZeroUsize>,
+    /// How many finished jobs [`JobScheduler::jobs`] still lists. Older
+    /// finished jobs are forgotten.
+    pub retain_finished: usize,
+    /// How long a running job has to stop after a cancel request. Then the
+    /// scheduler aborts it. The setting is in milliseconds.
+    pub cancel_grace: Duration,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: NonZeroUsize::MIN.saturating_add(3),
+            max_per_extension: NonZeroUsize::new(8),
+            retain_finished: 100,
+            cancel_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+impl JobConfig {
+    /// Reads the limits from `settings`. A key that no layer sets has its
+    /// default (see the table in [`JobConfig`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `user` error if a value has the wrong type, or if
+    /// `jobs.max_concurrent` or `jobs.max_per_extension` is `0`.
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
+        let default = Self::default();
+        let max_concurrent = settings.get("jobs.max_concurrent")?;
+        let max_per_extension = settings.get("jobs.max_per_extension")?;
+        let retain_finished = settings.get("jobs.retain_finished")?;
+        let cancel_grace = settings.get("jobs.cancel_grace_ms")?;
+        Ok(Self {
+            max_concurrent: max_concurrent.unwrap_or(default.max_concurrent),
+            max_per_extension: max_per_extension.or(default.max_per_extension),
+            retain_finished: retain_finished.unwrap_or(default.retain_finished),
+            cancel_grace: cancel_grace.map_or(default.cancel_grace, Duration::from_millis),
+        })
+    }
+}
+
 /// Runs jobs with a limit on how many run at the same time.
 ///
 /// Clones share the same jobs. All methods take `&self` and are safe for
 /// concurrent use.
+///
+/// The Tokio runtime must have its timer: the abort of a job after
+/// [`JobConfig::cancel_grace`] uses it.
 #[derive(Debug, Clone)]
 pub struct JobScheduler {
     inner: Arc<Inner>,
@@ -265,8 +340,10 @@ pub struct JobScheduler {
 
 #[derive(Debug)]
 struct Inner {
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
+    max_per_extension: Option<NonZeroUsize>,
     retain_finished: usize,
+    cancel_grace: Duration,
     next_id: AtomicU64,
     jobs: Mutex<Jobs>,
 }
@@ -277,6 +354,9 @@ struct Jobs {
     active: BTreeMap<JobId, Active>,
     /// The newest finished jobs, oldest first.
     finished: VecDeque<JobSnapshot>,
+    /// The aborted jobs whose code has not stopped yet. They count for the
+    /// limit per extension.
+    stopping: BTreeMap<JobId, Owner>,
 }
 
 #[derive(Debug)]
@@ -288,18 +368,30 @@ struct Active {
 }
 
 impl JobScheduler {
-    /// Creates a scheduler.
+    /// Creates a scheduler with the two given limits and the defaults of
+    /// [`JobConfig`] for the other limits.
     ///
-    /// - `max_concurrent`: how many jobs run at the same time (the setting
-    ///   `jobs.max_concurrent`).
+    /// - `max_concurrent`: how many jobs run at the same time.
     /// - `retain_finished`: how many finished jobs [`jobs`](Self::jobs)
     ///   still lists. Older finished jobs are forgotten.
     pub fn new(max_concurrent: NonZeroUsize, retain_finished: usize) -> Self {
-        let slots = max_concurrent.get().min(Semaphore::MAX_PERMITS);
+        Self::with_config(JobConfig {
+            max_concurrent,
+            retain_finished,
+            ..JobConfig::default()
+        })
+    }
+
+    /// Creates a scheduler with the limits of `config`, for example from
+    /// [`JobConfig::from_settings`].
+    pub fn with_config(config: JobConfig) -> Self {
+        let slots = config.max_concurrent.get().min(Semaphore::MAX_PERMITS);
         Self {
             inner: Arc::new(Inner {
-                slots: Semaphore::new(slots),
-                retain_finished,
+                slots: Arc::new(Semaphore::new(slots)),
+                max_per_extension: config.max_per_extension,
+                retain_finished: config.retain_finished,
+                cancel_grace: config.cancel_grace,
                 next_id: AtomicU64::new(1),
                 jobs: Mutex::default(),
             }),
@@ -318,11 +410,17 @@ impl JobScheduler {
     /// | --- | --- |
     /// | returns `Ok` | `Succeeded` |
     /// | returns `Err` after a cancel request, or an `Err` of the category `cancelled` | `Cancelled` |
+    /// | does not return in [`JobConfig::cancel_grace`] after a cancel request (it is aborted) | `Cancelled` |
+    ///
+    /// The abort stops `work` at its next `.await`. See the
+    /// [module documentation](self) for work that never reaches one.
     /// | returns another `Err`, or panics | `Failed` |
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if the caller is not in a Tokio runtime.
+    /// - An `internal` error if the caller is not in a Tokio runtime.
+    /// - A `policy` error if `owner` has as many queued and running jobs as
+    ///   [`JobConfig::max_per_extension`] permits.
     pub fn spawn<T, F, Fut>(
         &self,
         owner: Owner,
@@ -345,12 +443,15 @@ impl JobScheduler {
     /// on an async worker thread (§5.1).
     ///
     /// The job counts against `max_concurrent`. States and errors are the
-    /// same as for [`spawn`](Self::spawn). To cooperate with a cancel
+    /// same as for [`spawn`](Self::spawn), with one difference: the abort
+    /// cannot stop blocking work. A blocking job that ignores a cancel
+    /// request ends `Cancelled` after [`JobConfig::cancel_grace`], but it
+    /// keeps its slot until `work` returns. To cooperate with a cancel
     /// request, `work` polls [`JobContext::is_cancelled`].
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if the caller is not in a Tokio runtime.
+    /// The same errors as [`spawn`](Self::spawn).
     pub fn spawn_blocking<T, F>(
         &self,
         owner: Owner,
@@ -367,15 +468,37 @@ impl JobScheduler {
     }
 
     /// Asks every queued or running job of `owner` to stop. Returns how
-    /// many jobs received the request.
+    /// many jobs received the request. A job that does not stop is aborted
+    /// after [`JobConfig::cancel_grace`].
     pub fn cancel_owner(&self, owner: &Owner) -> usize {
+        self.request_stop(owner).len()
+    }
+
+    /// Asks every queued or running job of `owner` to stop, and waits until
+    /// each of them has ended (§5.2). Returns how many jobs these were.
+    ///
+    /// The wait is not longer than [`JobConfig::cancel_grace`]: then the
+    /// scheduler aborts the jobs that still run.
+    pub async fn stop_owner(&self, owner: &Owner) -> usize {
+        let jobs = self.request_stop(owner);
+        let count = jobs.len();
+        for mut status in jobs {
+            // An error means that the job is gone, thus it has ended.
+            let _ = status.wait_for(|status| status.state.is_finished()).await;
+        }
+        count
+    }
+
+    /// Sends a cancel request to every queued or running job of `owner`.
+    fn request_stop(&self, owner: &Owner) -> Vec<watch::Receiver<JobStatus>> {
         let jobs = self.inner.lock();
         let of_owner = jobs.active.values().filter(|job| &job.owner == owner);
         of_owner
-            .inspect(|job| {
+            .map(|job| {
                 job.cancel.send_replace(true);
+                job.status.clone()
             })
-            .count()
+            .collect()
     }
 
     /// Returns a copy of all known jobs: the queued and running jobs in the
@@ -414,15 +537,31 @@ impl JobScheduler {
             progress: Progress::default(),
         });
         let (result_sender, result) = oneshot::channel();
-        self.inner.lock().active.insert(
-            id,
-            Active {
+        {
+            // One lock for the count and the insert: two spawns at the same
+            // time cannot both take the last place.
+            let mut jobs = self.inner.lock();
+            if let Some(limit) = self.inner.max_per_extension {
+                let active = jobs.active.values().filter(|job| job.owner == owner);
+                let stopping = jobs
+                    .stopping
+                    .iter()
+                    .filter(|(id, of)| **of == owner && !jobs.active.contains_key(id));
+                if active.count() + stopping.count() >= limit.get() {
+                    return Err(Error::policy(format!(
+                        "extension `{owner}` cannot start the job `{kind}`: it has {limit} \
+                         queued or running jobs, which is the limit per extension"
+                    )));
+                }
+            }
+            let job = Active {
                 kind,
                 owner,
                 cancel: cancel.clone(),
                 status: status_watch.clone(),
-            },
-        );
+            };
+            jobs.active.insert(id, job);
+        }
 
         let ctx = JobContext {
             id,
@@ -460,24 +599,58 @@ impl Inner {
 
     /// Waits for a slot, runs the work and returns its result. An error
     /// has the category `cancelled` if and only if the job is `Cancelled`.
-    async fn run<T, L>(&self, ctx: JobContext, launch: L) -> Result<T>
+    async fn run<T, L>(self: &Arc<Self>, ctx: JobContext, launch: L) -> Result<T>
     where
+        T: Send + 'static,
         L: FnOnce(JobContext) -> JoinHandle<Result<T>>,
     {
         let (id, token, status) = (ctx.id, ctx.token.clone(), ctx.status.clone());
         let slot = tokio::select! {
             biased;
             () = token.cancelled() => None,
-            slot = self.slots.acquire() => slot.ok(),
+            slot = self.slots.clone().acquire_owned() => slot.ok(),
         };
         // The semaphore is never closed: no slot means cancelled in the queue.
-        let Some(_slot) = slot else {
+        let Some(slot) = slot else {
             return Err(Error::cancelled(format!(
                 "job {id} was cancelled before it started"
             )));
         };
         status.send_modify(|status| status.state = JobState::Running);
-        match launch(ctx).await {
+        let mut work = launch(ctx);
+        let grace = self.cancel_grace;
+        let overdue = async {
+            token.cancelled().await;
+            tokio::time::sleep(grace).await;
+        };
+        let joined = tokio::select! {
+            joined = &mut work => joined,
+            () = overdue => {
+                work.abort();
+                let owner = {
+                    let mut jobs = self.lock();
+                    let owner = jobs.active.get(&id).map(|job| job.owner.clone());
+                    jobs.stopping.extend(owner.clone().map(|owner| (id, owner)));
+                    owner
+                };
+                // The job ends now, but it keeps its slot until its code has
+                // stopped: the limits count real work.
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    if tokio::time::timeout(grace, &mut work).await.is_err() {
+                        let owner = owner.as_ref().map(ToString::to_string);
+                        tracing::warn!(owner, job = %id, "an aborted job still runs and keeps its slot");
+                        let _ = work.await;
+                    }
+                    inner.lock().stopping.remove(&id);
+                    drop(slot);
+                });
+                return Err(Error::cancelled(format!(
+                    "job {id} did not stop in {grace:?} after the cancel request and was aborted"
+                )));
+            }
+        };
+        match joined {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error))
                 if token.is_cancelled() && error.category() != ErrorCategory::Cancelled =>
@@ -560,6 +733,15 @@ mod tests {
             .into_iter()
             .find(|job| job.id == id)
             .expect("the job is listed")
+    }
+
+    /// Opens the gate one time when it is dropped.
+    struct DropPermit(Arc<Semaphore>);
+
+    impl Drop for DropPermit {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
     }
 
     /// A job that waits for a cancel request and then stops.
@@ -945,6 +1127,229 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(dones.recv().await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn job_above_the_limit_per_owner_is_refused_with_a_clear_error() {
+        // The global limit is 1, so the second job of `ext.a` is queued.
+        let scheduler = JobScheduler::with_config(JobConfig {
+            max_concurrent: NonZeroUsize::MIN,
+            max_per_extension: NonZeroUsize::new(2),
+            ..JobConfig::default()
+        });
+        let running = scheduler
+            .spawn(owner("ext.a"), "query", until_cancelled)
+            .unwrap();
+        wait_for(&running, JobState::Running).await;
+        let queued = scheduler
+            .spawn(owner("ext.a"), "export", until_cancelled)
+            .unwrap();
+
+        // Queued and running jobs count. Both ways to start a job refuse.
+        let error = scheduler
+            .spawn(owner("ext.a"), "diff", |_| async { Ok(()) })
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert!(error.message().contains("`ext.a`"), "{error}");
+        assert!(error.message().contains("`diff`"), "{error}");
+        assert!(error.message().contains("limit per extension"), "{error}");
+        let error = scheduler
+            .spawn_blocking(owner("ext.a"), "diff", |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        // A refused job is not listed.
+        assert_eq!(scheduler.jobs().len(), 2);
+
+        // The limit is per owner, and the global limit still queues.
+        let other = scheduler
+            .spawn(owner("ext.b"), "query", |_| async { Ok("b") })
+            .unwrap();
+        assert_eq!(other.status().state, JobState::Queued);
+
+        // A finished job frees its place.
+        queued.cancel();
+        queued.join().await.unwrap_err();
+        let next = scheduler
+            .spawn(owner("ext.a"), "export", |_| async { Ok("a") })
+            .unwrap();
+        running.cancel();
+        running.join().await.unwrap_err();
+        assert_eq!(other.join().await.unwrap(), "b");
+        assert_eq!(next.join().await.unwrap(), "a");
+    }
+
+    #[tokio::test]
+    async fn the_limits_come_from_the_settings_and_have_documented_defaults() {
+        use crate::settings::Layer;
+        let default = JobConfig::default();
+        assert_eq!(default.max_concurrent.get(), 4);
+        assert_eq!(default.max_per_extension, NonZeroUsize::new(8));
+        assert_eq!(default.retain_finished, 100);
+        assert_eq!(default.cancel_grace, Duration::from_secs(5));
+
+        let read = |jobs: &str| {
+            let mut settings = Settings::new();
+            let text = format!("schema_version = 1\n[jobs]\n{jobs}");
+            settings.set_layer(Layer::User, "test", &text).unwrap();
+            JobConfig::from_settings(&settings)
+        };
+        assert_eq!(read("").unwrap(), default);
+        for invalid in [
+            "max_concurrent = 0\n",
+            "max_per_extension = 0\n",
+            "retain_finished = -1\n",
+            "cancel_grace_ms = \"soon\"\n",
+        ] {
+            let error = read(invalid).expect_err(invalid);
+            assert_eq!(error.category(), ErrorCategory::User, "{invalid}");
+        }
+        let config = read(
+            "max_concurrent = 1\nmax_per_extension = 2\nretain_finished = 1\n\
+             cancel_grace_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(config.cancel_grace, Duration::from_millis(250));
+
+        // The settings limit the jobs of the scheduler.
+        let scheduler = JobScheduler::with_config(config);
+        let running = scheduler
+            .spawn(owner("ext.a"), "query", until_cancelled)
+            .unwrap();
+        wait_for(&running, JobState::Running).await;
+        let queued = scheduler
+            .spawn(owner("ext.a"), "query", |_| async { Ok(()) })
+            .unwrap();
+        assert_eq!(queued.status().state, JobState::Queued);
+        let refused = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok(()) });
+        assert_eq!(refused.unwrap_err().category(), ErrorCategory::Policy);
+        running.cancel();
+        running.join().await.unwrap_err();
+        queued.join().await.unwrap();
+        assert_eq!(scheduler.jobs().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_job_that_ignores_the_cancel_request_is_aborted_after_the_grace_period() {
+        let grace = JobConfig::default().cancel_grace;
+        let scheduler = scheduler(1);
+        let dropped = gate();
+        let job_dropped = dropped.clone();
+        let stubborn = scheduler
+            .spawn(owner("ext.a"), "query", |_| async move {
+                // Tells the test when the work is dropped.
+                let _guard = DropPermit(job_dropped);
+                std::future::pending::<Result<()>>().await
+            })
+            .unwrap();
+        wait_for(&stubborn, JobState::Running).await;
+        let next = scheduler
+            .spawn(owner("ext.b"), "query", |_| async { Ok("next") })
+            .unwrap();
+        let cooperative = scheduler
+            .spawn(owner("ext.a"), "export", until_cancelled)
+            .unwrap();
+        let start = tokio::time::Instant::now();
+
+        // The owner scope ends.
+        assert_eq!(scheduler.cancel_owner(&owner("ext.a")), 2);
+
+        // The queued job of the owner ends at once.
+        let error = cooperative.join().await.unwrap_err();
+        assert!(error.message().contains("before it started"), "{error}");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(stubborn.status().state, JobState::Running);
+        assert_eq!(next.status().state, JobState::Queued);
+
+        let (id, watch) = (stubborn.id(), stubborn.watch());
+        let error = stubborn.join().await.unwrap_err();
+        assert_eq!(start.elapsed(), grace);
+        assert_eq!(error.category(), ErrorCategory::Cancelled);
+        assert!(error.message().contains("was aborted"), "{error}");
+        assert_eq!(watch.borrow().state, JobState::Cancelled);
+        assert_eq!(snapshot(&scheduler, id).state, JobState::Cancelled);
+        // The slot is free, and the work is gone.
+        assert_eq!(next.join().await.unwrap(), "next");
+        pass(&dropped).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_owner_waits_until_the_jobs_of_the_owner_have_ended() {
+        let grace = JobConfig::default().cancel_grace;
+        let scheduler = scheduler(2);
+        let cooperative = scheduler
+            .spawn(owner("ext.a"), "query", until_cancelled)
+            .unwrap();
+        let stubborn = scheduler
+            .spawn(owner("ext.a"), "export", |_| {
+                std::future::pending::<Result<()>>()
+            })
+            .unwrap();
+        let other = scheduler
+            .spawn(owner("ext.b"), "query", until_cancelled)
+            .unwrap();
+        wait_for(&stubborn, JobState::Running).await;
+        let start = tokio::time::Instant::now();
+
+        assert_eq!(scheduler.stop_owner(&owner("ext.a")).await, 2);
+
+        // The wait ends with the abort of the job that ignores the request.
+        assert_eq!(start.elapsed(), grace);
+        assert_eq!(cooperative.status().state, JobState::Cancelled);
+        assert_eq!(stubborn.status().state, JobState::Cancelled);
+        assert_eq!(other.status().state, JobState::Running);
+        assert_eq!(scheduler.stop_owner(&owner("ext.a")).await, 0);
+        assert_eq!(start.elapsed(), grace);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborted_job_whose_code_still_runs_is_cancelled_but_keeps_its_slot() {
+        let config = JobConfig {
+            max_concurrent: NonZeroUsize::MIN,
+            max_per_extension: NonZeroUsize::new(1),
+            ..JobConfig::default()
+        };
+        let grace = config.cancel_grace;
+        let scheduler = JobScheduler::with_config(config);
+        // Blocking work cannot be aborted. It ignores the cancel request.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stubborn = scheduler
+            .spawn_blocking(owner("ext.a"), "compress", move |ctx| {
+                ctx.report(Progress::new(1, None));
+                released.recv().ok();
+                Ok(())
+            })
+            .unwrap();
+        // The work has started: an abort cannot prevent it any more.
+        let mut started = stubborn.watch();
+        started
+            .wait_for(|status| status.progress.completed == 1)
+            .await
+            .unwrap();
+        let next = scheduler
+            .spawn(owner("ext.b"), "query", |_| async { Ok("next") })
+            .unwrap();
+
+        stubborn.cancel();
+        // The clock does not advance by itself while blocking work runs.
+        while !stubborn.status().state.is_finished() {
+            tokio::time::advance(grace).await;
+        }
+        let watch = stubborn.watch();
+        let error = stubborn.join().await.unwrap_err();
+
+        assert_eq!(error.category(), ErrorCategory::Cancelled);
+        assert!(error.message().contains("was aborted"), "{error}");
+        assert_eq!(watch.borrow().state, JobState::Cancelled);
+        // The code still runs: the slot and the place of the owner are taken.
+        assert_eq!(next.status().state, JobState::Queued);
+        let refused = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok(()) });
+        assert_eq!(refused.unwrap_err().category(), ErrorCategory::Policy);
+
+        // The code returns.
+        release.send(()).unwrap();
+        assert_eq!(next.join().await.unwrap(), "next");
+        let again = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok("again") });
+        assert_eq!(again.unwrap().join().await.unwrap(), "again");
     }
 
     #[test]
