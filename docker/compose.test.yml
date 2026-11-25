@@ -1,0 +1,51 @@
+# Databases for the container tests of rivet-testkit.
+#
+#   Start: docker compose -f docker/compose.test.yml up -d --wait
+#   Test:  RIVET_TEST_CONTAINERS=1 cargo test --workspace
+#   Stop:  docker compose -f docker/compose.test.yml down -v
+#
+# TEST-ONLY CREDENTIALS. The user names and passwords below are public and
+# protect nothing. Never use them for a real database.
+#
+# - Ports are published on 127.0.0.1 only, on host ports that a local
+#   database does not use by default.
+# - Data is in memory (tmpfs). It is lost when the container stops.
+# - crates/rivet-testkit/src/database.rs has the same ports and credentials.
+#   Its tests fail if the two files differ.
+name: rivet-test
+
+services:
+  postgres:
+    image: postgres:18.7
+    environment:
+      POSTGRES_USER: rivet_test
+      POSTGRES_PASSWORD: test-only-not-a-secret
+      POSTGRES_DB: rivet_test
+    ports:
+      - "127.0.0.1:54329:5432"
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      # TCP, not the socket: the setup server listens on the socket only.
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=rivet_test", "--dbname=rivet_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4.13
+    environment:
+      MYSQL_ROOT_PASSWORD: test-only-not-a-secret
+      MYSQL_USER: rivet_test
+      MYSQL_PASSWORD: test-only-not-a-secret
+      MYSQL_DATABASE: rivet_test
+    ports:
+      - "127.0.0.1:33069:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      # TCP, not the socket: the setup server has no network.
+      test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--user=rivet_test", "--password=test-only-not-a-secret"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
