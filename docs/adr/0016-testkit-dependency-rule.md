@@ -15,6 +15,8 @@ ARCHITECTURE.md §3.1 lists `rivet-testkit`, but the table in §3.2 had no row f
 | 2 | A workspace crate MAY depend on `rivet-testkit` only as a dev-dependency. A normal dependency or a build dependency on it MUST NOT exist. |
 | 3 | `rivet-sdk`, `rivet-engine-api` and `rivet-core` MUST NOT depend on `rivet-testkit` in any kind. |
 | 4 | For every other pair of crates, §3.2 applies to normal, build and dev dependencies alike. Rule 2 is the only place where the dependency kind matters. |
+| 5 | Rule 2 applies to `xtask` too. All other edges of `xtask` stay exempt from §3.2. |
+| 6 | `rivet-testkit` re-exports by name the `rivet-core` items that its public API uses. It MUST NOT re-export `rivet-core` as a whole, a whole module of it, or the constructors of the real core services. |
 
 ## Consequences
 

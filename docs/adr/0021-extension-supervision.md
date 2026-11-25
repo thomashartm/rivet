@@ -16,7 +16,7 @@ Settings and defaults:
 | `extensions.call_timeout_ms` | 30000 | Longest time of one call into an extension |
 | `extensions.restart.backoff_initial_ms` | 100 | Delay before the first restart |
 | `extensions.restart.backoff_factor` | 2 | Factor for each further delay |
-| `extensions.restart.backoff_max_ms` | 60000 | Longest delay |
+| `extensions.restart.backoff_max_ms` | 1000 | Longest delay |
 | `extensions.restart.limit` | 5 | Failed restarts in a row before `Disabled` |
 | `extensions.restart.reset_after_ms` | 300000 | Time in `Active` after which the failure count is 0 |
 | `jobs.max_per_extension` | 8 | Queued plus running jobs of one extension |
@@ -40,7 +40,8 @@ Behaviour:
 
 ## Consequences
 
-- The first restart starts after 100 ms, so the §9 target of 1 s can be met. The target is not measured yet.
+- With the defaults the delays are 100, 200, 400, 800 and 1000 ms. No delay is above the §9 target of 1 s. The time of the restart itself is not measured yet.
+- An earlier text of this ADR had `backoff_max_ms` = 60000. That value gave a fifth delay of 1600 ms and was never reached with 5 restarts.
 - The defaults are not measured. They are settings and can change without a contract change.
 - A timed-out call can still run on the blocking pool until it returns or its fuel is used (ADR-0018).
 - `ExtensionHost::new` gets a configuration argument. Callers in other tickets must follow.

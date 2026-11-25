@@ -355,7 +355,7 @@ Shutdown order:
 ### 6.4 Credential and Secret Storage
 
 - Credentials MUST be stored only in the OS keychain or a cloud secret manager. They MUST NOT be stored in configuration, history, logs or caches.
-- The OS keychain backend is built in on macOS and Windows. On Linux it is an optional build feature ([ADR-0014](docs/adr/0014-keychain-optional-on-linux.md)). Without it, resolving a `keychain://` URI on Linux fails with a clear error.
+- The OS keychain backend is built in on macOS and Windows. On Linux it is decided to be an optional build feature ([ADR-0014](docs/adr/0014-keychain-optional-on-linux.md)); a build without it gives a clear error when a `keychain://` URI is resolved. Not implemented yet: the backend is built in on every platform.
 - In memory, secrets SHOULD be held in zeroizing types and dropped as soon as the connection attempt ends.
 
 ### 6.5 Caching and Invalidation
@@ -487,7 +487,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | # | Decision | Outcome | ADR |
 | --- | --- | --- | --- |
 | 1 | Async runtime | Tokio | [0001](docs/adr/0001-async-runtime.md) |
-| 2 | WASM runtime | Wasmtime; WASI version pinned in the ADR | [0002](docs/adr/0002-wasm-runtime.md) |
+| 2 | WASM runtime | Wasmtime; WASI: none for now (ADR-0018, Proposed) | [0002](docs/adr/0002-wasm-runtime.md) |
 | 3 | Native plugin placement | Out-of-process by default; in-process only for signed first-party extensions with a measured need | [0003](docs/adr/0003-native-plugin-placement.md) |
 | 4 | Control API protocol | gRPC, with Arrow Flight for result streams | [0004](docs/adr/0004-control-api-protocol.md) |
 | 5 | Local persistence | SQLite for history, metadata cache and audit log | [0005](docs/adr/0005-local-persistence.md) |
@@ -503,8 +503,8 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 15 | Integration test databases | Local PostgreSQL and MySQL containers with Docker Compose | [0015](docs/adr/0015-integration-test-databases.md) |
 | 16 | `rivet-testkit` dependencies (Proposed) | May use `rivet-sdk`, `rivet-engine-api`, `rivet-core`; others use it as dev-dependency only | [0016](docs/adr/0016-testkit-dependency-rule.md) |
 | 17 | Extension host lifecycle (Proposed) | As-built behaviour recorded; changes to §4.4 proposed | [0017](docs/adr/0017-extension-host-lifecycle.md) |
-| 18 | WASM runtime parameters (Proposed) | No WASI for now; fuel; memory budget with trap; WIT package `rivet:extension` | [0018](docs/adr/0018-wasm-runtime-parameters.md) |
+| 18 | WASM runtime parameters (Proposed) | No WASI for now; fuel and time limit; memory budget with trap; WIT package `rivet:extension` | [0018](docs/adr/0018-wasm-runtime-parameters.md) |
 | 19 | Publisher identity and trust store (Proposed) | Publisher = first segment of the extension id; `trust.toml` in the user configuration directory | [0019](docs/adr/0019-publisher-identity-and-trust-store.md) |
 | 20 | Permission matching rules (Proposed) | Exact matches, deny in case of doubt | [0020](docs/adr/0020-permission-matching-rules.md) |
-| 21 | Extension supervision (Proposed) | Restart with backoff from 100 ms, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
+| 21 | Extension supervision (Proposed) | Restart with backoff from 100 ms to 1 s, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
 | 22 | Short secrets in logs (Proposed) | Values shorter than 4 bytes are not redacted; a warning is logged | [0022](docs/adr/0022-short-secrets-not-redacted.md) |

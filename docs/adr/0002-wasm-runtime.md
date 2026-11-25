@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-25
+- Amended by: [ADR-0018](0018-wasm-runtime-parameters.md) (Proposed). The pinned WASI version is "none" for now.
 
 ## Context
 
