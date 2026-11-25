@@ -390,7 +390,23 @@ impl SecretStore {
                     shown(scheme)
                 ))
             })?;
-        let secret = match backend.resolve(uri.path()).await {
+        let read = backend.resolve(uri.path());
+        // The limit is for a backend of an extension that an extension
+        // reads. The keychain can ask the user, who can need more time
+        // (ADR-0020).
+        let result = if of_extension && reader.is_some() {
+            let Ok(result) = tokio::time::timeout(READ_TIMEOUT, read).await else {
+                return Err(Error::retryable(format!(
+                    "the secret backend for the scheme `{}` did not answer in {} s",
+                    shown(scheme),
+                    READ_TIMEOUT.as_secs()
+                )));
+            };
+            result
+        } else {
+            read.await
+        };
+        let secret = match result {
             Err(error) if of_extension => return Err(self.backend_error(scheme, &error)),
             result => result?,
         };
@@ -614,24 +630,15 @@ impl ExtensionSecrets {
     ///   called.
     /// - Returns the same error if the grant ends during the read of the
     ///   backend.
-    /// - Returns a `retryable` error if the backend does not answer in
-    ///   [`READ_TIMEOUT`].
+    /// - Returns a `retryable` error if a backend of an extension does not
+    ///   answer in [`READ_TIMEOUT`]. A read of the keychain has no limit.
     /// - Returns the errors of [`SecretStore::resolve`].
     /// - Returns a `policy` error if the value is equal to the id of the
     ///   extension, or if the extension has read
     ///   [`MAX_VALUES_PER_OWNER`] different values and this is a new one.
     pub async fn resolve(&self, uri: &SecretUri) -> Result<Secret> {
         self.permissions.check_secret(&self.extension, uri)?;
-        let read = self.store.resolve_for(Some(&self.extension), uri);
-        let secret = tokio::time::timeout(READ_TIMEOUT, read)
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::retryable(format!(
-                    "the secret backend for the scheme `{}` did not answer in {} s",
-                    shown(uri.scheme()),
-                    READ_TIMEOUT.as_secs()
-                )))
-            })?;
+        let secret = self.store.resolve_for(Some(&self.extension), uri).await?;
         // The grant can end while the backend works. The value is dropped
         // here; it stays registered with the redactor.
         self.permissions.check_secret(&self.extension, uri)?;
@@ -1165,6 +1172,30 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::Retryable);
         assert!(error.message().contains("`aws-sm`"), "{error}");
         assert_eq!(start.elapsed(), READ_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_built_in_backend_that_does_not_answer_has_no_time_limit() {
+        let built_in = Arc::new(Gated::default());
+        let (secrets, _, store) = service_with(&Redactor::new(), Arc::new(Gated::default()));
+        // As the keychain: a backend without an owner.
+        store
+            .backends
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                String::from("built-in"),
+                Registration {
+                    owner: None,
+                    backend: Arc::clone(&built_in) as Arc<dyn SecretBackend>,
+                },
+            );
+        let read = uri("built-in://acme-postgres/prod");
+        let mut resolve = std::pin::pin!(secrets.resolve(&read));
+        let waited = tokio::time::timeout(READ_TIMEOUT * 10, &mut resolve).await;
+        assert!(waited.is_err(), "the read ended without an answer");
+        built_in.release.notify_one();
+        assert_eq!(resolve.await.unwrap().expose(), "hunter2-value");
     }
 
     #[tokio::test]
