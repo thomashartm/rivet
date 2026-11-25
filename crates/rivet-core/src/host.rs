@@ -4567,9 +4567,13 @@ mod tests {
         assert_eq!(f.fake.count("deactivate a"), 1);
         assert_eq!(f.state("a"), Some(Active));
         assert_eq!(f.registered("a").await, (true, true));
+        assert!(f.has_backend("a").await);
         deactivate.await.unwrap().unwrap();
         assert_eq!(f.state("a"), Some(Inactive));
         assert_eq!(f.registered("a").await, (false, false));
+        // The job was aborted while its extension had a secret backend.
+        assert_eq!(f.job_end("a").await, ErrorCategory::Cancelled);
+        f.assert_no_backend("a").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4820,6 +4824,7 @@ mod tests {
         assert_eq!(blocking.state, crate::jobs::JobState::Cancelled);
         assert_eq!(running, 1);
         assert_eq!(f.registered("a").await, (false, false));
+        f.assert_no_backend("a").await;
         // The log has the limit, one time: the release of the deactivation.
         let log = log.text();
         let limit = "the code of aborted jobs has not stopped";
