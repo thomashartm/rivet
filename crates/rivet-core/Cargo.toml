@@ -18,7 +18,7 @@ serde = "1.0.229"
 serde_json = "1.0.154"
 tar = { version = "0.4.46", default-features = false }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 toml = { version = "1", default-features = false, features = ["display", "parse", "serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "std", "smallvec"] }
@@ -30,3 +30,8 @@ minisign = "=0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "test-util"] }
 wat = "1.263.0"
+
+[[test]]
+name = "native_process"
+# The test program is also the child process of the tests.
+harness = false

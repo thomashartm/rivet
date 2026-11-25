@@ -298,7 +298,7 @@ fn guest_error(redactor: &Redactor, error: &types::Error) -> Error {
 ///    ([`is_unsafe`]), and `"` becomes `'`. The human log format writes a host
 ///    field as `name="value"`, so the text cannot imitate one.
 /// 3. The text is cut to [`MAX_GUEST_TEXT_BYTES`].
-fn guest_text(redactor: &Redactor, text: &str) -> String {
+pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
     let mut text: String = redactor
         .redact(text)
         .chars()

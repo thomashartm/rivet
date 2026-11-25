@@ -1,0 +1,574 @@
+//! The process runtime for native extensions (ARCHITECTURE.md §4.3,
+//! ADR-0003).
+//!
+//! A native extension runs in its own child process, so a crash or memory
+//! corruption stays outside the engine. This module starts the process,
+//! talks to it and ends it. It loads no library: the program that it starts
+//! (the extension host program) does that.
+//!
+//! # Process
+//!
+//! [`ExtensionRuntime::load`] starts one process for each extension:
+//! `<program> <arguments...> <package directory>`, with the package
+//! directory as the working directory. [`NativeConfig::program`] must be an
+//! absolute path: the runtime does not search in `PATH`.
+//!
+//! The process gets an empty environment plus the variables of
+//! [`ENVIRONMENT`] that the engine has, so no secret of the engine
+//! environment reaches it (§7.4).
+//!
+//! The instance owns the process. To drop the instance closes the standard
+//! input of the process, waits [`NativeConfig::grace`] and then kills it. The
+//! runtime always waits for the exit status, so no defunct process stays.
+//! The drop does not block: a task does this work.
+//!
+//! # Protocol
+//!
+//! Control messages go over the standard input and output of the process.
+//! One message is one line of JSON of [`NativeConfig::max_message_bytes`] at
+//! most. The engine sends one request and waits for one answer.
+//!
+//! | Request of the engine | Answer of the process |
+//! | --- | --- |
+//! | `{"type":"hello","protocol":1}` | `{"type":"hello","protocol":1}` |
+//! | `{"type":"activate"}` | `{"type":"ok"}` |
+//! | `{"type":"deactivate"}` | `{"type":"ok"}` |
+//!
+//! Each request can also have the answer
+//! `{"type":"error","category":"<category>","message":"<text>"}`. The
+//! category is a name of the SDK error model (§5.6), for example `user`.
+//! The engine keeps the category. The message is untrusted text: see
+//! [Untrusted text](#untrusted-text).
+//!
+//! `hello` is the first request. The answer must have the protocol version
+//! [`PROTOCOL_VERSION`] and must arrive in
+//! [`NativeConfig::handshake_timeout`]. `activate` and `deactivate` have no
+//! time limit here: the host has one for each call
+//! ([`HostConfig::call_timeout`](crate::host::HostConfig::call_timeout)).
+//!
+//! # Failures
+//!
+//! | Failure | Result |
+//! | --- | --- |
+//! | The program does not start | `internal` error of `load`, no process |
+//! | Wrong protocol version, or no answer in time | `internal` error of `load`, no process |
+//! | The process exits or closes its output during a call | `internal` error of the call |
+//! | A malformed or too large answer | `internal` error of the call |
+//! | The caller drops a call that runs | the process is killed |
+//! | The process exits, closes its output or sends a message while no call runs | the crash callback |
+//!
+//! After each of these failures the process is killed, and each later call
+//! of the instance gives an `internal` error. The engine continues.
+//!
+//! The crash callback ([`CrashCallback`]) is for
+//! [`ExtensionHost::report_crash`](crate::host::ExtensionHost::report_crash).
+//! The runtime does not call it after an orderly drop of the instance.
+//!
+//! # Untrusted text
+//!
+//! The message of an error answer and the error output of the process are
+//! text from extension code. The rules are those of the guest text of the
+//! WASM runtime (ADR-0018): secrets are redacted, control characters are
+//! replaced and the text is cut. Each line of the error output is one log
+//! event of the level `info` with the text in the field `guest_message`, so
+//! the text cannot imitate a field of the host.
+//!
+//! The error output has the log budget of the WASM runtime:
+//! [`LOG_LINES_PER_CALL`] lines and [`LOG_BYTES_PER_CALL`] bytes. Each
+//! request to the process (`hello`, `activate`, `deactivate`) starts a new
+//! budget, which is also for the time until the next request. The runtime
+//! reads the lines past the budget, so the process cannot block, and drops
+//! them. It writes their number when the next budget starts and when the
+//! error output ends.
+//!
+//! # Not in this module
+//!
+//! - The [`ExtensionContext`] does not cross the process boundary yet: the
+//!   protocol has no message for a registration.
+//! - Bulk data (Arrow IPC over a local socket, §6.6).
+//! - Memory and CPU limits of the process, and OS sandboxing (§4.3).
+
+use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
+use crate::logging::Redactor;
+use crate::wasm::{LOG_BYTES_PER_CALL, LOG_LINES_PER_CALL, guest_text};
+use rivet_sdk::error::{Error, Result};
+use rivet_sdk::extension::BoxFuture;
+use rivet_sdk::manifest::{ExtensionId, Manifest};
+use serde_json::{Value, json};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot};
+use tracing::instrument::WithSubscriber;
+
+/// The version of the protocol between the engine and the process. The
+/// handshake fails if the process has a different version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The environment variables that the process gets from the engine, if the
+/// engine has them. The process gets no other variable. On Windows the list
+/// also has `SystemRoot`, `TEMP` and `TMP` (ADR-0024).
+pub const ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    #[cfg(windows)]
+    "SystemRoot",
+    #[cfg(windows)]
+    "TEMP",
+    #[cfg(windows)]
+    "TMP",
+];
+
+/// The default of [`NativeConfig::handshake_timeout`]: 5 s.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The default of [`NativeConfig::grace`]: 2 s.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(2);
+
+/// The default of [`NativeConfig::max_message_bytes`]: 64 KiB.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// The most bytes that the runtime keeps of one line of the error output.
+/// The rest of the line is read and dropped.
+const ERROR_OUTPUT_LINE_BYTES: usize = 8 * 1024;
+
+/// What the runtime calls when a process ends, closes its output or sends a
+/// message while no call runs. The arguments are the extension and the
+/// reason. The reason contains no text from the process.
+///
+/// The runtime calls it from a task of the Tokio runtime. It must not
+/// block.
+pub type CrashCallback = Arc<dyn Fn(ExtensionId, Error) + Send + Sync>;
+
+/// How the runtime starts and limits a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeConfig {
+    /// The extension host program, as an absolute path.
+    pub program: PathBuf,
+    /// The arguments before the package directory.
+    pub arguments: Vec<OsString>,
+    /// The longest time between the start of the process and its answer to
+    /// `hello`.
+    pub handshake_timeout: Duration,
+    /// The time that the process has to exit after its input was closed.
+    /// Then the runtime kills it.
+    pub grace: Duration,
+    /// The most bytes of one message of the process, without the line end.
+    pub max_message_bytes: usize,
+}
+
+impl NativeConfig {
+    /// A configuration for `program` with no arguments,
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`], [`DEFAULT_GRACE`] and
+    /// [`DEFAULT_MAX_MESSAGE_BYTES`].
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            arguments: Vec::new(),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            grace: DEFAULT_GRACE,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+/// The runtime that runs each extension in its own process.
+pub struct NativeRuntime {
+    config: NativeConfig,
+    redactor: Redactor,
+    on_crash: CrashCallback,
+}
+
+impl NativeRuntime {
+    /// Creates a runtime.
+    ///
+    /// - `redactor` redacts the text that a process sends.
+    /// - `on_crash` gets each crash that occurs while no call runs, one
+    ///   time for each process at most. Connect it to
+    ///   [`ExtensionHost::report_crash`](crate::host::ExtensionHost::report_crash).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `user` error if [`NativeConfig::program`] is not an
+    /// absolute path.
+    pub fn new(config: NativeConfig, redactor: Redactor, on_crash: CrashCallback) -> Result<Self> {
+        if !config.program.is_absolute() {
+            return Err(Error::user(format!(
+                "the extension host program `{}` is not an absolute path",
+                config.program.display()
+            )));
+        }
+        Ok(Self {
+            config,
+            redactor,
+            on_crash,
+        })
+    }
+}
+
+impl ExtensionRuntime for NativeRuntime {
+    /// Starts the process of the extension and does the handshake.
+    ///
+    /// Returns the error answer of the process, or an `internal` error if
+    /// the program does not start, the handshake fails or the process
+    /// breaks the protocol. After an error no process is left.
+    fn load<'a>(
+        &'a self,
+        manifest: &'a Manifest,
+        directory: &'a Path,
+    ) -> BoxFuture<'a, Result<Box<dyn ExtensionInstance>>> {
+        Box::pin(async move {
+            let id = manifest.id.clone();
+            let environment = ENVIRONMENT
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| (name, value)));
+            let mut child = Command::new(&self.config.program)
+                .args(&self.config.arguments)
+                .arg(directory)
+                .current_dir(directory)
+                .env_clear()
+                .envs(environment)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                // The backstop when the Tokio runtime ends before the
+                // supervisor task.
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| {
+                    failure(&id, "the extension host program did not start").with_source(error)
+                })?;
+            let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+            let (Some(input), Some(output), Some(errors)) = pipes else {
+                let _ = child.kill().await;
+                return Err(failure(&id, "the process has no pipes"));
+            };
+            let log = Arc::new(LogBudget::new(id.clone()));
+            tokio::spawn(
+                log_error_output(errors, Arc::clone(&log), self.redactor.clone())
+                    .with_current_subscriber(),
+            );
+            let process = Process {
+                id,
+                log,
+                child,
+                input,
+                output: BufReader::new(output),
+                config: self.config.clone(),
+                redactor: self.redactor.clone(),
+            };
+            let (calls, requests) = mpsc::channel(1);
+            let supervisor = tokio::spawn(
+                supervise(process, requests, Arc::clone(&self.on_crash)).with_current_subscriber(),
+            );
+            if let Err(error) = call(&calls, "hello").await {
+                // The supervisor ends the process. Wait for it, so no
+                // process is left when `load` returns.
+                drop(calls);
+                let _ = supervisor.await;
+                return Err(error);
+            }
+            Ok(Box::new(NativeInstance { calls }) as Box<dyn ExtensionInstance>)
+        })
+    }
+}
+
+/// One request: its type and where the answer goes.
+type Call = (&'static str, oneshot::Sender<Result<()>>);
+
+/// One extension in its process. To drop it ends the process.
+struct NativeInstance {
+    /// The requests for the supervisor task. The supervisor ends the
+    /// process when this sender is dropped.
+    calls: mpsc::Sender<Call>,
+}
+
+impl ExtensionInstance for NativeInstance {
+    /// Sends `activate`. `context` stays in the engine (see the module
+    /// documentation).
+    fn activate(&self, _context: ExtensionContext) -> BoxFuture<'_, Result<()>> {
+        Box::pin(call(&self.calls, "activate"))
+    }
+
+    fn deactivate(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(call(&self.calls, "deactivate"))
+    }
+}
+
+/// Sends one request to the supervisor and waits for the answer. If the
+/// caller drops this future, the supervisor kills the process.
+async fn call(calls: &mpsc::Sender<Call>, request: &'static str) -> Result<()> {
+    let ended = || Error::internal("the process of the extension has ended");
+    let (answer, result) = oneshot::channel();
+    calls.send((request, answer)).await.map_err(|_| ended())?;
+    result.await.map_err(|_| ended())?
+}
+
+/// An `internal` error about the process of `id`. `reason` must not contain
+/// text from the process.
+fn failure(id: &ExtensionId, reason: &str) -> Error {
+    Error::internal(format!("extension `{id}`: {reason}"))
+}
+
+/// The process of one extension and its control pipes.
+struct Process {
+    id: ExtensionId,
+    log: Arc<LogBudget>,
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    config: NativeConfig,
+    redactor: Redactor,
+}
+
+/// Owns the process until it has ended. Does one request after the other.
+async fn supervise(
+    mut process: Process,
+    mut requests: mpsc::Receiver<Call>,
+    on_crash: CrashCallback,
+) {
+    loop {
+        tokio::select! {
+            request = requests.recv() => {
+                let Some((request, mut answer)) = request else {
+                    // The instance was dropped.
+                    break;
+                };
+                let result = tokio::select! {
+                    result = process.exchange(request) => result,
+                    () = answer.closed() => Err(failure(&process.id, "the call was dropped")),
+                };
+                match result {
+                    Ok(result) => {
+                        let _ = answer.send(result);
+                    }
+                    Err(error) => {
+                        // The state of the process is not known.
+                        let _ = process.child.kill().await;
+                        let _ = answer.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            error = process.unexpected() => {
+                let _ = process.child.kill().await;
+                on_crash(process.id, error);
+                return;
+            }
+        }
+    }
+    let Process {
+        mut child,
+        input,
+        config,
+        ..
+    } = process;
+    // The closed input tells the process to exit.
+    drop(input);
+    if tokio::time::timeout(config.grace, child.wait())
+        .await
+        .is_err()
+    {
+        // Kills and reads the exit status. Not isolated by a test:
+        // without this line `kill_on_drop` kills, but does not wait.
+        let _ = child.kill().await;
+    }
+}
+
+impl Process {
+    /// Sends `request` and reads one answer. The outer error is a failure
+    /// of the process or of the protocol. The inner result is the answer.
+    async fn exchange(&mut self, request: &'static str) -> Result<Result<()>> {
+        self.log.renew();
+        if request == "hello" {
+            let limit = self.config.handshake_timeout;
+            return tokio::time::timeout(limit, self.exchange_unlimited(request))
+                .await
+                .unwrap_or_else(|_| Err(failure(&self.id, "the process did not answer in time")));
+        }
+        self.exchange_unlimited(request).await
+    }
+
+    async fn exchange_unlimited(&mut self, request: &'static str) -> Result<Result<()>> {
+        let mut line = match request {
+            "hello" => json!({"type": request, "protocol": PROTOCOL_VERSION}),
+            _ => json!({"type": request}),
+        }
+        .to_string();
+        line.push('\n');
+        let sent = async {
+            self.input.write_all(line.as_bytes()).await?;
+            self.input.flush().await
+        };
+        sent.await.map_err(|error| {
+            failure(&self.id, "the process closed its input").with_source(error)
+        })?;
+
+        let limit = self.config.max_message_bytes;
+        // One byte more than the limit, for the line end.
+        let answer = read_chunk(&mut self.output, limit.saturating_add(1))
+            .await
+            .map_err(|error| {
+                failure(&self.id, "the output of the process cannot be read").with_source(error)
+            })?;
+        let Some(answer) = answer.strip_suffix(b"\n").or_else(|| {
+            // The last line of the output can have no line end.
+            (!answer.is_empty() && answer.len() <= limit).then_some(&answer[..])
+        }) else {
+            return Err(failure(
+                &self.id,
+                if answer.is_empty() {
+                    "the process ended or closed its output during the call"
+                } else {
+                    "the process sent a message that is too large"
+                },
+            ));
+        };
+        self.answer(request, answer)
+    }
+
+    /// Reads the answer `line` to `request`.
+    fn answer(&self, request: &str, line: &[u8]) -> Result<Result<()>> {
+        let malformed = || failure(&self.id, "the process sent a malformed message");
+        let message: Value = serde_json::from_slice(line).map_err(|_| malformed())?;
+        match (message["type"].as_str(), request) {
+            (Some("hello"), "hello") if message["protocol"] == PROTOCOL_VERSION => Ok(Ok(())),
+            (Some("hello"), "hello") => Err(failure(
+                &self.id,
+                &format!("the process does not have the protocol version {PROTOCOL_VERSION}"),
+            )),
+            (Some("ok"), "activate" | "deactivate") => Ok(Ok(())),
+            (Some("error"), _) => {
+                let text = message["message"].as_str().ok_or_else(malformed)?;
+                let text = guest_text(&self.redactor, text);
+                let error = match message["category"].as_str() {
+                    Some("user") => Error::user(text),
+                    Some("auth") => Error::auth(text),
+                    Some("connectivity") => Error::connectivity(text),
+                    Some("database") => Error::database(text),
+                    Some("policy") => Error::policy(text),
+                    Some("cancelled") => Error::cancelled(text),
+                    Some("retryable") => Error::retryable(text),
+                    Some("internal") => Error::internal(text),
+                    _ => return Err(malformed()),
+                };
+                Ok(Err(error))
+            }
+            _ => Err(malformed()),
+        }
+    }
+
+    /// Completes when the process does something that is a crash while no
+    /// call runs. Returns the reason.
+    async fn unexpected(&mut self) -> Error {
+        let reason = tokio::select! {
+            status = self.child.wait() => match status {
+                Ok(status) => format!("the process ended ({status})"),
+                Err(_) => "the state of the process cannot be read".to_owned(),
+            },
+            chunk = read_chunk(&mut self.output, self.config.max_message_bytes) => match chunk {
+                Ok(chunk) if !chunk.is_empty() => {
+                    "the process sent a message that answers no request".to_owned()
+                }
+                _ => "the process ended or closed its output".to_owned(),
+            },
+        };
+        failure(&self.id, &reason)
+    }
+}
+
+/// Reads to the end of the line, but `most` bytes at most. The result is
+/// empty at the end of the input.
+async fn read_chunk<R>(reader: &mut R, most: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut chunk = Vec::new();
+    let most = u64::try_from(most).unwrap_or(u64::MAX);
+    reader.take(most).read_until(b'\n', &mut chunk).await?;
+    Ok(chunk)
+}
+
+/// The log budget of the error output of one process (see the module
+/// documentation).
+struct LogBudget {
+    id: ExtensionId,
+    /// The lines and the bytes that are left, and the dropped lines.
+    left: Mutex<(u32, usize, u64)>,
+}
+
+impl LogBudget {
+    fn new(id: ExtensionId) -> Self {
+        Self {
+            id,
+            left: Mutex::new((LOG_LINES_PER_CALL, LOG_BYTES_PER_CALL, 0)),
+        }
+    }
+
+    fn left(&self) -> MutexGuard<'_, (u32, usize, u64)> {
+        self.left.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts a new budget. Writes the number of the lines that the last
+    /// budget dropped.
+    fn renew(&self) {
+        let new = (LOG_LINES_PER_CALL, LOG_BYTES_PER_CALL, 0);
+        let (_, _, dropped) = std::mem::replace(&mut *self.left(), new);
+        if dropped > 0 {
+            // The message of `wasm.rs`.
+            tracing::warn!(extension = self.id.as_str(), "{dropped} log lines dropped");
+        }
+    }
+
+    /// Takes one line of `bytes` from the budget. Returns `false`, and
+    /// counts the line as dropped, if the budget does not have it.
+    fn take(&self, bytes: usize) -> bool {
+        let mut left = self.left();
+        let (lines, left_bytes, dropped) = &mut *left;
+        if *lines == 0 || bytes > *left_bytes {
+            *dropped += 1;
+            return false;
+        }
+        *lines -= 1;
+        *left_bytes -= bytes;
+        true
+    }
+}
+
+/// Writes the error output of the process to the log, as untrusted text.
+/// Ends when the process closes its error output.
+async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Redactor) {
+    let mut errors = BufReader::new(errors);
+    let extension = log.id.as_str();
+    // `true` while the start of the current line is already read.
+    let mut rest_of_line = false;
+    loop {
+        let chunk = match read_chunk(&mut errors, ERROR_OUTPUT_LINE_BYTES).await {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => chunk,
+            Err(error) => {
+                tracing::warn!(extension, %error, "the error output of the process cannot be read");
+                break;
+            }
+        };
+        let dropped = std::mem::replace(&mut rest_of_line, !chunk.ends_with(b"\n"));
+        // Before the work on the text: a dropped line must be cheap.
+        if dropped || !log.take(chunk.len()) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&chunk);
+        let text = guest_text(&redactor, text.trim_end_matches(['\r', '\n']));
+        // A field, not the message: see `wasm.rs`.
+        let guest_message = text.as_str();
+        tracing::info!(extension, guest_message, "extension error output");
+    }
+    log.renew();
+}
