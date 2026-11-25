@@ -1623,6 +1623,7 @@ dependencies = [
  "rivet-sdk",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
