@@ -29,7 +29,8 @@ zeroize = "1.9.2"
 minisign = "=0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "test-util"] }
-wat = "1.263.0"
+# Exact: this version builds the WASM test components from WAT text.
+wat = "=1.263.0"
 
 [[test]]
 name = "native_process"
