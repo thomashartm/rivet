@@ -431,10 +431,25 @@ impl Write for Capture {
     }
 }
 
+/// Makes `log` the log subscriber of this thread.
+///
+/// It also keeps a second subscriber alive for the whole test process.
+/// Reason: while only one subscriber exists, tracing-core 0.1 decides if
+/// a log statement is on with the subscriber of the thread that reaches
+/// the statement first, and keeps the answer for the process
+/// (`Rebuilder::JustOne` in `callsite.rs`). A parallel test with no
+/// subscriber then turns the statement off for the test that captures.
+/// With two subscribers, each event asks the subscriber of its thread.
+#[cfg(test)]
+pub(crate) fn capture_logs(log: &tracing::Dispatch) -> tracing::dispatcher::DefaultGuard {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
+    tracing::dispatcher::set_default(log)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing::dispatcher::with_default;
     use tracing::{debug, error, info, info_span, warn};
 
     const FORMATS: [LogFormat; 2] = [LogFormat::Human, LogFormat::Json];
@@ -459,7 +474,10 @@ mod tests {
         log: impl FnOnce(),
     ) -> String {
         let capture = Capture::default();
-        with_default(&capture.dispatch(level, format, redactor), log);
+        {
+            let _guard = capture_logs(&capture.dispatch(level, format, redactor));
+            log();
+        }
         capture.text()
     }
 

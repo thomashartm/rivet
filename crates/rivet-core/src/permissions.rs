@@ -13,8 +13,22 @@
 //! - A denied access returns a `policy` error and writes one `warn` log
 //!   event. Both name the extension, the capability and the requested
 //!   resource. A resource is a host and port, a path, a secret URI or a
-//!   clipboard operation. It is never a secret value. A requested host is
-//!   cut to 255 bytes (the maximum length of a DNS name) in both.
+//!   clipboard operation. It is never a secret value. A resource that is
+//!   longer than 1024 bytes is cut to 1024 bytes in both; for a host and
+//!   port, the port is then not shown.
+//!
+//! # Order of a check and a revoke
+//!
+//! - Each check reads the grant one time. [`Permissions::grant`],
+//!   [`Permissions::revoke`] and [`Permissions::review_update`] replace or
+//!   remove the grant in one step. A check never sees a part of a change.
+//! - A check that starts after [`Permissions::revoke`] returned is denied.
+//! - A check that runs at the same time as a revoke is allowed or denied.
+//!   A filesystem check reads the grant before it resolves the path, so it
+//!   can return "allowed" a short time after the revoke returned.
+//! - The service does not close a resource that was opened before the
+//!   revoke. The caller of the revoke MUST stop the extension or close its
+//!   resources.
 //!
 //! # Network
 //!
@@ -38,6 +52,10 @@
 //!   ([`Permissions::new`]). It comes from the operating system or the
 //!   process environment only. A later change of the home directory does
 //!   not move a `~` scope: it needs a restart of the process.
+//! - A home directory that is not absolute, or that is a filesystem root
+//!   (`/`, also through `..` or a symbolic link), is not used: each `~`
+//!   scope grants nothing and the service writes one `warn` log event when
+//!   it is created.
 //! - The requested path must be absolute.
 //! - The requested path and the scope path are resolved before they are
 //!   compared: symbolic links and `..` are followed with
@@ -69,10 +87,14 @@
 //! - A namespace that contains `://`, for example `aws-sm://prod`, grants
 //!   nothing. This form is reserved for a later namespace that is limited
 //!   to one scheme (ADR-0020).
-//! - The comparison is exact and case-sensitive. A URI path with a `.` or
-//!   `..` segment, an empty segment (`//`, or a `/` at the end) or a `%`
-//!   (an encoded segment) is denied: a backend can read such a path as a
-//!   path out of the namespace.
+//! - The comparison is exact and case-sensitive, character by character.
+//!   Nothing is decoded or normalised: `#` and a fullwidth dot are ordinary
+//!   characters. A path that is equal to the namespace is included.
+//! - A URI path with a `.` or `..` segment, an empty segment (`//`, or a
+//!   `/` at the end), a `%` (an encoded segment), a `\` or a control
+//!   character (for example NUL) is denied: a backend can read such a path
+//!   as a path out of the namespace (ADR-0020).
+//! - Limit: a name with a `%`, for example `100%-cpu`, cannot be read.
 //!
 //! # Update review
 //!
@@ -150,12 +172,24 @@ impl Default for Permissions {
 impl Permissions {
     /// Creates a service without grants. Reads the home directory of the
     /// user here, one time; `~` in a scope path refers to it for the life of
-    /// the service.
+    /// the service. A home directory that is a filesystem root or not
+    /// absolute is not used (see the [module documentation](self)).
     pub fn new() -> Self {
         Self::with_home(std::env::home_dir())
     }
 
     fn with_home(home: Option<PathBuf>) -> Self {
+        // With `HOME=/` the scope `~` would be the whole disk. A relative
+        // home directory would depend on the working directory.
+        let home = home.filter(|home| {
+            let resolved = home.canonicalize();
+            let usable = home.is_absolute()
+                && resolved.as_deref().unwrap_or(home).parent().is_some();
+            if !usable {
+                warn!(home = ?home, "the home directory is a root or not absolute: `~` scopes grant nothing");
+            }
+            usable
+        });
         Self {
             grants: RwLock::default(),
             home,
@@ -231,14 +265,7 @@ impl Permissions {
     /// Returns a `policy` error if the host and port are not granted.
     pub fn check_network(&self, extension: &ExtensionId, host: &str, port: u16) -> Result<()> {
         let allowed = self.granted(extension, |granted| allows_network(granted, host, port));
-        // `host` comes from the extension: its length has no limit.
-        let resource = if host.len() > MAX_HOST_BYTES {
-            let cut = &host[..host.floor_char_boundary(MAX_HOST_BYTES)];
-            format!("{cut}…:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        allow(allowed, extension, "network", &resource)
+        allow(allowed, extension, "network", &format!("{host}:{port}"))
     }
 
     /// Checks that `extension` may access `path` and returns the resolved
@@ -433,9 +460,10 @@ fn cut_to(granted: &mut Capabilities, requested: &Capabilities) {
         .retain(|access| requested.clipboard.contains(access));
 }
 
-/// The maximum length of a DNS name. A longer requested host is cut to it
-/// in the log and in the error.
-const MAX_HOST_BYTES: usize = 255;
+/// A longer requested resource is cut to this length in the log and in the
+/// error. It is the maximum length of a path on macOS; a DNS name has a
+/// maximum of 255 bytes.
+const MAX_RESOURCE_BYTES: usize = 1024;
 
 /// Turns a decision into a result. `None` (no grant) is a denial.
 fn allow(
@@ -453,8 +481,17 @@ fn allow(
 
 /// Logs a denied access and builds its error.
 fn denied(extension: &ExtensionId, capability: &str, resource: &str) -> Error {
-    // `resource` comes from an untrusted extension. The debug form escapes
-    // control characters, so it cannot add a line to the log.
+    // `resource` comes from an untrusted extension: its length has no limit.
+    let cut;
+    let resource = if resource.len() > MAX_RESOURCE_BYTES {
+        let start = &resource[..resource.floor_char_boundary(MAX_RESOURCE_BYTES)];
+        cut = format!("{start}…");
+        cut.as_str()
+    } else {
+        resource
+    };
+    // The debug form escapes control characters, so `resource` cannot add a
+    // line to the log.
     warn!(extension = %extension, capability, resource = ?resource, "permission denied");
     Error::policy(format!(
         "the extension `{extension}` does not have the capability `{capability}` for {resource:?}"
@@ -496,9 +533,10 @@ fn covers(have: FilesystemAccess, want: FilesystemAccess) -> bool {
 fn in_namespace(namespace: &str, path: &str) -> bool {
     let mut segments = path.split('/');
     // `://` is reserved for a per-scheme namespace (ADR-0020). A backend can
-    // decode `%2e%2e` or drop an empty segment, so both are denied.
+    // decode `%2e%2e`, read `\` as a separator, stop at a control character
+    // or drop an empty segment, so these are denied.
     !namespace.contains("://")
-        && !path.contains('%')
+        && !path.contains(|c: char| matches!(c, '%' | '\\') || c.is_control())
         && !path
             .split('/')
             .any(|segment| matches!(segment, "" | "." | ".."))
@@ -560,11 +598,10 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::{Capture, Level, LogFormat, Redactor};
+    use crate::logging::{Capture, Level, LogFormat, Redactor, capture_logs};
     use rivet_sdk::error::ErrorCategory;
     use rivet_sdk::manifest::{FilesystemScope, NetworkScope};
     use std::fs;
-    use tracing::dispatcher::with_default;
 
     /// A manifest of `acme.postgres` with the `[capabilities]` content
     /// `capabilities` (TOML).
@@ -688,6 +725,61 @@ mod tests {
         assert_no_access(&permissions, &id);
     }
 
+    /// R-26: threads check in a loop while one thread revokes. A check that
+    /// starts after `revoke` returned is denied.
+    #[test]
+    fn no_check_is_allowed_after_revoke_returns() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const CHECKERS: usize = 8;
+        const ROUNDS_AFTER: usize = 200;
+        let (permissions, id) = granted(ALL);
+        let dir = tempfile::tempdir().unwrap();
+        let secret = uri("keychain://acme-postgres/prod");
+        let start = Barrier::new(CHECKERS + 1);
+        let revoke_returned = AtomicBool::new(false);
+        let allowed_rounds = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..CHECKERS {
+                scope.spawn(|| {
+                    start.wait();
+                    let mut rounds_after = 0;
+                    while rounds_after < ROUNDS_AFTER {
+                        // Read before the checks: `true` means that `revoke`
+                        // returned before the first check of this round.
+                        let after = revoke_returned.load(Ordering::SeqCst);
+                        let allowed = [
+                            permissions
+                                .check_network(&id, "db.example.com", 5432)
+                                .is_ok(),
+                            permissions
+                                .check_filesystem(&id, dir.path(), FilesystemAccess::ReadWrite)
+                                .is_ok(),
+                            permissions.check_secret(&id, &secret).is_ok(),
+                            permissions
+                                .check_clipboard(&id, ClipboardAccess::Write)
+                                .is_ok(),
+                        ];
+                        if after {
+                            assert_eq!(allowed, [false; 4], "allowed after revoke");
+                            rounds_after += 1;
+                        } else if allowed == [true; 4] {
+                            allowed_rounds.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+            start.wait();
+            // The revoke must run against checks that are allowed.
+            while allowed_rounds.load(Ordering::SeqCst) < CHECKERS * 10 {
+                std::thread::yield_now();
+            }
+            assert!(permissions.revoke(&id));
+            revoke_returned.store(true, Ordering::SeqCst);
+        });
+        assert_no_access(&permissions, &id);
+    }
+
     #[test]
     fn network_needs_a_granted_host_and_port() {
         let (permissions, id) = granted(
@@ -752,22 +844,63 @@ mod tests {
         let error = permissions
             .check_network(&id, &"a".repeat(100_000), 443)
             .unwrap_err();
-        let cut = format!("{}…:443", "a".repeat(255));
+        let cut = format!("{}…\"", "a".repeat(MAX_RESOURCE_BYTES));
         assert!(error.message().contains(&cut), "{}", error.message().len());
-        assert!(!error.message().contains(&"a".repeat(256)));
+        assert!(
+            !error
+                .message()
+                .contains(&"a".repeat(MAX_RESOURCE_BYTES + 1))
+        );
 
         // The cut is on a character boundary: `é` has 2 bytes.
         let error = permissions
-            .check_network(&id, &"é".repeat(200), 443)
+            .check_network(&id, &format!("a{}", "é".repeat(MAX_RESOURCE_BYTES)), 443)
             .unwrap_err();
-        let cut = format!("{}…:443", "é".repeat(127));
+        let cut = format!("a{}…\"", "é".repeat((MAX_RESOURCE_BYTES - 1) / 2));
         assert!(error.message().contains(&cut), "{error}");
-        assert!(!error.message().contains(&"é".repeat(128)));
+        assert!(
+            !error
+                .message()
+                .contains(&"é".repeat(MAX_RESOURCE_BYTES / 2 + 1))
+        );
 
-        // A host of the maximum length is not cut.
-        let host = "a".repeat(255);
+        // A resource of the maximum length is not cut.
+        let host = "a".repeat(MAX_RESOURCE_BYTES - ":443".len());
         let error = permissions.check_network(&id, &host, 443).unwrap_err();
         assert!(error.message().contains(&format!("{host}:443")), "{error}");
+    }
+
+    /// R-28f: a path and a secret URI come from the extension too. The cut
+    /// is for the error and for the log.
+    #[test]
+    fn a_long_path_or_secret_uri_is_cut_in_the_error_and_in_the_log() {
+        let (permissions, id) = granted(REQUESTED);
+        let long = "a".repeat(1_000_000);
+        let capture = Capture::default();
+        let errors = {
+            let _guard =
+                capture_logs(&capture.dispatch(Level::WARN, LogFormat::Human, &Redactor::new()));
+            [
+                permissions
+                    .check_filesystem(&id, Path::new(&format!("/{long}")), FilesystemAccess::Read)
+                    .unwrap_err(),
+                permissions
+                    .check_secret(&id, &uri(&format!("keychain://{long}")))
+                    .unwrap_err(),
+            ]
+        };
+        let output = capture.text();
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", output.len());
+        for (error, (line, start)) in errors
+            .iter()
+            .zip(lines.iter().zip(["/aaa", "keychain://aaa"]))
+        {
+            for text in [error.message(), line] {
+                assert!(text.len() < MAX_RESOURCE_BYTES + 300, "{}", text.len());
+                assert!(text.contains(start) && text.contains("a…\""), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -983,6 +1116,54 @@ mod tests {
         );
     }
 
+    /// R-57b: with `HOME=/` the scope `~` would be the whole disk. The test
+    /// uses the constructor that `Permissions::new` calls, so it does not
+    /// change the process environment.
+    #[test]
+    fn a_home_directory_that_is_the_root_or_relative_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let all = manifest("[[capabilities.filesystem]]\npath = \"~\"\naccess = \"read\"\n");
+        let mut homes = vec![PathBuf::from("/"), PathBuf::from("relative")];
+        // A home directory that resolves to the root.
+        homes.push(
+            dir.path()
+                .join(dir.path().components().map(|_| "..").collect::<PathBuf>()),
+        );
+        for home in homes {
+            let capture = Capture::default();
+            let permissions = {
+                let _guard = capture_logs(&capture.dispatch(
+                    Level::WARN,
+                    LogFormat::Human,
+                    &Redactor::new(),
+                ));
+                Permissions::with_home(Some(home.clone()))
+            };
+            permissions.grant(&all, all.capabilities.clone()).unwrap();
+            for path in [dir.path(), Path::new("/"), Path::new("/etc")] {
+                assert_denied(
+                    permissions.check_filesystem(&all.id, path, FilesystemAccess::Read),
+                    &["filesystem read"],
+                );
+            }
+            let output = capture.text();
+            assert_eq!(output.lines().count(), 1, "{home:?}: {output}");
+            assert!(
+                output.contains("WARN") && output.contains("home"),
+                "{output}"
+            );
+        }
+        // A usable home directory writes no warning.
+        let capture = Capture::default();
+        {
+            let _guard =
+                capture_logs(&capture.dispatch(Level::WARN, LogFormat::Human, &Redactor::new()));
+            let _ = Permissions::with_home(Some(dir.path().to_path_buf()));
+            let _ = Permissions::with_home(None);
+        }
+        assert_eq!(capture.text(), "");
+    }
+
     #[test]
     fn secrets_need_a_granted_namespace() {
         let (permissions, id) =
@@ -1030,6 +1211,46 @@ mod tests {
                 &["acme.postgres", "secrets", denied],
             );
         }
+    }
+
+    /// R-57a, ADR-0020: a path is compared character by character and
+    /// nothing is decoded. A `\` or a control character is denied: a backend
+    /// can read it as a separator or as the end of the path.
+    #[test]
+    fn a_secret_path_is_literal_and_has_no_backslash_or_control_character() {
+        let (permissions, id) = granted("[capabilities]\nsecrets = [\"acme-postgres\"]\n");
+        for denied in [
+            "keychain://acme-postgres/..\\other",
+            "keychain://acme-postgres\\other",
+            "keychain://acme-postgres/a\0b",
+            "keychain://acme-postgres/a\nb",
+            "keychain://acme-postgres/a\u{7f}b",
+            "keychain://acme-postgres/a\u{85}b",
+            // Known limit: `%` is denied, so this legitimate name is too.
+            "keychain://acme-postgres/100%-cpu",
+        ] {
+            assert_denied(
+                permissions.check_secret(&id, &uri(denied)),
+                &["acme.postgres", "secrets"],
+            );
+        }
+        // Ordinary characters. Fullwidth dots are a name in the namespace:
+        // they are not `..`.
+        for allowed in [
+            "keychain://acme-postgres/a#b",
+            "keychain://acme-postgres/pass-wörd",
+            "keychain://acme-postgres/\u{ff0e}\u{ff0e}/other",
+        ] {
+            permissions
+                .check_secret(&id, &uri(allowed))
+                .unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        // A literal comparison gives no access to another namespace.
+        let (other, id) = granted("[capabilities]\nsecrets = [\"other\"]\n");
+        assert_denied(
+            other.check_secret(&id, &uri("keychain://\u{ff0e}\u{ff0e}/other")),
+            &["secrets"],
+        );
     }
 
     /// ADR-0020: the form `scheme://...` is reserved for a later per-scheme
@@ -1306,26 +1527,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for format in [LogFormat::Human, LogFormat::Json] {
             let capture = Capture::default();
-            with_default(
-                &capture.dispatch(Level::WARN, format, &Redactor::new()),
-                || {
-                    permissions
-                        .check_network(&id, "db.example.com", 5432)
-                        .unwrap();
-                    permissions
-                        .check_network(&id, "evil.org\nWARN forged", 443)
-                        .unwrap_err();
-                    permissions
-                        .check_filesystem(&id, dir.path(), FilesystemAccess::ReadWrite)
-                        .unwrap_err();
-                    permissions
-                        .check_secret(&id, &uri("aws-sm://prod/db"))
-                        .unwrap_err();
-                    permissions
-                        .check_clipboard(&id, ClipboardAccess::Write)
-                        .unwrap_err();
-                },
-            );
+            {
+                let _guard = capture_logs(&capture.dispatch(Level::WARN, format, &Redactor::new()));
+                permissions
+                    .check_network(&id, "db.example.com", 5432)
+                    .unwrap();
+                permissions
+                    .check_network(&id, "evil.org\nWARN forged", 443)
+                    .unwrap_err();
+                permissions
+                    .check_filesystem(&id, dir.path(), FilesystemAccess::ReadWrite)
+                    .unwrap_err();
+                permissions
+                    .check_secret(&id, &uri("aws-sm://prod/db"))
+                    .unwrap_err();
+                permissions
+                    .check_clipboard(&id, ClipboardAccess::Write)
+                    .unwrap_err();
+            }
             let output = capture.text();
             let lines: Vec<_> = output.lines().collect();
             assert_eq!(lines.len(), 4, "{output}");
