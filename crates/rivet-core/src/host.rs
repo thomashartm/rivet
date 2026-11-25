@@ -520,7 +520,8 @@ struct Entry {
     package: Package,
     state: ExtensionState,
     reason: Option<String>,
-    /// `Some` in the states `Active` and `Inactive`, until the shutdown.
+    /// `Some` in the states `Active` and `Inactive`, until the shutdown or
+    /// a crash report for the `Inactive` extension.
     instance: Option<Arc<dyn ExtensionInstance>>,
     /// The failures in a row. See [`Entry::end_run`].
     failures: u32,
@@ -1227,9 +1228,10 @@ impl ExtensionHost {
             .await?
     }
 
-    /// Handles a crash of the active extension `id`, for example a WASM
-    /// trap outside a lifecycle call. The runtime of the extension calls
-    /// it. `error` is the reason; it must not contain secrets.
+    /// Handles a crash of the extension `id`, for example a WASM trap
+    /// outside a lifecycle call or the end of a native process. The runtime
+    /// of the extension calls it. `error` is the reason; it must not contain
+    /// secrets.
     ///
     /// The host deactivates the active dependents first, puts `id` in the
     /// state `Failed`, releases what it owns (§5.2) and drops its instance.
@@ -1238,10 +1240,14 @@ impl ExtensionHost {
     /// dependents again, also a dependent whose `deactivate` call failed
     /// here and that is `Failed` thus.
     ///
+    /// If `id` is not `Active` (ADR-0021), the host only unloads the
+    /// instance, if it has one (an `Inactive` extension): the instance is
+    /// dead. The state does not change, no failure is counted and nothing
+    /// restarts. The next activation loads a new instance.
+    ///
     /// # Errors
     ///
     /// - A `user` error if the host does not know `id`.
-    /// - A `policy` error if the extension is not `Active`.
     pub async fn report_crash(&self, id: &ExtensionId, error: Error) -> Result<()> {
         let id = id.clone();
         self.operation(|host| async move { host.crash(&id, &error).await })
@@ -1250,17 +1256,22 @@ impl ExtensionHost {
 
     /// The body of [`report_crash`](Self::report_crash).
     async fn crash(&self, id: &ExtensionId, error: &Error) -> Result<()> {
-        let dependents = {
-            let inner = self.inner();
-            let entry = inner.entries.get(id).ok_or_else(|| unknown(id))?;
-            if entry.state != ExtensionState::Active {
-                return Err(Error::policy(format!(
-                    "extension `{id}` cannot crash in the state {:?}",
-                    entry.state
-                )));
+        let (state, dead) = {
+            let mut inner = self.inner();
+            let entry = inner.entries.get_mut(id).ok_or_else(|| unknown(id))?;
+            match entry.state {
+                ExtensionState::Active => (entry.state, None),
+                // The instance has ended. The next activation loads a new one.
+                state => (state, entry.instance.take()),
             }
-            inner.active_dependents(id)
         };
+        if state != ExtensionState::Active {
+            let unloaded = dead.is_some();
+            tracing::warn!(extension = %id, ?state, %error, unloaded, "crash report for an extension that is not active");
+            self.drop_instance(id, dead).await;
+            return Ok(());
+        }
+        let dependents = self.inner().active_dependents(id);
         for dependent in dependents.iter().rev() {
             // A dependent that fails here is `Failed` until the restart of
             // `id` succeeds.
@@ -3447,16 +3458,47 @@ mod tests {
             assert_eq!(f.registered(owner).await, (true, true));
         }
 
-        // Only an active extension can crash.
-        for (extension, category) in [
-            ("idle", ErrorCategory::Policy),
-            ("unknown", ErrorCategory::User),
-        ] {
-            let crash = Error::internal("trap");
-            let error = f.host.report_crash(&id(extension), crash).await;
-            assert_eq!(error.unwrap_err().category(), category);
-        }
+        // A report for an extension without an instance changes nothing.
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("idle"), crash).await.unwrap();
         assert_eq!(f.state("idle"), Some(Resolved));
+        assert!(f.changes().await.is_empty());
+        let crash = Error::internal("trap");
+        let unknown = f.host.report_crash(&id("unknown"), crash).await;
+        assert_eq!(unknown.unwrap_err().category(), ErrorCategory::User);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reported_crash_of_an_inactive_extension_unloads_its_instance_only() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        f.host.deactivate(&id("a")).await.unwrap();
+        f.fake.take_calls();
+        f.changes().await;
+
+        // The process of the inactive extension ended.
+        let crash = Error::internal("the process has ended");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+
+        assert_eq!(f.fake.take_calls(), ["unload a"]);
+        // No state change, no failure, no restart.
+        pass(DAY).await;
+        assert!(f.changes().await.is_empty());
+        assert!(f.all_scheduled().await.is_empty());
+        let status = f.status("a").unwrap();
+        assert_eq!((status.state, status.reason), (Inactive, None));
+        // The next activation loads a new instance.
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert_eq!(f.fake.take_calls(), ["load a@1.0.0", "activate a"]);
+        // A second report for the instance that is gone changes nothing.
+        f.host.deactivate(&id("a")).await.unwrap();
+        for _ in 0..2 {
+            let crash = Error::internal("the process has ended");
+            f.host.report_crash(&id("a"), crash).await.unwrap();
+        }
+        assert_eq!(f.fake.take_calls(), ["deactivate a", "unload a"]);
     }
 
     #[tokio::test(start_paused = true)]
