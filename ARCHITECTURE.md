@@ -512,3 +512,4 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 22 | Short secrets in logs (Proposed) | Values shorter than 4 bytes are not redacted. The store writes a `warn` event for each read of such a value | [0022](docs/adr/0022-short-secrets-not-redacted.md) |
 | 23 | Package format and install layout (Proposed) | Uncompressed tar with three fixed entries; store plus active directory; journal for update and rollback | [0023](docs/adr/0023-package-format-and-install-layout.md) |
 | 24 | Native process runtime (Proposed) | One child process per native extension; JSON lines over standard input and output; empty environment | [0024](docs/adr/0024-native-process-runtime.md) |
+| 25 | First database drivers (Proposed) | Crates `rivet-ext-postgres` and `rivet-ext-mysql` on the existing driver contract; conformance suite in the testkit | [0025](docs/adr/0025-first-database-drivers.md) |
