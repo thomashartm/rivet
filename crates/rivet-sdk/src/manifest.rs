@@ -311,7 +311,7 @@ impl Manifest {
     /// - a contribution `id`, an activation `command` or `type`, a network
     ///   `host`, a filesystem `path` or a secret namespace is empty or has only
     ///   whitespace;
-    /// - a network scope has an empty `ports` list;
+    /// - a network scope has an empty `ports` list or contains port 0;
     /// - two contributions have the same `kind` and `id`;
     /// - a UI extension point is contributed and `requires_ui` is not `true`.
     pub fn parse(text: &str) -> Result<Self> {
@@ -376,6 +376,11 @@ impl Manifest {
             if scope.ports.is_empty() {
                 return invalid(format!(
                     "field `capabilities.network[{index}].ports` must list at least one port"
+                ));
+            }
+            if scope.ports.contains(&0) {
+                return invalid(format!(
+                    "field `capabilities.network[{index}].ports` must not contain port 0"
                 ));
             }
         }
@@ -694,6 +699,14 @@ mod tests {
         rejected(
             &format!("{MINIMAL}[[capabilities.network]]\nhost = \"h\"\nports = []\n"),
             &["field `capabilities.network[0].ports` must list at least one port"],
+        );
+    }
+
+    #[test]
+    fn rejects_network_port_zero() {
+        rejected(
+            &format!("{MINIMAL}[[capabilities.network]]\nhost = \"h\"\nports = [5432, 0]\n"),
+            &["field `capabilities.network[0].ports` must not contain port 0"],
         );
     }
 
