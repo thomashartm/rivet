@@ -18,6 +18,8 @@ ADR-0006 pins publisher keys on first install. It does not say what identifies a
 - The trusted comment of a signature is exactly `rivet-package id=<extension id> version=<version>`. Verification fails if the comment has another form, or if the id or the version differs from the package that the caller expects. For a publisher package, the publisher must be the first segment of the id.
 - Verification returns the open file that was verified. The caller reads the package from this handle and does not open the path again. The caller MUST verify a copy in a private location of the user (to enforce in #12 part 2; no check exists).
 - The project key cannot be pinned as a publisher key. A pinned key is replaced only by a separate call that the caller makes after a new review.
+- A package file larger than 256 MiB is not verified. The value is not measured.
+- A trust store file with an invalid entry does not load. No entry is skipped.
 - Failed verification, a key that differs from the pin, and a publisher without a pin give a `policy` error. Malformed or unreadable input gives a `user` error.
 
 ## Consequences
