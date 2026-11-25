@@ -31,7 +31,7 @@ Names and hosts in a manifest (Proposed, not decided by the owner; review findin
 - A filesystem scope path has one spelling (review finding R-55c). Refused: an empty component (`/a//b`, `//host/share`; the start `\\` of a UNC path stays permitted), a `.` component, a separator at the end except for a root (`/`, `C:\`, `C:/`; write `~`, not `~/`), each control character, and the same path two times, also with different access (read-write includes read).
 - The command bus does not check the name of a command. A command with a name that the manifest rule refuses can be registered, but it cannot be an activation event.
 
-Secret check of settings files (Proposed, not decided by the owner; review findings R-44, R-64, R-65; `settings.rs`; the changes are not on `main` on this date):
+Secret check of settings files (Proposed, not decided by the owner; review findings R-44, R-64, R-65; `settings.rs`; on `main` since PR #146, except where a line says otherwise):
 
 - The check is a guard against common mistakes. It is not a proof.
 - A key path is "about a secret" if the secret segment, or a key below it, comes with a word of one fixed list: `max`, `min`, `ttl`, `length`, `len`, `limit`, `count`, `size`, `timeout`, `retries`, `per`, `file`, `path`, `encryption`. Examples: `max_tokens`, `token_ttl`, `db_password_file`.
