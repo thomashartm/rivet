@@ -8,15 +8,18 @@
 //! The tests run one after the other. An argument that does not start with
 //! `-` is a filter on the test name.
 //!
-//! Only on Unix do the tests check that a process is gone (`kill -0`). On
-//! other systems the tests that only make this check do not run, the other
-//! tests skip it, and the runner says so.
+//! Only on Unix can a test check that a process is gone (`kill -0`). On
+//! other systems each test that makes this check does not run, and the
+//! runner says so.
 
-use rivet_core::bus::{CommandBus, EventBus, Received};
+#[cfg(unix)]
+use rivet_core::bus::Received;
+use rivet_core::bus::{CommandBus, EventBus};
 use rivet_core::host::{
-    ExtensionContext, ExtensionHost, ExtensionInstance, ExtensionRuntime, ExtensionState,
-    ExtensionStateChanged, HostConfig, MANIFEST_FILE, Services,
+    ExtensionContext, ExtensionInstance, ExtensionRuntime, MANIFEST_FILE, Services,
 };
+#[cfg(unix)]
+use rivet_core::host::{ExtensionHost, ExtensionState, ExtensionStateChanged, HostConfig};
 use rivet_core::jobs::JobScheduler;
 use rivet_core::logging::{LogConfig, Redactor, dispatch};
 use rivet_core::native::{
@@ -24,10 +27,13 @@ use rivet_core::native::{
     PROTOCOL_VERSION,
 };
 use rivet_core::registry::ServiceRegistry;
+#[cfg(unix)]
 use rivet_core::resolve::ActivationTrigger;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use rivet_sdk::extension::BoxFuture;
-use rivet_sdk::manifest::{ExtensionId, Manifest, Version};
+#[cfg(unix)]
+use rivet_sdk::manifest::Version;
+use rivet_sdk::manifest::{ExtensionId, Manifest};
 use rivet_sdk::secret::Secret;
 use serde_json::{Value, json};
 use std::future::Future;
@@ -35,7 +41,9 @@ use std::io::Write;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -53,11 +61,14 @@ fn child(directory: &Path) -> ! {
     let behaviour = std::fs::read_to_string(directory.join("behaviour")).unwrap();
     // One extension has one process at a time: the file `overlap` says that
     // an older process of this package directory exists.
-    let older = std::fs::read_to_string(directory.join("pids")).unwrap_or_default();
-    if let Some(older) = older.lines().last()
-        && alive(older.parse().unwrap())
+    #[cfg(unix)]
     {
-        std::fs::write(directory.join("overlap"), older).unwrap();
+        let older = std::fs::read_to_string(directory.join("pids")).unwrap_or_default();
+        if let Some(older) = older.lines().last()
+            && alive(older.parse().unwrap())
+        {
+            std::fs::write(directory.join("overlap"), older).unwrap();
+        }
     }
     let mut pids = std::fs::OpenOptions::new()
         .create(true)
@@ -131,6 +142,27 @@ fn child(directory: &Path) -> ! {
                 }
                 reply(json!({"type": "ok"}));
                 std::process::exit(0);
+            }
+            ("activate", "answer-exit-late") => {
+                // Answers when the test makes the file `go`.
+                std::fs::write(directory.join("asked"), "").unwrap();
+                let go = directory.join("go");
+                while !go.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                reply(json!({"type": "ok"}));
+                std::process::exit(0);
+            }
+            ("activate", "half-exit" | "half-exit-held") => {
+                if behaviour == "half-exit-held" {
+                    second(directory, true);
+                }
+                print!("{{\"type\":");
+                std::io::stdout().flush().unwrap();
+                std::process::exit(0);
+            }
+            ("activate", other) if other.starts_with("raw:") => {
+                println!("{}", &other["raw:".len()..]);
             }
             ("activate", "malformed") => println!("{{\"token\":\"{SECRET}\",\"type\":"),
             ("activate", "not-an-answer") => reply(json!({"type": "hello", "protocol": 1})),
@@ -260,6 +292,7 @@ impl Package {
             .collect()
     }
 
+    #[cfg(unix)]
     fn pid(&self) -> u32 {
         let pids = self.pids();
         assert_eq!(pids.len(), 1, "one process for one extension");
@@ -317,6 +350,7 @@ fn context() -> ExtensionContext {
 
 /// A real host with the native runtime. The crash callback of the runtime
 /// calls `report_crash` of the host.
+#[cfg(unix)]
 fn host(package: &Package, services: Services) -> Arc<ExtensionHost> {
     let slot: Arc<OnceLock<Weak<ExtensionHost>>> = Arc::default();
     let on_crash: CrashCallback = Arc::new({
@@ -340,6 +374,7 @@ fn host(package: &Package, services: Services) -> Arc<ExtensionHost> {
     host
 }
 
+#[cfg(unix)]
 fn state(host: &ExtensionHost) -> ExtensionState {
     host.extensions()[0].state
 }
@@ -372,11 +407,6 @@ fn alive(pid: u32) -> bool {
         .success()
 }
 
-#[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
-    false
-}
-
 /// `true` if the process has ended and nobody has read its exit status.
 #[cfg(unix)]
 fn defunct(pid: u32) -> bool {
@@ -406,6 +436,7 @@ fn internal(error: &Error) {
 // ---------------------------------------------------------------- tests
 
 /// Criteria 1, 2 and 3: the runtime works behind the contract of the host.
+#[cfg(unix)]
 async fn a_host_runs_an_extension_in_one_process() {
     let package = package("ok");
     let host = host(&package, services());
@@ -421,12 +452,10 @@ async fn a_host_runs_an_extension_in_one_process() {
     );
     assert_eq!(state(&host), ExtensionState::Active);
     let pid = package.pid();
-    #[cfg(unix)]
     assert!(alive(pid));
 
     within(host.deactivate(&id)).await.unwrap();
     assert_eq!(state(&host), ExtensionState::Inactive);
-    #[cfg(unix)]
     assert!(alive(pid));
 
     within(host.unload(&id)).await.unwrap();
@@ -435,6 +464,7 @@ async fn a_host_runs_an_extension_in_one_process() {
 }
 
 /// Criterion 2.
+#[cfg(unix)]
 async fn a_failed_handshake_is_an_error_and_leaves_no_process() {
     let mut short = config();
     short.handshake_timeout = Duration::from_millis(200);
@@ -501,6 +531,7 @@ async fn a_relative_program_path_is_refused() {
 
 /// Criteria 2 and 3: the process can refuse the handshake with its own
 /// error.
+#[cfg(unix)]
 async fn an_error_answer_to_the_handshake_is_kept_and_leaves_no_process() {
     let package = package("refuse");
     let (runtime, _crashes) = runtime(config());
@@ -537,6 +568,7 @@ async fn an_error_answer_keeps_its_category_and_its_message() {
 }
 
 /// Criterion 4.
+#[cfg(unix)]
 async fn a_failure_of_the_process_during_a_call_is_an_internal_error() {
     for (behaviour, reason) in [
         ("abort", "ended or closed its output"),
@@ -574,17 +606,9 @@ async fn a_failure_of_the_process_during_a_call_is_an_internal_error() {
 /// Criterion 4 (§5.6): the error keeps its cause, and the cause has no text
 /// of the process.
 async fn a_malformed_message_keeps_its_cause_without_text_of_the_process() {
-    let package = package("malformed");
-    let instance = loaded(&package).await;
-    let error = within(instance.activate(context())).await.unwrap_err();
-    internal(&error);
-    let cause = std::error::Error::source(&error).expect("the cause");
-    assert!(cause.is::<serde_json::Error>(), "{cause}");
-    assert!(std::error::Error::source(cause).is_none());
-    assert!(!cause.to_string().contains(SECRET), "{cause}");
-
     // The cause of each kind of malformed text is a kind and a position.
     for text in [
+        format!("{{\"token\":\"{SECRET}\",\"type\":"),
         SECRET.to_owned(),
         format!("\"{SECRET}"),
         format!("\"{SECRET}\\q\""),
@@ -597,8 +621,15 @@ async fn a_malformed_message_keeps_its_cause_without_text_of_the_process() {
         format!("\"\\u{SECRET}\""),
         format!("\"{SECRET}\u{1}\""),
     ] {
-        let cause = serde_json::from_slice::<Value>(text.as_bytes()).unwrap_err();
-        assert!(!cause.to_string().contains("hunter"), "{cause}");
+        let package = package(&format!("raw:{text}"));
+        let instance = loaded(&package).await;
+        let error = within(instance.activate(context())).await.unwrap_err();
+        internal(&error);
+        assert!(error.message().contains("malformed message"), "{error}");
+        let cause = std::error::Error::source(&error).expect("the cause");
+        assert!(cause.is::<serde_json::Error>(), "{cause}");
+        assert!(std::error::Error::source(cause).is_none());
+        assert!(!format!("{error:?} {cause} {cause:?}").contains("hunter"));
     }
 }
 
@@ -647,6 +678,106 @@ async fn an_answer_before_an_exit_is_kept() {
     }
 }
 
+/// Criterion 4 (R-104): the runtime sees the exit of the process before it
+/// sees the answer in the pipe. The answer is not lost.
+///
+/// The order is made with a runtime of one thread, as in
+/// [`an_exit_before_the_handshake_is_an_error_of_the_load_and_no_crash`]:
+/// the end of some other process wakes the supervisor task, and the test
+/// blocks the thread until the answer is in the pipe and the process has
+/// ended. Then the supervisor task runs before the runtime looks at the
+/// pipe. Where the end of some other process does not wake the supervisor
+/// task (Linux with a process file descriptor), the test makes the usual
+/// order.
+#[cfg(unix)]
+fn an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first() -> std::future::Ready<()> {
+    let package = package("answer-exit-late");
+    let single = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    single.block_on(async {
+        let (runtime, mut crashes) = runtime(config());
+        let instance = load(&runtime, &package).await.unwrap();
+        let pid = package.pid();
+        let mut activate = std::pin::pin!(within(instance.activate(context())));
+        let mut step = 0;
+        let result = std::future::poll_fn(|context| {
+            let result = activate.as_mut().poll(context);
+            if result.is_ready() {
+                return result;
+            }
+            match step {
+                // The process has the request, so the supervisor task
+                // waits for the answer and for the exit.
+                0 if package.directory.join("asked").exists() => {
+                    let other = std::process::Command::new("/bin/sleep").arg("0").status();
+                    assert!(other.unwrap().success());
+                    step = 1;
+                }
+                // The runtime has seen the end of the other process.
+                1 => {
+                    std::fs::write(package.directory.join("go"), "").unwrap();
+                    block_until(|| defunct(pid));
+                    step = 2;
+                }
+                _ => {}
+            }
+            // Polls again after each turn of the runtime, before the tasks.
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+        result.unwrap();
+        let (_, error) = within(crashes.recv()).await.unwrap();
+        assert!(error.message().contains("the process ended"), "{error}");
+    });
+    std::future::ready(())
+}
+
+/// Criterion 4 (R-104): many processes answer and exit at one time, on the
+/// runtime of the runner. This makes the order of
+/// [`an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first`] by chance,
+/// also where that test cannot make it.
+#[cfg(unix)]
+async fn answers_before_exits_are_kept_under_load() {
+    let mut lost = 0;
+    for _ in 0..10 {
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..40 {
+            calls.spawn(async {
+                let package = package("answer-exit");
+                let instance = loaded(&package).await;
+                within(instance.activate(context())).await
+            });
+        }
+        for result in calls.join_all().await {
+            lost += usize::from(result.is_err());
+        }
+    }
+    assert_eq!(lost, 0, "lost answers");
+}
+
+/// Criterion 4 (R-105): the process ends in the middle of its answer. The
+/// reason is the same with and without another process that holds the
+/// output.
+#[cfg(unix)]
+async fn half_an_answer_before_an_exit_is_an_end_of_the_process() {
+    for behaviour in ["half-exit", "half-exit-held"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, mut crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        let error = within(instance.activate(context())).await.unwrap_err();
+        internal(&error);
+        let reason = "ended or closed its output during the call";
+        assert!(error.message().contains(reason), "{behaviour}: {error}");
+        assert!(!alive(package.pid()), "{behaviour}");
+        assert!(crashes.try_recv().is_err(), "{behaviour}");
+    }
+}
+
 /// Criterion 2 (ADR-0024): the runtime reports no crash before the
 /// handshake.
 ///
@@ -689,6 +820,7 @@ fn an_exit_before_the_handshake_is_an_error_of_the_load_and_no_crash() -> std::f
 }
 
 /// Criterion 5.
+#[cfg(unix)]
 async fn a_crash_while_no_call_runs_restarts_the_extension_in_a_new_process() {
     let package = package("crash");
     let services = services();
@@ -725,7 +857,6 @@ async fn a_crash_while_no_call_runs_restarts_the_extension_in_a_new_process() {
     assert_eq!(pids.len(), 2, "{pids:?}");
     assert_ne!(pids[0], pids[1]);
     assert!(!alive(first));
-    #[cfg(unix)]
     assert!(alive(pids[1]));
 
     // `shutdown` of the host keeps the instances; `unload` drops one.
@@ -736,6 +867,7 @@ async fn a_crash_while_no_call_runs_restarts_the_extension_in_a_new_process() {
 }
 
 /// Criterion 5: a message without a request breaks the protocol.
+#[cfg(unix)]
 async fn a_message_that_answers_no_request_is_reported_as_a_crash() {
     let package = package("talk");
     let (runtime, mut crashes) = runtime(config());
@@ -752,6 +884,7 @@ async fn a_message_that_answers_no_request_is_reported_as_a_crash() {
 }
 
 /// Criterion 5: bytes without a line end break the protocol also.
+#[cfg(unix)]
 async fn bytes_without_a_line_end_while_no_call_runs_are_reported_as_a_crash() {
     let package = package("talk-no-line-end");
     let (runtime, mut crashes) = runtime(config());
@@ -765,13 +898,13 @@ async fn bytes_without_a_line_end_while_no_call_runs_are_reported_as_a_crash() {
 }
 
 /// Criterion 6.
+#[cfg(unix)]
 async fn to_drop_the_instance_ends_the_process() {
     let package = package("ok");
     let (runtime, mut crashes) = runtime(config());
     let instance = load(&runtime, &package).await.unwrap();
     within(instance.activate(context())).await.unwrap();
     let pid = package.pid();
-    #[cfg(unix)]
     assert!(alive(pid));
 
     drop(instance);
@@ -854,6 +987,7 @@ fn a_process_that_is_killed_after_the_grace_time_is_not_left_defunct() -> std::f
 }
 
 /// Criterion 6: the host drops a call that exceeds its time limit.
+#[cfg(unix)]
 async fn a_dropped_call_kills_the_process() {
     let package = package("hang");
     let instance = loaded(&package).await;
@@ -1025,13 +1159,17 @@ macro_rules! tests {
 }
 
 const TESTS: &[Test] = tests![
+    #[cfg(unix)]
     a_host_runs_an_extension_in_one_process,
+    #[cfg(unix)]
     a_failed_handshake_is_an_error_and_leaves_no_process,
     a_program_that_cannot_start_is_an_error,
     a_relative_program_path_is_refused,
     a_limit_of_zero_is_refused,
+    #[cfg(unix)]
     an_error_answer_to_the_handshake_is_kept_and_leaves_no_process,
     an_error_answer_keeps_its_category_and_its_message,
+    #[cfg(unix)]
     a_failure_of_the_process_during_a_call_is_an_internal_error,
     a_malformed_message_keeps_its_cause_without_text_of_the_process,
     #[cfg(unix)]
@@ -1041,10 +1179,20 @@ const TESTS: &[Test] = tests![
     #[cfg(unix)]
     an_answer_before_an_exit_is_kept,
     #[cfg(unix)]
+    an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first,
+    #[cfg(unix)]
+    answers_before_exits_are_kept_under_load,
+    #[cfg(unix)]
+    half_an_answer_before_an_exit_is_an_end_of_the_process,
+    #[cfg(unix)]
     an_exit_before_the_handshake_is_an_error_of_the_load_and_no_crash,
+    #[cfg(unix)]
     a_crash_while_no_call_runs_restarts_the_extension_in_a_new_process,
+    #[cfg(unix)]
     a_message_that_answers_no_request_is_reported_as_a_crash,
+    #[cfg(unix)]
     bytes_without_a_line_end_while_no_call_runs_are_reported_as_a_crash,
+    #[cfg(unix)]
     to_drop_the_instance_ends_the_process,
     #[cfg(unix)]
     a_process_that_ignores_its_closed_input_is_killed_after_the_grace_time,
@@ -1052,6 +1200,7 @@ const TESTS: &[Test] = tests![
     a_load_waits_for_the_end_of_the_old_process_of_the_extension,
     #[cfg(unix)]
     a_process_that_is_killed_after_the_grace_time_is_not_left_defunct,
+    #[cfg(unix)]
     a_dropped_call_kills_the_process,
     the_process_gets_only_the_allowed_environment,
     error_output_goes_to_the_log_as_untrusted_text,
@@ -1097,7 +1246,7 @@ fn main() -> ExitCode {
     }
     println!("\ntest result: {passed} passed; {failed} failed");
     #[cfg(not(unix))]
-    println!("warning: not Unix, so no test checked that a process is gone");
+    println!("warning: not Unix, so the tests that check that a process is gone did not run");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {

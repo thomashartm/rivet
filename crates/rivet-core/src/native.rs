@@ -41,7 +41,9 @@
 //!
 //! Control messages go over the standard input and output of the process.
 //! One message is one line of JSON of [`NativeConfig::max_message_bytes`] at
-//! most. The engine sends one request and waits for one answer.
+//! most. The engine sends one request and waits for one answer. An answer
+//! that the process wrote before its exit counts: after an exit during a
+//! call, the runtime waits [`NativeConfig::grace`] at most for the answer.
 //!
 //! | Request of the engine | Answer of the process |
 //! | --- | --- |
@@ -68,7 +70,7 @@
 //! | The program does not start | `internal` error of `load`, no process |
 //! | Wrong protocol version, or no answer in time | `internal` error of `load`, no process |
 //! | The process exits or closes a pipe before the handshake | `internal` error of `load`, no crash callback |
-//! | The process exits or closes its output during a call | `internal` error of the call |
+//! | The process exits or closes its output during a call, also in the middle of a line | `internal` error of the call |
 //! | A malformed or too large answer | `internal` error of the call |
 //! | The caller drops a call that runs | the process is killed |
 //! | After the handshake, the process exits, closes its output or sends a byte while no call runs | the crash callback |
@@ -105,7 +107,8 @@
 //! - Memory and CPU limits of the process, and OS sandboxing (§4.3).
 //! - A process that the process of the extension starts itself. The runtime
 //!   does not end it, and it does not wait for it: a pipe that such a
-//!   process holds open delays no call (ADR-0024).
+//!   process holds open delays a call by [`NativeConfig::grace`] at most
+//!   (ADR-0024).
 
 use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
 use crate::logging::Redactor;
@@ -182,9 +185,11 @@ pub struct NativeConfig {
     pub handshake_timeout: Duration,
     /// The time that the process has to exit after its input was closed.
     /// Then the runtime kills it. Also the time that the error output has
-    /// to end after the process has ended. 0 is valid: the runtime kills
-    /// the process at once, and the last lines of its error output can be
-    /// lost.
+    /// to end after the process has ended, and the time that an answer has
+    /// to arrive from the pipe after the process has ended during a call.
+    /// 0 is valid: the runtime kills the process at once, and the last
+    /// lines of its error output and an answer directly before an exit can
+    /// be lost.
     pub grace: Duration,
     /// The most bytes of one message of the process, without the line end.
     /// Not 0.
@@ -545,30 +550,28 @@ impl Process {
                 biased;
                 answer = &mut read => answer,
                 _ = self.child.wait() => {
+                    // The exit can be known before Tokio says that the pipe
+                    // has bytes, so one poll of the read is not sufficient.
                     // Another process can hold the output open, so the end
-                    // of the output can stay away. Take only what the pipe
-                    // has now.
-                    tokio::select! {
-                        biased;
-                        answer = &mut read => answer,
-                        () = std::future::ready(()) => Ok(Vec::new()),
-                    }
+                    // of the output can stay away: the wait has a limit.
+                    tokio::time::timeout(self.config.grace, &mut read)
+                        .await
+                        .unwrap_or_else(|_| Ok(Vec::new()))
                 }
             }
         }
         .map_err(|error| {
             failure(&self.id, "the output of the process cannot be read").with_source(error)
         })?;
-        let Some(answer) = answer.strip_suffix(b"\n").or_else(|| {
-            // The last line of the output can have no line end.
-            (!answer.is_empty() && answer.len() <= limit).then_some(&answer[..])
-        }) else {
+        let Some(answer) = answer.strip_suffix(b"\n") else {
             return Err(failure(
                 &self.id,
-                &if answer.is_empty() {
-                    format!("the process ended or closed its output {when}")
-                } else {
+                &if answer.len() > limit {
                     "the process sent a message that is too large".to_owned()
+                } else {
+                    // One message is one line: the output ended before the
+                    // line end.
+                    format!("the process ended or closed its output {when}")
                 },
             ));
         };
