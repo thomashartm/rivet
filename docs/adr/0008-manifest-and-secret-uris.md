@@ -35,7 +35,7 @@ Secret check of settings files (Proposed, not decided by the owner; review findi
 
 - The check is a guard against common mistakes. It is not a proof.
 - A key path is "about a secret" if the secret segment, or a key below it, comes with a word of one fixed list: `max`, `min`, `ttl`, `length`, `len`, `limit`, `count`, `size`, `timeout`, `retries`, `per`, `file`, `path`, `encryption`. Examples: `max_tokens`, `token_ttl`, `db_password_file`.
-- Position of the word (review finding R-93, not on `main` on this date): the last word of the key name is in the list (`token_ttl`, `password_file`); or the first word is `max` or `min` (`max_tokens`); or the word `per` is at any position (`tokens_per_page`). No other position counts: `file_password = "hunter2"` is refused.
+- Position of the word (review finding R-93, on `main` since PR #158): the last word of the key name is in the list (`token_ttl`, `password_file`); or the first word is `max` or `min` (`max_tokens`); or the word `per` is at any position (`tokens_per_page`). No other position counts: `file_password = "hunter2"` is refused.
 - A table key with a list word below a secret key (`[credentials] retries`, `[tokens.limit] burst`): numbers and booleans below it are accepted; a string below it must be a secret URI. So `[credentials] file = "/etc/creds"` is refused; write `credentials_file`.
 - Under a secret key that is not "about a secret": a string must be a secret URI; a number and a date are refused; a boolean is accepted.
 - Under a key "about a secret": each value type is accepted. The checks of the text (URL with a password, parameter with a secret name) still apply.
