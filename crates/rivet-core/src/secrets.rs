@@ -7,10 +7,13 @@
 
 use crate::Owner;
 use crate::logging::Redactor;
+use crate::permissions::Permissions;
 use rivet_sdk::error::{Error, Result};
+use rivet_sdk::manifest::ExtensionId;
 use rivet_sdk::secret::{Secret, SecretUri};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -292,11 +295,116 @@ impl Default for SecretStore {
     }
 }
 
+/// The secret service of one extension (§7.4): reads a secret only in a
+/// namespace that the user granted to the extension.
+///
+/// The host creates one service per extension. It is the only way for an
+/// extension to get a secret value.
+///
+/// - Each read asks [`Permissions::check_secret`] first. A denied read calls
+///   no backend.
+/// - A namespace applies to every scheme (ADR-0020), so an extension can read
+///   through a backend that another extension registered.
+/// - The service gives no access to the [`SecretStore`]: an extension cannot
+///   read out of its namespaces and cannot register or remove a backend.
+/// - The grant is read at each call. After [`Permissions::revoke`] the next
+///   read is denied. A [`Secret`] that the extension got before stays in the
+///   memory of the extension: a revoke cannot take it back. To stop the use
+///   of such a value, the host must deactivate the extension.
+/// - The service has no `forget`. The redactor is shared by the process: an
+///   extension must not remove a value that the host or another extension
+///   still holds. Only the host calls [`SecretStore::forget`].
+///
+/// ```
+/// use rivet_core::permissions::Permissions;
+/// use rivet_core::secrets::{ExtensionSecrets, SecretStore};
+/// use rivet_sdk::manifest::Manifest;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> rivet_sdk::error::Result<()> {
+/// let manifest = Manifest::parse(
+///     r#"
+///     id = "acme.postgres"
+///     version = "1.4.0"
+///     sdk = ">=0.1.0, <0.2.0"
+///
+///     [capabilities]
+///     secrets = ["acme-postgres"]
+///     "#,
+/// )?;
+/// let permissions = Arc::new(Permissions::new());
+/// permissions.grant(&manifest, manifest.capabilities.clone())?;
+/// let secrets = ExtensionSecrets::new(Arc::new(SecretStore::new()), permissions, manifest.id);
+///
+/// let denied = secrets.resolve(&"keychain://other/prod".parse()?).await;
+/// assert!(denied.is_err());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The store is not reachable:
+///
+/// ```compile_fail
+/// fn store(secrets: &rivet_core::secrets::ExtensionSecrets) {
+///     let _ = &secrets.store;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn store(secrets: &rivet_core::secrets::ExtensionSecrets) {
+///     let _: &rivet_core::secrets::SecretStore = &**secrets;
+/// }
+/// ```
+pub struct ExtensionSecrets {
+    store: Arc<SecretStore>,
+    permissions: Arc<Permissions>,
+    extension: ExtensionId,
+}
+
+impl ExtensionSecrets {
+    /// Creates the secret service of `extension`.
+    pub fn new(
+        store: Arc<SecretStore>,
+        permissions: Arc<Permissions>,
+        extension: ExtensionId,
+    ) -> Self {
+        Self {
+            store,
+            permissions,
+            extension,
+        }
+    }
+
+    /// Reads the secret that `uri` references, as [`SecretStore::resolve`]
+    /// does, if a granted namespace of the extension contains `uri`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns the `policy` error of [`Permissions::check_secret`] if the
+    ///   read is not granted. The denied read is logged and no backend is
+    ///   called.
+    /// - Returns the errors of [`SecretStore::resolve`].
+    pub async fn resolve(&self, uri: &SecretUri) -> Result<Secret> {
+        self.permissions.check_secret(&self.extension, uri)?;
+        self.store.resolve(uri).await
+    }
+}
+
+impl fmt::Debug for ExtensionSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionSecrets")
+            .field("extension", &self.extension)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::logging::{Capture, Level, LogFormat};
     use rivet_sdk::error::ErrorCategory;
+    use rivet_sdk::manifest::Manifest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::dispatcher::with_default;
     use tracing::info;
 
@@ -605,6 +713,127 @@ mod tests {
         for task in tasks {
             task.await.unwrap().unwrap();
         }
+    }
+
+    /// A backend that counts its calls.
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl SecretBackend for Counting {
+        fn resolve<'a>(&'a self, _path: &'a str) -> SecretFuture<'a> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Secret::from(String::from("hunter2-value"))) })
+        }
+    }
+
+    /// The secret service of `acme.postgres` with the granted namespace
+    /// `acme-postgres`. The scheme `aws-sm` has a counting backend that
+    /// another extension registered.
+    fn extension_secrets(
+        redactor: Redactor,
+    ) -> (ExtensionSecrets, Arc<Permissions>, Arc<Counting>) {
+        let manifest = Manifest::parse(
+            "id = \"acme.postgres\"\nversion = \"1.0.0\"\nsdk = \">=0.1.0\"\n\
+             [capabilities]\nsecrets = [\"acme-postgres\"]\n",
+        )
+        .unwrap();
+        let permissions = Arc::new(Permissions::new());
+        permissions
+            .grant(&manifest, manifest.capabilities.clone())
+            .unwrap();
+        let backend = Arc::new(Counting::default());
+        let store = Arc::new(SecretStore::with_redactor(redactor));
+        store
+            .register(owner(), "aws-sm", Arc::clone(&backend) as _)
+            .unwrap();
+        let secrets = ExtensionSecrets::new(store, Arc::clone(&permissions), manifest.id);
+        (secrets, permissions, backend)
+    }
+
+    #[tokio::test]
+    async fn an_extension_reads_a_secret_in_a_granted_namespace_only() {
+        let (secrets, _, backend) = extension_secrets(Redactor::new());
+        let secret = secrets
+            .resolve(&uri("aws-sm://acme-postgres/prod"))
+            .await
+            .unwrap();
+        assert_eq!(secret.expose(), "hunter2-value");
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+
+        // The permission check runs first: no backend is called.
+        for denied in [
+            "aws-sm://other/prod",
+            "aws-sm://acme-postgres-2/prod",
+            "aws-sm://acme-postgres/../other/prod",
+        ] {
+            let error = secrets.resolve(&uri(denied)).await.unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::Policy, "{denied}");
+        }
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_read_names_the_extension_and_the_resource_and_is_logged() {
+        let redactor = Redactor::new();
+        let (secrets, _, backend) = extension_secrets(redactor.clone());
+        let capture = Capture::default();
+        let error = {
+            let _guard = tracing::dispatcher::set_default(&capture.dispatch(
+                Level::WARN,
+                LogFormat::Human,
+                &redactor,
+            ));
+            secrets.resolve(&uri("aws-sm://other/prod")).await
+        }
+        .unwrap_err();
+
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        let output = capture.text();
+        assert_eq!(output.lines().count(), 1, "{output}");
+        for part in ["acme.postgres", "secrets", "aws-sm://other/prod"] {
+            assert!(error.message().contains(part), "no {part} in: {error}");
+            assert!(output.contains(part), "no {part} in: {output}");
+        }
+        assert!(output.contains("permission denied"), "{output}");
+        assert!(!rendered(&error).contains("hunter2"));
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_debug_form_of_the_service_shows_the_extension_only() {
+        let (secrets, _, _) = extension_secrets(Redactor::new());
+        let _secret = secrets
+            .resolve(&uri("aws-sm://acme-postgres/prod"))
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("{secrets:?}"),
+            "ExtensionSecrets { extension: ExtensionId(\"acme.postgres\"), .. }"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_from_the_service_is_registered_with_the_redactor() {
+        let redactor = Redactor::new();
+        let (secrets, _, _) = extension_secrets(redactor.clone());
+        assert_eq!(redactor.redact("hunter2-value"), "hunter2-value");
+        let _secret = secrets
+            .resolve(&uri("aws-sm://acme-postgres/prod"))
+            .await
+            .unwrap();
+        assert!(!redactor.redact("hunter2-value").contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn after_revoke_the_next_read_is_denied() {
+        let (secrets, permissions, backend) = extension_secrets(Redactor::new());
+        let granted = uri("aws-sm://acme-postgres/prod");
+        secrets.resolve(&granted).await.unwrap();
+
+        assert!(permissions.revoke(&"acme.postgres".parse().unwrap()));
+        let error = secrets.resolve(&granted).await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
     }
 
     /// Reads a real entry from the keychain of this machine.
