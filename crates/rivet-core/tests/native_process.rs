@@ -315,7 +315,7 @@ fn redactor() -> Redactor {
 /// A runtime whose crash callback sends each report to the receiver.
 fn runtime(config: NativeConfig) -> (NativeRuntime, mpsc::UnboundedReceiver<(ExtensionId, Error)>) {
     let (sender, crashes) = mpsc::unbounded_channel();
-    let on_crash: CrashCallback = Arc::new(move |id, error| {
+    let on_crash: CrashCallback = Arc::new(move |id, error, _| {
         let _ = sender.send((id, error));
     });
     let runtime = NativeRuntime::new(config, redactor(), on_crash).unwrap();
@@ -355,9 +355,9 @@ fn host(package: &Package, services: Services) -> Arc<ExtensionHost> {
     let slot: Arc<OnceLock<Weak<ExtensionHost>>> = Arc::default();
     let on_crash: CrashCallback = Arc::new({
         let slot = Arc::clone(&slot);
-        move |id, error| {
+        move |id, error, failed_at| {
             if let Some(host) = slot.get().and_then(Weak::upgrade) {
-                tokio::spawn(async move { host.report_crash(&id, error).await });
+                tokio::spawn(async move { host.report_crash(&id, error, failed_at).await });
             }
         }
     });
@@ -494,7 +494,7 @@ async fn a_program_that_cannot_start_is_an_error() {
 
 /// A limit of 0 lets no handshake and no message pass.
 async fn a_limit_of_zero_is_refused() {
-    let on_crash: CrashCallback = Arc::new(|_, _| {});
+    let on_crash: CrashCallback = Arc::new(|_, _, _| {});
     let mut no_time = config();
     no_time.handshake_timeout = Duration::ZERO;
     let mut no_bytes = config();
@@ -517,7 +517,7 @@ async fn a_limit_of_zero_is_refused() {
 
 /// Criterion 2 (ADR-0024): no search in `PATH`.
 async fn a_relative_program_path_is_refused() {
-    let on_crash: CrashCallback = Arc::new(|_, _| {});
+    let on_crash: CrashCallback = Arc::new(|_, _, _| {});
     let config = NativeConfig::new("sh");
     let error = NativeRuntime::new(config, redactor(), on_crash)
         .err()
