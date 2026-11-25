@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR-0003 says native plugins run in a separate extension host process. ARCHITECTURE.md §6.6 says control messages use a typed schema and bulk data uses Arrow IPC over a local socket. Neither fixes the process model, the message form or the limits. Part 1 of the native runtime ticket (#95) needs them. No code for it is on `main` on this date. None of the values below is measured.
+ADR-0003 says native plugins run in a separate extension host process. ARCHITECTURE.md §6.6 says control messages use a typed schema and bulk data uses Arrow IPC over a local socket. Neither fixes the process model, the message form or the limits. Part 1 of the native runtime ticket (#95) needs them. Part 1 is on `main` since PR #142 (`crates/rivet-core/src/native.rs`). Compared with that file at commit 12255a3: the environment list, the three limits (64 KiB, 5 s, 2 s), the refusal of a relative program path and the level `info` of the error output are equal to the table below. The other rows were not compared with the code. None of the values below is measured.
 
 ## Decision
 
