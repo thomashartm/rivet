@@ -1,7 +1,7 @@
 # Databases for the container tests of rivet-testkit.
 #
 #   Start: docker compose -f docker/compose.test.yml up -d --wait
-#   Test:  RIVET_TEST_CONTAINERS=1 cargo test --workspace
+#   Test:  RIVET_TEST_CONTAINERS=1 cargo test -p rivet-testkit
 #   Stop:  docker compose -f docker/compose.test.yml down -v
 #
 # TEST-ONLY CREDENTIALS. The user names and passwords below are public and

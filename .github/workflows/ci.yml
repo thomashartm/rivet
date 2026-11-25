@@ -18,8 +18,9 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # Installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - run: cargo fmt --all --check
@@ -29,18 +30,22 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
 
   containers:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: rustup toolchain install
       # PostgreSQL and MySQL for the container tests (rivet-testkit).
       - run: docker compose -f docker/compose.test.yml up -d --wait
-      - run: cargo test --workspace
+      # Only the crates with container tests; `check` runs the whole suite.
+      # Add `-p <crate>` for each driver crate that has container tests.
+      - run: cargo test -p rivet-testkit
         env:
           RIVET_TEST_CONTAINERS: "1"
       - if: always()

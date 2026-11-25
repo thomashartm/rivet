@@ -1,13 +1,14 @@
 //! The mock engine: real services, real host, recorded calls and events.
 
-use rivet_core::bus::Received;
-use rivet_core::host::ExtensionState::{self, Active, Failed, Inactive, Rejected, Resolved};
-use rivet_core::host::MANIFEST_FILE;
-use rivet_core::resolve::ActivationTrigger;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use rivet_sdk::manifest::{ExtensionId, Version, VersionReq};
-use rivet_testkit::{Behaviour, TestEngine, manifest};
+use rivet_testkit::ExtensionState::{self, Active, Failed, Inactive, Rejected, Resolved};
+use rivet_testkit::{
+    ActivationTrigger, Behaviour, ExtensionStateChanged, JobContext, MANIFEST_FILE, Received,
+    TestEngine, manifest,
+};
 use std::sync::Arc;
+use std::time::Duration;
 
 fn state(engine: &TestEngine, id: &ExtensionId) -> Option<ExtensionState> {
     let mut all = engine.host().extensions().into_iter();
@@ -21,7 +22,7 @@ fn changes(engine: &TestEngine) -> Vec<String> {
         state.map_or("none".to_owned(), |state| format!("{state:?}"))
     };
     let changes = engine.take_state_changes().unwrap();
-    let text = |change: rivet_core::host::ExtensionStateChanged| {
+    let text = |change: ExtensionStateChanged| {
         format!(
             "{}: {} -> {}",
             change.id,
@@ -268,5 +269,36 @@ async fn dependency_that_is_missing_rejects_the_extension() -> Result<()> {
     engine.host().discover().await?;
     assert_eq!(state(&engine, &id), Some(Rejected));
     assert_eq!(state(&engine, &id).filter(|state| *state == Active), None);
+    Ok(())
+}
+
+/// R-38 (c): a test that fails early drops the engine without `shutdown`.
+#[tokio::test]
+async fn dropping_the_engine_cancels_the_jobs_of_its_extensions() -> Result<()> {
+    let engine = TestEngine::new()?;
+    let behaviour = Behaviour::new().on_activate(|context| async move {
+        let until_cancelled = |job: JobContext| async move {
+            job.cancelled().await;
+            Ok(())
+        };
+        let jobs = &context.services.jobs;
+        jobs.spawn(context.owner, "acme.poll", until_cancelled)?;
+        Ok(())
+    });
+    engine.add_extension(&manifest("acme.poller", "1.0.0", &[]), behaviour)?;
+    engine.host().discover().await?;
+    let trigger = ActivationTrigger::Command("acme.poller");
+    assert_eq!(engine.host().trigger(trigger).await.activated.len(), 1);
+    let jobs = engine.services().jobs.clone();
+
+    drop(engine);
+
+    let finished = async {
+        while jobs.jobs().iter().any(|job| !job.state.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(5), finished).await;
+    assert!(finished.is_ok(), "jobs still run: {:?}", jobs.jobs());
     Ok(())
 }

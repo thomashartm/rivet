@@ -16,7 +16,7 @@
 //! The test adds an extension, drives its lifecycle through the real host
 //! and asserts the recorded calls and state changes.
 //!
-//! ```
+//! ```test_harness
 #![doc = include_str!("../tests/example.rs")]
 //! ```
 #![warn(missing_docs)]
@@ -25,8 +25,10 @@ pub mod database;
 mod engine;
 
 pub use engine::{Behaviour, TestEngine, manifest};
+pub use rivet_core::bus::{Received, Subscription};
 pub use rivet_core::host::{
     ActivationReport, ExtensionContext, ExtensionHost, ExtensionState, ExtensionStateChanged,
-    ExtensionStatus, Services,
+    ExtensionStatus, MANIFEST_FILE, Services,
 };
+pub use rivet_core::jobs::{JobContext, JobHandle, JobSnapshot, JobState, Progress};
 pub use rivet_core::resolve::ActivationTrigger;

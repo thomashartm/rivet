@@ -1,5 +1,6 @@
 //! Container tests: they need the databases of `docker/compose.test.yml`.
-//! Without `RIVET_TEST_CONTAINERS=1` each test is skipped and passes.
+//! Without `RIVET_TEST_CONTAINERS=1` each test is skipped and passes. A value
+//! that is not `1`, `0` or empty fails each test.
 
 use rivet_sdk::error::Result;
 use rivet_testkit::database::{containers_enabled, mysql, postgres};
