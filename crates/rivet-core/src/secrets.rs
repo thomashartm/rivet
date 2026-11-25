@@ -8,6 +8,7 @@
 use crate::Owner;
 use crate::logging::{MIN_REDACTED_LEN, Redactor};
 use crate::permissions::Permissions;
+use crate::wasm::guest_text;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use rivet_sdk::manifest::ExtensionId;
 use rivet_sdk::secret::{Secret, SecretUri};
@@ -29,9 +30,10 @@ pub(crate) const BUILT_IN_SCHEMES: [&str; 2] = ["aws-sm", "gcp-sm"];
 /// The publisher segment of the built-in extensions.
 const BUILT_IN_PUBLISHER: &str = "rivet";
 
-/// The time limit of one read of a backend: the default of the call time
-/// limit of an extension (ADR-0021). A read that takes longer fails with a
-/// `retryable` error (ADR-0020).
+/// The time limit of one read through [`ExtensionSecrets`]: the default of
+/// the call time limit of an extension (ADR-0021). A read that takes longer
+/// fails with a `retryable` error, and the future of the backend is dropped
+/// (ADR-0020). The extension is not failed for it.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The maximum number of different secret values that the [`Redactor`] holds
@@ -39,8 +41,7 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// slower, so the number has a limit.
 pub const MAX_VALUES_PER_OWNER: usize = 256;
 
-/// Text that an extension controls (a URI, the error text of a backend) is
-/// cut to this length in an error.
+/// A URI is cut to this length in an error.
 /// The same limit as for a resource in a permission error.
 const MAX_SHOWN_BYTES: usize = crate::permissions::MAX_RESOURCE_BYTES;
 
@@ -157,7 +158,6 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
 /// - `keychain` is registered from the start ([`KeychainBackend`]). It has
 ///   no owner, so it cannot be removed.
 /// - The store has no cache. Each call reads the backend again (§6.4).
-/// - A read has the time limit [`READ_TIMEOUT`].
 /// - All methods take `&self` and are safe for concurrent use. Share the
 ///   store in an [`Arc`].
 ///
@@ -177,8 +177,9 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
 /// memory that is set to zero, at most [`MAX_VALUES_PER_OWNER`] values. A
 /// read of one more value is refused.
 ///
-/// A value that is equal to the id of the reading extension or of an
-/// extension that has a backend is refused with a `policy` error: to hide
+/// A value from a backend of an extension that is equal to the id of the
+/// reading extension or of an extension that has a backend is refused with
+/// a `policy` error. A value from the keychain is always registered. To hide
 /// it would hide the id in the audit log. Known limit: a backend of an
 /// extension can still return other words of a log line as values, and the
 /// log then hides these words.
@@ -349,21 +350,21 @@ impl SecretStore {
 
     /// Reads the secret that `uri` references from the backend of its scheme.
     ///
-    /// The store has no cancel request for a backend: after
-    /// [`READ_TIMEOUT`] the future of the backend is dropped.
+    /// This read has no time limit: the caller sets one. A read of an
+    /// extension has the limit [`READ_TIMEOUT`].
     ///
     /// # Errors
     ///
     /// - Returns a `user` error that names the scheme if no backend is
     ///   registered for it.
-    /// - Returns a `retryable` error if the backend does not answer in
-    ///   [`READ_TIMEOUT`].
     /// - Returns the error of the backend if the backend fails. The error of
     ///   a backend of an extension keeps its category only: its text is
-    ///   redacted, cut and escaped, and it follows a text of the store that
-    ///   names the scheme. Its source is dropped.
-    /// - Returns a `policy` error if the value is equal to the id of an
-    ///   extension that has a backend. See [Redaction](Self#redaction).
+    ///   redacted, cleaned and cut as each text from an extension, and it
+    ///   follows a text of the store that names the scheme. Its source is
+    ///   dropped.
+    /// - Returns a `policy` error if a backend of an extension returns a
+    ///   value that is equal to the id of an extension that has a backend.
+    ///   See [Redaction](Self#redaction).
     pub async fn resolve(&self, uri: &SecretUri) -> Result<Secret> {
         self.resolve_for(None, uri).await
     }
@@ -389,19 +390,12 @@ impl SecretStore {
                     shown(scheme)
                 ))
             })?;
-        let secret = match tokio::time::timeout(READ_TIMEOUT, backend.resolve(uri.path())).await {
-            Err(_) => {
-                return Err(Error::retryable(format!(
-                    "the secret backend for the scheme `{}` did not answer in {} s",
-                    shown(scheme),
-                    READ_TIMEOUT.as_secs()
-                )));
-            }
-            Ok(Err(error)) if of_extension => return Err(self.backend_error(scheme, &error)),
-            Ok(result) => result?,
+        let secret = match backend.resolve(uri.path()).await {
+            Err(error) if of_extension => return Err(self.backend_error(scheme, &error)),
+            result => result?,
         };
         if let Some(redactor) = &self.redactor {
-            self.register_value(redactor, reader, &secret)?;
+            self.register_value(redactor, reader, of_extension, &secret)?;
         }
         Ok(secret)
     }
@@ -409,12 +403,8 @@ impl SecretStore {
     /// Builds the error for a failure of a backend of an extension. The text
     /// of such a backend is text from a guest (ADR-0020).
     fn backend_error(&self, scheme: &str, error: &Error) -> Error {
-        // Redaction is before the cut, so the cut cannot leave a part of a
-        // secret that the redacting log writer does not find.
-        let text = match &self.redactor {
-            Some(redactor) => shown(&redactor.redact(error.message())),
-            None => shown(error.message()),
-        };
+        let redactor = self.redactor.clone().unwrap_or_default();
+        let text = guest_text(&redactor, error.message());
         let message = format!(
             "the secret backend for the scheme `{}` failed: {text}",
             shown(scheme)
@@ -441,17 +431,20 @@ impl SecretStore {
         &self,
         redactor: &Redactor,
         reader: Option<&Owner>,
+        of_extension: bool,
         secret: &Secret,
     ) -> Result<()> {
         let value = secret.expose();
         let is_id = |id: Option<&Owner>| id.is_some_and(|id| id.as_str() == value);
-        let is_known_id = is_id(reader)
-            || self
-                .backends
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .values()
-                .any(|registration| is_id(registration.owner.as_ref()));
+        // A value of the keychain backend is always registered (ADR-0020).
+        let is_known_id = of_extension
+            && (is_id(reader)
+                || self
+                    .backends
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .values()
+                    .any(|registration| is_id(registration.owner.as_ref())));
         if is_known_id {
             // The text has no value and no id: the value is the id.
             return Err(Error::policy(
@@ -621,13 +614,24 @@ impl ExtensionSecrets {
     ///   called.
     /// - Returns the same error if the grant ends during the read of the
     ///   backend.
+    /// - Returns a `retryable` error if the backend does not answer in
+    ///   [`READ_TIMEOUT`].
     /// - Returns the errors of [`SecretStore::resolve`].
     /// - Returns a `policy` error if the value is equal to the id of the
     ///   extension, or if the extension has read
     ///   [`MAX_VALUES_PER_OWNER`] different values and this is a new one.
     pub async fn resolve(&self, uri: &SecretUri) -> Result<Secret> {
         self.permissions.check_secret(&self.extension, uri)?;
-        let secret = self.store.resolve_for(Some(&self.extension), uri).await?;
+        let read = self.store.resolve_for(Some(&self.extension), uri);
+        let secret = tokio::time::timeout(READ_TIMEOUT, read)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::retryable(format!(
+                    "the secret backend for the scheme `{}` did not answer in {} s",
+                    shown(uri.scheme()),
+                    READ_TIMEOUT.as_secs()
+                )))
+            })?;
         // The grant can end while the backend works. The value is dropped
         // here; it stays registered with the redactor.
         self.permissions.check_secret(&self.extension, uri)?;
@@ -1154,12 +1158,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_backend_that_does_not_answer_fails_after_the_time_limit() {
-        let store = SecretStore::new();
-        store
-            .register(owner(), "aws-sm", Arc::new(Gated::default()))
-            .unwrap();
+        let (secrets, _, _) = service_with(&Redactor::new(), Arc::new(Gated::default()));
         let start = tokio::time::Instant::now();
-        let error = store.resolve(&uri("aws-sm://prod/db")).await.unwrap_err();
+        let read = uri("aws-sm://acme-postgres/prod");
+        let error = secrets.resolve(&read).await.unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Retryable);
         assert!(error.message().contains("`aws-sm`"), "{error}");
         assert_eq!(start.elapsed(), READ_TIMEOUT);
@@ -1354,13 +1356,14 @@ mod tests {
         // text of the backend: redacted, cut, and with no control character.
         assert_eq!(error.category(), ErrorCategory::Auth);
         let start = "the secret backend for the scheme `aws-sm` failed: \
-                     denied\\n\\u{1b}[2J for [REDACTED] xxx";
+                     denied  [2J for [REDACTED] xxx";
         assert!(
             error.message().starts_with(start),
             "{:.120}",
             error.message()
         );
-        assert!(error.message().len() < MAX_SHOWN_BYTES + 300);
+        // The limit of each text from an extension: 8 KiB.
+        assert!(error.message().len() < 8 * 1024 + 300);
         assert!(!rendered(&error).contains("unknown content"));
     }
 
