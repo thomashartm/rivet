@@ -26,6 +26,7 @@ Weak keys (review fix, not on `main` on this date):
 
 - A public key that is a point of small order, or that is not in the canonical encoding (y not less than p), is refused when it is parsed, with a `user` error. This applies to the project key, a pinned key, a key file and each entry of the trust store.
 - Reason: with a key of small order, a signature that nobody signed can verify.
+- A signature whose point R has a small order is accepted when the key is valid. Only the owner of the secret key can make it, so it is not a forgery. The project does not need one unique signature per package, so there is no check for it.
 - The check is a fixed list of encodings in `package.rs`. No new crate. The list was not checked for this ADR; the tests of the fix must show that each listed encoding is refused and that the forged signature of the review finding does not verify.
 
 ## Consequences
