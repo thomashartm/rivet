@@ -4,8 +4,10 @@
 //! - [`EventBus`]: publish/subscribe of typed events, at-most-once per
 //!   subscriber, with bounded buffers.
 //!
-//! An event subscription has no owner. It ends when its [`Subscription`] is
-//! dropped.
+//! An event subscription ends when its [`Subscription`] is dropped. A
+//! subscription of an extension has an owner
+//! ([`EventBus::subscribe_owned`]), so that the host can end it when the
+//! extension stops ([`EventBus::unsubscribe_owner`], §5.2).
 
 use crate::Owner;
 use rivet_sdk::error::{Error, Result};
@@ -14,8 +16,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroU16;
 use std::pin::Pin;
-use std::sync::{Arc, PoisonError, RwLock};
-use tokio::sync::broadcast;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use tokio::sync::{broadcast, oneshot};
 
 type Handler<A, R> =
     Arc<dyn Fn(A) -> Pin<Box<dyn Future<Output = Result<R>> + Send>> + Send + Sync>;
@@ -179,6 +181,9 @@ pub struct EventBus {
     capacity: usize,
     /// One `broadcast::Sender<E>` for each event type `E`.
     channels: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    /// One entry for each subscription that has an owner. To send on it
+    /// closes the subscription.
+    owned: Mutex<Vec<(Owner, oneshot::Sender<()>)>>,
 }
 
 impl EventBus {
@@ -188,6 +193,7 @@ impl EventBus {
         Self {
             capacity: capacity.get().into(),
             channels: RwLock::default(),
+            owned: Mutex::default(),
         }
     }
 
@@ -209,7 +215,7 @@ impl EventBus {
     }
 
     /// Subscribes to the events of the type `E` that are published from now
-    /// on.
+    /// on. The subscription has no owner: it is for the core itself.
     pub fn subscribe<E>(&self) -> Subscription<E>
     where
         E: Clone + Send + 'static,
@@ -229,7 +235,44 @@ impl EventBus {
                 receiver
             }
         };
-        Subscription { receiver }
+        Subscription {
+            receiver: Some(receiver),
+            closed: None,
+        }
+    }
+
+    /// Subscribes like [`subscribe`](Self::subscribe), for the extension
+    /// `owner`. [`unsubscribe_owner`](Self::unsubscribe_owner) closes the
+    /// subscription.
+    pub fn subscribe_owned<E>(&self, owner: Owner) -> Subscription<E>
+    where
+        E: Clone + Send + 'static,
+    {
+        let mut subscription = self.subscribe();
+        let (close, closed) = oneshot::channel();
+        subscription.closed = Some(closed);
+        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        // The entries of dropped subscriptions must not collect.
+        owned.retain(|(_, close)| !close.is_closed());
+        owned.push((owner, close));
+        subscription
+    }
+
+    /// Closes every subscription of `owner`: each receives nothing more,
+    /// also no event that is in its buffer. Returns how many were closed.
+    ///
+    /// [`publish`](Self::publish) counts a closed subscription until its
+    /// owner drops it or calls [`Subscription::recv`] again.
+    pub fn unsubscribe_owner(&self, owner: &Owner) -> usize {
+        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        let (closing, kept) = owned.drain(..).partition(|(of, _)| of == owner);
+        *owned = kept;
+        let closing: Vec<(Owner, oneshot::Sender<()>)> = closing;
+        // A send fails only if the subscription was dropped before.
+        let closed = closing
+            .into_iter()
+            .filter_map(|(_, close)| close.send(()).ok());
+        closed.count()
     }
 }
 
@@ -243,16 +286,39 @@ pub enum Received<E> {
     Missed(u64),
 }
 
-/// The receiving end of [`EventBus::subscribe`]. Drop it to unsubscribe.
+/// The receiving end of [`EventBus::subscribe`] and
+/// [`EventBus::subscribe_owned`]. Drop it to unsubscribe.
 pub struct Subscription<E> {
-    receiver: broadcast::Receiver<E>,
+    /// `None` after [`EventBus::unsubscribe_owner`] closed the subscription.
+    receiver: Option<broadcast::Receiver<E>>,
+    /// `Some` while the subscription has an owner and is open.
+    closed: Option<oneshot::Receiver<()>>,
 }
 
 impl<E: Clone> Subscription<E> {
     /// Waits for the next event. Returns `None` when the [`EventBus`] was
-    /// dropped and no buffered event is left.
+    /// dropped and no buffered event is left, or when
+    /// [`EventBus::unsubscribe_owner`] closed the subscription.
     pub async fn recv(&mut self) -> Option<Received<E>> {
-        match self.receiver.recv().await {
+        let received = loop {
+            let receiver = self.receiver.as_mut()?;
+            let Some(closed) = &mut self.closed else {
+                break receiver.recv().await;
+            };
+            tokio::select! {
+                biased;
+                signal = closed => {
+                    self.closed = None;
+                    // An error means that the bus was dropped: the events
+                    // in the buffer are still delivered.
+                    if signal.is_ok() {
+                        self.receiver = None;
+                    }
+                }
+                received = receiver.recv() => break received,
+            }
+        };
+        match received {
             Ok(event) => Some(Received::Event(event)),
             Err(broadcast::error::RecvError::Lagged(missed)) => Some(Received::Missed(missed)),
             Err(broadcast::error::RecvError::Closed) => None,
@@ -484,6 +550,47 @@ mod tests {
             assert_eq!(slow.recv().await, Some(Received::Event(SchemaChanged(n))));
         }
         assert_eq!(slow.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_owner_closes_the_subscriptions_of_that_owner_only() {
+        let bus = Arc::new(EventBus::new(capacity(8)));
+        let (a, b) = (owner("ext.a"), owner("ext.b"));
+        let mut of_a = bus.subscribe_owned::<SchemaChanged>(a.clone());
+        let mut lost_of_a = bus.subscribe_owned::<ConnectionLost>(a.clone());
+        let mut waiting = bus.subscribe_owned::<ConnectionLost>(a.clone());
+        let mut of_b = bus.subscribe_owned::<SchemaChanged>(b.clone());
+        let mut core = bus.subscribe::<SchemaChanged>();
+        // A subscription that its owner dropped is not counted.
+        drop(bus.subscribe_owned::<SchemaChanged>(a.clone()));
+        let waiting = tokio::spawn(async move { waiting.recv().await });
+        tokio::task::yield_now().await;
+        bus.publish(SchemaChanged(1));
+
+        assert_eq!(bus.unsubscribe_owner(&a), 3);
+        assert_eq!(bus.unsubscribe_owner(&a), 0);
+        bus.publish(SchemaChanged(2));
+        bus.publish(ConnectionLost("db1"));
+
+        // Closed: not the event in the buffer, and not a later event.
+        assert_eq!(of_a.recv().await, None);
+        assert_eq!(of_a.recv().await, None);
+        assert_eq!(lost_of_a.recv().await, None);
+        // A `recv` call that waited ends.
+        assert_eq!(waiting.await.expect("task"), None);
+        // After the next `recv` call, the closed subscription is not counted.
+        assert_eq!(bus.publish(SchemaChanged(3)), 2);
+        for open in [&mut of_b, &mut core] {
+            for n in 1..=3 {
+                assert_eq!(open.recv().await, Some(Received::Event(SchemaChanged(n))));
+            }
+        }
+
+        // An owned subscription still gets the buffered events of a dropped bus.
+        bus.publish(SchemaChanged(4));
+        drop(bus);
+        assert_eq!(of_b.recv().await, Some(Received::Event(SchemaChanged(4))));
+        assert_eq!(of_b.recv().await, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
