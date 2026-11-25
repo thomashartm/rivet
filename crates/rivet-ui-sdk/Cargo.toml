@@ -1,0 +1,13 @@
+[package]
+name = "rivet-ui-sdk"
+description = "Public UI extension contract for rivet: views, commands, panels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rivet-sdk = { path = "../rivet-sdk" }
