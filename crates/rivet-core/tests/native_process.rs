@@ -51,6 +51,14 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The child process: speaks the protocol on its standard input and output.
 fn child(directory: &Path) -> ! {
     let behaviour = std::fs::read_to_string(directory.join("behaviour")).unwrap();
+    // One extension has one process at a time: the file `overlap` says that
+    // an older process of this package directory exists.
+    let older = std::fs::read_to_string(directory.join("pids")).unwrap_or_default();
+    if let Some(older) = older.lines().last()
+        && alive(older.parse().unwrap())
+    {
+        std::fs::write(directory.join("overlap"), older).unwrap();
+    }
     let mut pids = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -795,16 +803,25 @@ async fn a_load_waits_for_the_end_of_the_old_process_of_the_extension() {
     let package = package("stubborn");
     let mut config = config();
     config.grace = Duration::from_millis(500);
-    let (runtime, _crashes) = runtime(config);
+    let (runtime, mut crashes) = runtime(config);
     let instance = load(&runtime, &package).await.unwrap();
     let old = package.pid();
+
+    // A different extension does not wait for this one.
+    let mut other = self::package("ok");
+    other.manifest.id = "acme.other".parse().unwrap();
+    let _other = load(&runtime, &other).await.unwrap();
 
     // The old process ignores its closed input: it lives for the grace
     // time.
     drop(instance);
     let _instance = load(&runtime, &package).await.unwrap();
-    assert!(!alive(old), "two processes for one extension");
+    assert!(!alive(old));
     assert_eq!(package.pids().len(), 2);
+    // The new process looked for the old process when it started.
+    assert!(!package.directory.join("overlap").exists());
+    // The runtime ended the old process itself: that is no crash.
+    assert!(crashes.try_recv().is_err());
 }
 
 /// Criterion 6: the supervisor reads the exit status of the process that it

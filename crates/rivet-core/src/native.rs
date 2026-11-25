@@ -183,7 +183,8 @@ pub struct NativeConfig {
     /// The time that the process has to exit after its input was closed.
     /// Then the runtime kills it. Also the time that the error output has
     /// to end after the process has ended. 0 is valid: the runtime kills
-    /// the process at once.
+    /// the process at once, and the last lines of its error output can be
+    /// lost.
     pub grace: Duration,
     /// The most bytes of one message of the process, without the line end.
     /// Not 0.
@@ -210,10 +211,36 @@ pub struct NativeRuntime {
     config: NativeConfig,
     redactor: Redactor,
     on_crash: CrashCallback,
-    /// One permit for each extension: the supervisor task of its process
-    /// has it. An entry stays after the unload: the map has one entry for
-    /// each extension that was loaded.
-    slots: Mutex<HashMap<ExtensionId, Arc<Semaphore>>>,
+    slots: Arc<Slots>,
+}
+
+/// One permit for each extension that has a process or a load that waits.
+/// See [`Slot`].
+type Slots = Mutex<HashMap<ExtensionId, Arc<Semaphore>>>;
+
+/// The right to run the one process of an extension (ADR-0024). The
+/// supervisor task of the process keeps it to its end. The drop lets the
+/// next load of the extension continue.
+struct Slot {
+    id: ExtensionId,
+    slots: Arc<Slots>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for Slot {
+    /// Removes the entry of the extension if no load waits for it, so the
+    /// map does not grow.
+    fn drop(&mut self) {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        // The two owners are the map and the permit of this slot. A load
+        // that waits is one more, and it became one with this lock held.
+        if slots
+            .get(&self.id)
+            .is_some_and(|slot| Arc::strong_count(slot) == 2)
+        {
+            slots.remove(&self.id);
+        }
+    }
 }
 
 impl NativeRuntime {
@@ -247,13 +274,13 @@ impl NativeRuntime {
             config,
             redactor,
             on_crash,
-            slots: Mutex::default(),
+            slots: Arc::default(),
         })
     }
 
-    /// Waits until no process of `id` runs. The result lets one process
-    /// run: the supervisor task keeps it to its end.
-    async fn slot(&self, id: &ExtensionId) -> Result<OwnedSemaphorePermit> {
+    /// Waits until no process of `id` runs. A load of a different
+    /// extension does not wait, and no lock is held during the wait.
+    async fn slot(&self, id: &ExtensionId) -> Result<Slot> {
         let slot = {
             let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(
@@ -263,9 +290,15 @@ impl NativeRuntime {
             )
         };
         // Nothing closes the semaphore.
-        slot.acquire_owned()
+        let permit = slot
+            .acquire_owned()
             .await
-            .map_err(|error| failure(id, "the process slot is closed").with_source(error))
+            .map_err(|error| failure(id, "the process slot is closed").with_source(error))?;
+        Ok(Slot {
+            id: id.clone(),
+            slots: Arc::clone(&self.slots),
+            _permit: permit,
+        })
     }
 }
 
@@ -397,7 +430,7 @@ async fn supervise(
     on_crash: CrashCallback,
     // Free at the end of this task: then the next process of the extension
     // can start.
-    _slot: OwnedSemaphorePermit,
+    _slot: Slot,
 ) {
     // An end of the process is a crash only after the handshake. Before
     // it, the answer to `hello` gives the error (ADR-0024).
