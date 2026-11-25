@@ -27,7 +27,7 @@ struct Registration {
 ///
 /// let registry = ServiceRegistry::new();
 /// let service: Arc<str> = Arc::from("hello");
-/// registry.register("ext.a".into(), "greeting", Version::new(1, 2, 0), service)?;
+/// registry.register("ext.a".parse()?, "greeting", Version::new(1, 2, 0), service)?;
 ///
 /// let range = VersionReq::parse("^1")?;
 /// let found = registry.lookup::<str>("greeting", &range)?;
@@ -186,7 +186,7 @@ mod tests {
     }
 
     fn owner(text: &str) -> Owner {
-        text.into()
+        text.parse().expect("valid extension id")
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
             .map(|n| {
                 let registry = Arc::clone(&registry);
                 tokio::spawn(async move {
-                    let owner = format!("ext.{}", n % 4);
+                    let owner = owner(&format!("ext.{}", n % 4));
                     registry
                         .register(owner, "number", Version::new(1, n, 0), Arc::new(n))
                         .expect("register");
@@ -359,7 +359,7 @@ mod tests {
             31
         );
         let removed: usize = (0..4)
-            .map(|n| registry.unregister_owner(&format!("ext.{n}")))
+            .map(|n| registry.unregister_owner(&owner(&format!("ext.{n}"))))
             .sum();
         assert_eq!(removed, 32);
     }
