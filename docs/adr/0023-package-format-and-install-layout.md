@@ -13,9 +13,9 @@ Package file:
 
 - A package is one file `<id>-<version>.rivetpkg` with a detached signature `<id>-<version>.rivetpkg.minisig`.
 - The file is an uncompressed tar archive. It is read with the crate `tar` (default features off). Its licence was not checked for this ADR; the `cargo-deny` job in CI is the check.
-- The archive has exactly three entries: `extension.toml`, `extension.wasm`, `LICENSE`. Each is a regular file. Every other entry name or entry type is refused.
+- The archive has exactly three entries: `extension.toml`, `extension.wasm`, `LICENSE`. Each is a regular file. Every other entry name or entry type is refused. `LICENSE` is required, but its content is not checked, and the manifest has no licence field.
 - The "SDK docs reference" of §4.8 is the `sdk` version range in the manifest. The package has no separate file for it.
-- Entries for native libraries are not defined. They come with the native runtime (#95).
+- Entries for native libraries are not defined. They come with the native runtime (#95). So the part "native libraries per target" of the package format criterion of ticket #12 is not met.
 - The installer writes each file itself. It ignores the modes, owners and times of the archive. It counts the bytes while it copies. The entry `extension.wasm` has at most the component size limit of the WASM runtime (ADR-0018; one constant, so a package that installs can load). On `main` since PR #153 (128 MiB before). The installer uses the default of the runtime; a runtime with a lower limit refuses such a package at load (ADR-0018). Also: the manifest and the licence have at most 1 MiB each.
 - After extraction, the id and the version of the manifest must equal the id and the version in the signature.
 
