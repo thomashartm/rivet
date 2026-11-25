@@ -1,0 +1,67 @@
+# Example extension manifest (ARCHITECTURE.md §4.4, ADR-0008).
+# The file name is always `extension.toml`. Unknown fields are rejected.
+
+# Required. Lowercase letters, digits and `-`, in segments separated by `.`.
+id = "acme.postgres"
+
+# Required. The version of this extension (semver).
+version = "1.4.0"
+
+# Required. The SDK versions this extension supports (semver range).
+sdk = ">=0.1.0, <0.2.0"
+
+# Optional, default false. Must be true when a `ui-*` point is contributed.
+# An extension with `requires_ui = true` does not activate in a headless process.
+requires_ui = true
+
+# Optional. Other extensions this extension needs: extension id -> semver range.
+[dependencies]
+"acme.aws-auth" = "^2.1"
+
+# Optional. One table per contributed extension point.
+# kind: driver, auth-provider, credential-source, tunnel-provider,
+#       metadata-provider, result-sink, importer, exporter, model-provider,
+#       script-engine, cli-command, api-endpoint, ui-view, ui-command, ui-panel.
+# id:   the name of the contribution inside this extension.
+[[contributes]]
+kind = "driver"
+id = "postgres"
+
+[[contributes]]
+kind = "cli-command"
+id = "pg-vacuum"
+
+[[contributes]]
+kind = "ui-panel"
+id = "pg-activity"
+
+# Optional. The events that activate this extension (activation is lazy).
+[[activation]]
+on = "extension-point" # first use of a contributed extension point
+
+[[activation]]
+on = "command" # the named command is invoked
+command = "pg.vacuum"
+
+[[activation]]
+on = "connection" # a connection of this type is opened
+type = "postgres"
+
+# Optional. The permissions this extension needs (§4.7). Default: none.
+[capabilities]
+secrets = ["acme-postgres"]    # secret namespaces
+clipboard = ["read", "write"]  # read, write or both
+
+# Network allowlist: one host and its ports per table.
+[[capabilities.network]]
+host = "db.example.com"
+ports = [5432, 6432]
+
+# Filesystem scopes: access is "read" or "read-write".
+[[capabilities.filesystem]]
+path = "~/.postgresql"
+access = "read"
+
+[[capabilities.filesystem]]
+path = "~/.cache/acme-postgres"
+access = "read-write"

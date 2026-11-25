@@ -10,4 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 zeroize = "1.9.2"
