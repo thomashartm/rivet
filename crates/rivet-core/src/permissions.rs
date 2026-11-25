@@ -248,10 +248,17 @@ impl Permissions {
     ///   the review.
     /// - The extension has no grant: all capabilities of `manifest` are
     ///   returned and no grant is created.
-    pub fn review_update(&self, manifest: &Manifest) -> Capabilities {
+    ///
+    /// # Errors
+    ///
+    /// Returns a `user` error if a capability of `manifest` is not valid (a
+    /// manifest that [`Manifest::parse`] did not build). The grant of the
+    /// extension does not change.
+    pub fn review_update(&self, manifest: &Manifest) -> Result<Capabilities> {
+        manifest.capabilities.validate()?;
         let mut grants = self.write();
         let Some(grant) = grants.get_mut(&manifest.id) else {
-            return manifest.capabilities.clone();
+            return Ok(manifest.capabilities.clone());
         };
         let added = added_capabilities(&grant.requested, &manifest.capabilities);
         if added.is_empty() {
@@ -260,7 +267,7 @@ impl Permissions {
         } else {
             grants.remove(&manifest.id);
         }
-        added
+        Ok(added)
     }
 
     /// Checks that `extension` may connect to `host` on `port`.
@@ -1542,13 +1549,32 @@ mod tests {
         assert!(added_capabilities(&new, &old).is_empty());
     }
 
+    // R-85: the review stores the requested set, so it has the check of the grant.
+    #[test]
+    fn a_review_of_an_invalid_manifest_is_refused_and_keeps_the_grant() {
+        let (permissions, id) = granted(REQUESTED);
+        let mut update = manifest(REQUESTED);
+        update.capabilities.network[0].ports.push(0);
+        let error = permissions.review_update(&update).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        assert!(
+            permissions
+                .review_update(&manifest(REQUESTED))
+                .unwrap()
+                .is_empty()
+        );
+        permissions
+            .check_network(&id, "db.example.com", 5432)
+            .unwrap();
+    }
+
     #[test]
     fn an_update_that_adds_a_capability_removes_the_grant() {
         let (permissions, id) = granted(REQUESTED);
         let update = manifest(&format!(
             "{REQUESTED}[[capabilities.network]]\nhost = \"replica.example.com\"\nports = [5432]\n"
         ));
-        let added = permissions.review_update(&update);
+        let added = permissions.review_update(&update).unwrap();
         assert_eq!(added.network.len(), 1);
         assert_eq!(added.network[0].host, "replica.example.com");
         let mut rest = added.clone();
@@ -1557,21 +1583,29 @@ mod tests {
         assert_no_access(&permissions, &id);
 
         // Without a grant, the review lists all capabilities.
-        assert_eq!(permissions.review_update(&update), update.capabilities);
+        assert_eq!(
+            permissions.review_update(&update).unwrap(),
+            update.capabilities
+        );
         assert_no_access(&permissions, &id);
     }
 
     #[test]
     fn an_update_that_adds_nothing_keeps_the_grant() {
         let (permissions, id) = granted(REQUESTED);
-        assert!(permissions.review_update(&manifest(REQUESTED)).is_empty());
+        assert!(
+            permissions
+                .review_update(&manifest(REQUESTED))
+                .unwrap()
+                .is_empty()
+        );
         permissions
             .check_network(&id, "db.example.com", 5432)
             .unwrap();
 
         // The new version requests less: the grant follows.
         let less = manifest("[capabilities]\nclipboard = [\"read\"]\n");
-        assert!(permissions.review_update(&less).is_empty());
+        assert!(permissions.review_update(&less).unwrap().is_empty());
         permissions
             .check_clipboard(&id, ClipboardAccess::Read)
             .unwrap();
@@ -1594,7 +1628,7 @@ mod tests {
         let permissions = Permissions::new();
         permissions.grant(&requested, partial()).unwrap();
 
-        assert!(permissions.review_update(&requested).is_empty());
+        assert!(permissions.review_update(&requested).unwrap().is_empty());
         permissions.check_secret(id, &secret).unwrap();
         // The review does not grant what the user did not grant.
         assert_denied(
@@ -1606,7 +1640,7 @@ mod tests {
         let more =
             manifest(&REQUEST.replace("[\"acme-postgres\"]", "[\"acme-postgres\", \"aws\"]"));
         assert_eq!(
-            permissions.review_update(&more),
+            permissions.review_update(&more).unwrap(),
             Capabilities::new().with_secrets(["aws".to_owned()])
         );
         assert_no_access(&permissions, id);
@@ -1614,10 +1648,10 @@ mod tests {
         // The new version requests less: the partial grant is cut.
         permissions.grant(&requested, partial()).unwrap();
         let less = manifest("[capabilities]\nclipboard = [\"read\", \"write\"]\n");
-        assert!(permissions.review_update(&less).is_empty());
+        assert!(permissions.review_update(&less).unwrap().is_empty());
         assert_no_access(&permissions, id);
         // The cut request is the base of the next review.
-        assert_eq!(permissions.review_update(&requested), partial());
+        assert_eq!(permissions.review_update(&requested).unwrap(), partial());
     }
 
     #[test]
@@ -1625,7 +1659,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (permissions, id) = granted(&filesystem(&[(dir.path(), "read-write")]));
         let read_only = manifest(&filesystem(&[(dir.path(), "read")]));
-        assert!(permissions.review_update(&read_only).is_empty());
+        assert!(permissions.review_update(&read_only).unwrap().is_empty());
         permissions
             .check_filesystem(&id, dir.path(), FilesystemAccess::Read)
             .unwrap();
