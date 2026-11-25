@@ -11,5 +11,7 @@
 | [0007](0007-scripting-adapters.md) | Scripting: adapter framework, Rhai first | Accepted |
 | [0008](0008-manifest-and-secret-uris.md) | Manifest name and secret URI scheme | Accepted |
 | [0009](0009-crate-layout.md) | Crate layout | Accepted |
+| [0010](0010-architecture-check.md) | Architecture check with xtask | Accepted |
+| [0011](0011-control-api-token-scopes.md) | Control API token scopes | Accepted |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.

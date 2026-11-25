@@ -2,7 +2,7 @@
 
 This document defines the core architecture of the database client described in [MISSION.md](MISSION.md). Constraints use the keywords MUST, MUST NOT, SHOULD and MAY as defined in RFC 2119 (see [§10](#10-architectural-governance)).
 
-Accepted decisions are recorded as ADRs in [`docs/adr/`](docs/adr/) and listed in [Decisions](#decisions). Items marked **(proposed)** are not decided yet and are listed in [Open Decisions](#open-decisions).
+Accepted decisions are recorded as ADRs in [`docs/adr/`](docs/adr/) and listed in [Decisions](#decisions).
 
 ## 1. Architectural Principles
 
@@ -139,7 +139,7 @@ flowchart TB
 - Extensions MUST NOT depend on each other as crates. They interact only through the service registry, event bus and command bus.
 - UI components MUST NOT open database, cloud or network connections. All data comes through the Engine API.
 - Boundaries MUST be enforced in CI:
-  - an `xtask check-arch` step validates the table in §3.2 against `cargo metadata` (proposed);
+  - an `xtask check-arch` step validates the table in §3.2 against `cargo metadata` ([ADR-0010](docs/adr/0010-architecture-check.md));
   - `cargo-deny` checks licences, advisories and banned crates;
   - extension manifests are validated for undeclared dependencies.
 
@@ -388,7 +388,7 @@ Shutdown order:
 ### 7.2 Authentication and Authorisation
 
 - Database auth: password, client certificates, AWS RDS IAM tokens, GCP IAM tokens, GCP connector flow with ephemeral certificates.
-- Control API: token auth. Tokens SHOULD be scoped (e.g. read-only, run queries, manage tunnels) (proposed).
+- Control API: token auth. Every token MUST carry one or more scopes: `read-only`, `run-queries`, `manage-tunnels` ([ADR-0011](docs/adr/0011-control-api-token-scopes.md)).
 - Authorisation rules (read-only profiles, production guards, row limits) MUST be enforced in the engine. Interfaces and UI MAY show them but MUST NOT be the only enforcement point.
 
 ### 7.3 Extension Permissions and Isolation
@@ -486,10 +486,5 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 7 | Scripting | Adapter framework for multiple languages; Rhai first | [0007](docs/adr/0007-scripting-adapters.md) |
 | 8 | Manifest and secret URIs | `extension.toml`; `keychain://`, `aws-sm://`, `gcp-sm://` | [0008](docs/adr/0008-manifest-and-secret-uris.md) |
 | 9 | Crate layout | `rivet-*` crates as in §3.1 | [0009](docs/adr/0009-crate-layout.md) |
-
-## Open Decisions
-
-| # | Decision | Proposed |
-| --- | --- | --- |
-| 1 | Architecture check tool (§3.3) | `xtask check-arch` reading `cargo metadata` |
-| 2 | Control API token scopes (§7.2) | Scopes: read-only, run queries, manage tunnels |
+| 10 | Architecture check tool | `xtask check-arch` reading `cargo metadata` | [0010](docs/adr/0010-architecture-check.md) |
+| 11 | Control API token scopes | `read-only`, `run-queries`, `manage-tunnels` | [0011](docs/adr/0011-control-api-token-scopes.md) |
