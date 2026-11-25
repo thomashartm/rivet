@@ -17,6 +17,7 @@ ARCHITECTURE.md §7.4 says secrets MUST be redacted in logs, traces, errors and 
 
 ## Consequences
 
+- Text replacement also has a second limit: it finds a secret value as plain text and in the escaped forms of Rust `Debug`, JSON and the human log format, up to three layers. It does not find other encodings, for example Base64 or URL encoding. (Review fix R-43, not on `main` on this date.)
 - A secret of 1 to 3 bytes can appear in a log if code exposes it on purpose and logs it.
 - The user sees a warning for each such secret, when the event is implemented.
 - The alternative, to refuse short secrets, was not chosen: a user cannot change the password rules of each database they must connect to.
