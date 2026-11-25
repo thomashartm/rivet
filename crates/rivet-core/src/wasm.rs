@@ -172,6 +172,10 @@ pub const LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// Log or error text from a component is cut to this number of bytes.
 const MAX_GUEST_TEXT_BYTES: usize = 8 * 1024;
 
+/// A name of a component in an error message is cut to this number of
+/// bytes, the limit of `package.rs` for a key (ADR-0018).
+const MAX_SHOWN_NAME_BYTES: usize = 128;
+
 /// A path in an error text is cut to this number of bytes.
 const MAX_PATH_TEXT_BYTES: usize = 256;
 
@@ -635,10 +639,15 @@ impl WasmRuntime {
                         .imports(&engine)
                         .find(|(name, _)| name.starts_with("wasi:"))
                     {
-                        Some((name, _)) => format!(
-                            "the WASM component imports `{}`, but the host gives no WASI interface",
-                            guest_text(&redactor, name)
-                        ),
+                        Some((name, _)) => {
+                            // The message is also the reason of the state
+                            // (ADR-0018); the source has the full name.
+                            let name = guest_text(&redactor, name);
+                            let (start, mark) = crate::logging::cut(&name, MAX_SHOWN_NAME_BYTES);
+                            format!(
+                                "the WASM component imports `{start}{mark}`, but the host gives no WASI interface"
+                            )
+                        }
                         None => {
                             "the WASM component does not fit the world `rivet:extension`".to_owned()
                         }
@@ -2011,13 +2020,17 @@ mod tests {
         let gave_up = std::time::Instant::now();
         // The limit of the host ends the call first, because the runtime
         // rounds its limit up. If a tick comes in the first millisecond
-        // after the limit, the error of the runtime can be first: the two
-        // texts have "time limit". The text of the host is checked with a
+        // after the limit, the error of the runtime can be first: either
+        // text is correct. The text of the host is checked with a
         // paused clock in `a_call_that_exceeds_the_time_limit_fails_the_extension`
         // (`host.rs`).
         let error = &report.not_activated[&id("acme.spin")];
         assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
-        assert!(error.message().contains("time limit"), "{error}");
+        let texts = [
+            "extension `acme.spin` exceeded the time limit of 300ms in `activate`",
+            "extension `acme.spin`: activate failed: the call time limit was exceeded",
+        ];
+        assert!(texts.contains(&error.message()), "{error}");
         assert_eq!(hosted.state("acme.spin"), Some(ExtensionState::Failed));
 
         // The overshoot of the module documentation: two ticks, plus the
@@ -2299,6 +2312,40 @@ mod tests {
         let path = format!("{}/correct\thorse battery/x.wasm", "d".repeat(300));
         let text = path_text(&redactor, Path::new(&path));
         assert!(text.ends_with("/[REDACTED]/x.wasm"), "{text}");
+    }
+
+    #[test]
+    fn guest_text_is_cut_to_8_kib_after_the_redaction() {
+        // R-115a: the number is from ADR-0018, not from the constant.
+        let redactor = Redactor::new();
+        redactor.register(&Secret::from("hunter2-value".to_owned()));
+        assert_eq!(guest_text(&redactor, &"a".repeat(9000)), "a".repeat(8192));
+        // The cut is in the marker, not in the secret.
+        let text = guest_text(&redactor, &("a".repeat(8185) + "hunter2-value"));
+        assert_eq!(text, "a".repeat(8185) + "[REDACT");
+        // The cut is not inside a character.
+        let text = guest_text(&redactor, &("a".repeat(8191) + "é"));
+        assert_eq!(text, "a".repeat(8191));
+    }
+
+    #[tokio::test]
+    async fn a_wasi_import_name_in_a_load_message_is_cut_to_128_bytes() {
+        // R-115d, ADR-0018: the message is also the reason of the state; the
+        // source keeps the full cleaned text.
+        let name = format!("wasi:{}/x@0.2.6", "a".repeat(300));
+        let import = format!(r#"(import "{name}" (instance (export "f" (func))))"#);
+        let error = runtime()
+            .load(guest_with(&import, "", "(i32.const 0)"))
+            .await
+            .err()
+            .unwrap();
+        let shown = format!("wasi:{}…", "a".repeat(123));
+        assert_eq!(
+            error.message(),
+            format!("the WASM component imports `{shown}`, but the host gives no WASI interface")
+        );
+        let source = all_text(&error)[2].clone();
+        assert!(source.contains(&format!("{name}`")), "{source}");
     }
 
     #[tokio::test]
