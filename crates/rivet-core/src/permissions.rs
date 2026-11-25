@@ -133,11 +133,12 @@
 //! ```
 
 use rivet_sdk::error::{Error, Result};
-use rivet_sdk::manifest::{Capabilities, ClipboardAccess, ExtensionId, FilesystemAccess, Manifest};
+use rivet_sdk::manifest::{
+    Capabilities, ClipboardAccess, ExtensionId, FilesystemAccess, Manifest, same_host,
+};
 use rivet_sdk::secret::SecretUri;
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 use tracing::warn;
@@ -507,26 +508,6 @@ fn allows_network(granted: &Capabilities, host: &str, port: u16) -> bool {
         .network
         .iter()
         .any(|scope| same_host(&scope.host, host) && scope.ports.contains(&port))
-}
-
-fn same_host(granted: &str, requested: &str) -> bool {
-    match (ip_address(granted), ip_address(requested)) {
-        (Some(granted), Some(requested)) => granted == requested,
-        (None, None) => granted.eq_ignore_ascii_case(requested),
-        _ => false,
-    }
-}
-
-/// Parses an IP address literal. An IPv6 address can have the `[]` of a
-/// URL; an IPv4 address in brackets is not an address.
-fn ip_address(host: &str) -> Option<IpAddr> {
-    match host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    {
-        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
-        None => host.parse().ok(),
-    }
 }
 
 /// `true` if a scope with the access `have` permits the access `want`.
