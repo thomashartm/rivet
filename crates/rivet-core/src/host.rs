@@ -10,10 +10,18 @@
 //!
 //! Each extension has one [`ExtensionState`]. One function decides every
 //! state change. It permits the transitions of the state diagram in §4.4 and
-//! one addition: an extension in the state `Resolved` or `Rejected` has no
-//! loaded code, so the host can forget it and discover it again when its
-//! manifest, or the result of the resolution, changes. Each state change is
-//! published on the event bus as an [`ExtensionStateChanged`].
+//! two additions:
+//!
+//! - An extension in the state `Resolved` or `Rejected` has no loaded code,
+//!   so the host can forget it and discover it again when its manifest, or
+//!   the result of the resolution, changes.
+//! - An extension in the state `Failed` or `Disabled` has no loaded code
+//!   either, so [`ExtensionHost::unload`] and [`ExtensionHost::reload`]
+//!   can remove it. Without this, a corrected package could not replace
+//!   it. [`ExtensionHost::discover`] alone does not remove it.
+//!
+//! Each state change is published on the event bus as an
+//! [`ExtensionStateChanged`].
 //!
 //! The state `Active` in an event always means that the activation
 //! succeeded. An activation that fails goes from its start state (`Resolved`
@@ -73,6 +81,10 @@
 //! future of an operation does not stop it: the operation completes, and
 //! the next operation starts after it.
 //!
+//! [`ExtensionHost::discover`] and [`ExtensionHost::reload`] read the
+//! discovery directories before they wait for their turn. Thus a slow read
+//! delays only the next read, not an activation or the shutdown.
+//!
 //! ```
 //! use rivet_core::bus::{CommandBus, EventBus};
 //! use rivet_core::host::{
@@ -129,15 +141,19 @@ use rivet_sdk::extension::BoxFuture;
 use rivet_sdk::manifest::{ExtensionId, Manifest, Version};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::Instant;
 
 /// The name of the manifest file in an extension directory (§4.4).
 pub const MANIFEST_FILE: &str = "extension.toml";
+
+/// The largest manifest file that discovery reads, in bytes (1 MiB). A
+/// larger file is listed in [`ExtensionHost::invalid_packages`].
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// The runtime contract: the only way the host reaches extension code
 /// (§4.3).
@@ -168,13 +184,13 @@ pub trait ExtensionRuntime: Send + Sync {
 /// the state `Failed` (§5.6).
 pub trait ExtensionInstance: Send + Sync {
     /// Activates the extension. The extension registers its services,
-    /// command handlers and jobs through `context`, with
-    /// [`ExtensionContext::owner`] as the owner.
+    /// command handlers, event subscriptions and jobs through `context`,
+    /// with [`ExtensionContext::owner`] as the owner.
     fn activate(&self, context: ExtensionContext) -> BoxFuture<'_, Result<()>>;
 
     /// Deactivates the extension. After the call, the host removes every
-    /// service and command handler of the extension and cancels its jobs,
-    /// also when the call fails.
+    /// service and command handler of the extension, closes its event
+    /// subscriptions and cancels its jobs, also when the call fails.
     fn deactivate(&self) -> BoxFuture<'_, Result<()>>;
 }
 
@@ -195,7 +211,8 @@ pub struct Services {
 #[derive(Clone)]
 pub struct ExtensionContext {
     /// The id of the extension. The extension gives it as the owner of each
-    /// registration and each job.
+    /// registration, each event subscription
+    /// ([`EventBus::subscribe_owned`]) and each job.
     pub owner: Owner,
     /// The shared services.
     pub services: Services,
@@ -220,7 +237,8 @@ pub enum ExtensionState {
     /// host restarts it automatically ([`HostConfig`]). See also
     /// [`ExtensionHost::restart`] and [`ExtensionHost::disable`].
     Failed,
-    /// The extension was disabled after a failure. It stays disabled.
+    /// The extension was disabled after a failure. It stays disabled until
+    /// [`ExtensionHost::reload`] or [`ExtensionHost::unload`].
     Disabled,
 }
 
@@ -403,7 +421,8 @@ enum Lifecycle {
     Forget,
 }
 
-/// The state machine of §4.4, plus `Forget` (see the module documentation).
+/// The state machine of §4.4, plus `Forget` and the `Unload` of a failed or
+/// disabled extension (see the module documentation).
 /// `Ok(None)` means the extension is removed.
 ///
 /// This function is the only place that decides if a state change is legal.
@@ -417,7 +436,9 @@ fn transition(from: ExtensionState, event: Lifecycle) -> Result<Option<Extension
         // `Resolved` and `Inactive`: the activation failed.
         (Resolved | Inactive | Active, Lifecycle::Fail) => Some(Failed),
         (Failed, Lifecycle::Disable) => Some(Disabled),
-        (Inactive, Lifecycle::Unload) | (Resolved | Rejected, Lifecycle::Forget) => None,
+        // `Failed` and `Disabled`: see the module documentation.
+        (Inactive | Failed | Disabled, Lifecycle::Unload)
+        | (Resolved | Rejected, Lifecycle::Forget) => None,
         _ => {
             return Err(Error::policy(format!(
                 "the state {from:?} does not permit {event:?}"
@@ -484,17 +505,51 @@ struct Scan {
     invalid: Vec<(PathBuf, String)>,
 }
 
+/// Reads the manifest file of the extension directory `directory`.
+/// `Ok(None)` means that the directory has none. Blocking.
+fn read_manifest(directory: &Path) -> Result<Option<String>, String> {
+    let path = directory.join(MANIFEST_FILE);
+    // A link is not followed. A FIFO or a device is not opened: its read
+    // can wait for ever.
+    match std::fs::symlink_metadata(&path) {
+        Ok(found) if found.is_file() => {}
+        Ok(_) => return Err(format!("`{MANIFEST_FILE}` is not a regular file")),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    }
+    // shortcut: a file that changes to a link or a FIFO between the check
+    // and the open is followed or blocks this read (and each later discovery
+    // and reload, but no other operation); open with `O_NOFOLLOW` and
+    // `O_NONBLOCK` when the workspace has a crate for these flags.
+    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+    let mut limited = file.take(MAX_MANIFEST_BYTES + 1);
+    let mut text = String::new();
+    let read = limited.read_to_string(&mut text);
+    read.map_err(|error| error.to_string())?;
+    if limited.limit() == 0 {
+        return Err(format!(
+            "`{MANIFEST_FILE}` is larger than {MAX_MANIFEST_BYTES} bytes"
+        ));
+    }
+    Ok(Some(text))
+}
+
 /// Reads the extension directories. Blocking.
 ///
-/// For one id, a later discovery directory wins. Two packages with the same
-/// id in the same discovery directory make the id invalid.
+/// An extension directory is a real directory: a symbolic link is refused.
+/// For one id, a later discovery directory wins, but an invalid package
+/// never replaces a valid one (ADR-0017). Two packages with the same id in
+/// the same discovery directory make the id invalid in that directory.
 fn scan(directories: &[PathBuf]) -> Scan {
     let mut scan = Scan::default();
     for root in directories {
-        let mut folders: Vec<PathBuf> = match std::fs::read_dir(root) {
+        // `file_type` does not follow a link.
+        let mut entries: Vec<(PathBuf, std::fs::FileType)> = match std::fs::read_dir(root) {
             Ok(entries) => entries
-                .filter_map(|entry| Some(entry.ok()?.path()))
-                .filter(|path| path.is_dir())
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    Some((entry.path(), entry.file_type().ok()?))
+                })
                 .collect(),
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => {
@@ -502,14 +557,22 @@ fn scan(directories: &[PathBuf]) -> Scan {
                 continue;
             }
         };
-        folders.sort();
-        let mut in_root: BTreeMap<ExtensionId, PathBuf> = BTreeMap::new();
-        for directory in folders {
-            let text = match std::fs::read_to_string(directory.join(MANIFEST_FILE)) {
-                Ok(text) => text,
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => {
-                    scan.invalid.push((directory, error.to_string()));
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut in_root: BTreeMap<ExtensionId, Package> = BTreeMap::new();
+        for (directory, kind) in entries {
+            if kind.is_symlink() {
+                let reason = "a symbolic link is not read as an extension directory";
+                scan.invalid.push((directory, reason.to_owned()));
+                continue;
+            }
+            if !kind.is_dir() {
+                continue;
+            }
+            let text = match read_manifest(&directory) {
+                Ok(Some(text)) => text,
+                Ok(None) => continue,
+                Err(reason) => {
+                    scan.invalid.push((directory, reason));
                     continue;
                 }
             };
@@ -527,11 +590,11 @@ fn scan(directories: &[PathBuf]) -> Scan {
                 scan.invalid.push((directory, reason));
                 continue;
             };
-            let manifest = match in_root.insert(id.clone(), directory.clone()) {
+            let manifest = match in_root.get(&id) {
                 Some(other) => Err(format!(
                     "extension `{id}` has two packages in `{}`: `{}` and `{}`",
                     root.display(),
-                    other.display(),
+                    other.directory.display(),
                     directory.display()
                 )),
                 None => manifest,
@@ -540,7 +603,21 @@ fn scan(directories: &[PathBuf]) -> Scan {
                 directory,
                 manifest,
             };
-            scan.packages.insert(id, package);
+            in_root.insert(id, package);
+        }
+        for (id, package) in in_root {
+            match (&package.manifest, scan.packages.get(&id)) {
+                (Err(reason), Some(earlier)) if earlier.manifest.is_ok() => {
+                    let reason = format!(
+                        "extension `{id}`: {reason}; the valid package in `{}` stays",
+                        earlier.directory.display()
+                    );
+                    scan.invalid.push((package.directory, reason));
+                }
+                _ => {
+                    scan.packages.insert(id, package);
+                }
+            }
         }
     }
     scan
@@ -574,7 +651,7 @@ async fn joined<T>(
     match tokio::time::timeout(limit, &mut task).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            let message = format!("extension `{id}` panicked in `{what}`");
+            let message = format!("extension `{id}` {} in `{what}`", ended(&error));
             Err(Error::internal(message).with_source(error))
         }
         Err(_) => {
@@ -585,6 +662,19 @@ async fn joined<T>(
             )))
         }
     }
+}
+
+/// How a task ended that did not complete.
+fn ended(error: &JoinError) -> &'static str {
+    if error.is_cancelled() {
+        "was cancelled"
+    } else {
+        "panicked"
+    }
+}
+
+fn not_on_disk(id: &ExtensionId) -> Error {
+    Error::user(format!("extension `{id}` is not in a discovery directory"))
 }
 
 fn unknown(id: &ExtensionId) -> Error {
@@ -653,6 +743,9 @@ pub struct ExtensionHost {
     // activation of an unrelated extension; use one lock per dependency tree
     // when that delay is measured as a problem.
     lifecycle: tokio::sync::Mutex<()>,
+    /// Held from the read of the discovery directories until its result is
+    /// applied. Always taken before `lifecycle`.
+    scanning: tokio::sync::Mutex<()>,
     /// Never held across an `.await`.
     inner: Mutex<Inner>,
 }
@@ -690,6 +783,7 @@ impl ExtensionHost {
             directories,
             headless,
             lifecycle: tokio::sync::Mutex::default(),
+            scanning: tokio::sync::Mutex::default(),
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
                 invalid: Vec::new(),
@@ -713,8 +807,16 @@ impl ExtensionHost {
     }
 
     /// Returns the directories that the last [`discover`](Self::discover)
-    /// could not read as an extension and that give no extension id, each
-    /// with the reason. An invalid manifest that has a valid `id` is in
+    /// did not accept as an extension, each with the reason:
+    ///
+    /// - a directory that cannot be read as an extension and gives no
+    ///   extension id;
+    /// - a symbolic link, a manifest that is not a regular file, and a
+    ///   manifest above [`MAX_MANIFEST_BYTES`];
+    /// - an invalid package that has the id of a valid package in an
+    ///   earlier discovery directory. The valid package stays.
+    ///
+    /// Each other invalid manifest that has a valid `id` is in
     /// [`extensions`](Self::extensions) instead, in the state `Rejected`.
     pub fn invalid_packages(&self) -> Vec<(PathBuf, String)> {
         self.inner().invalid.clone()
@@ -723,8 +825,8 @@ impl ExtensionHost {
     /// Reads the discovery directories and resolves the dependencies.
     ///
     /// An extension is an immediate sub-directory that contains
-    /// `extension.toml`. Discovery activates nothing. An invalid manifest
-    /// rejects only its extension.
+    /// `extension.toml`. Discovery follows no symbolic link. Discovery
+    /// activates nothing. An invalid manifest rejects only its extension.
     ///
     /// The method can be called again. An extension that was activated
     /// before keeps its manifest: use [`reload`](Self::reload) to apply a
@@ -734,8 +836,8 @@ impl ExtensionHost {
     ///
     /// Returns an `internal` error if the read of the directories panicked.
     pub async fn discover(&self) -> Result<()> {
-        self.operation(|host| async move {
-            let scan = host.scan().await?;
+        self.scanned(|host, scan| async move {
+            let scan = scan?;
             let unloaded = {
                 let mut inner = host.inner();
                 inner.invalid = scan.invalid;
@@ -806,22 +908,23 @@ impl ExtensionHost {
             .await
     }
 
-    /// Unloads the inactive extension `id`: drops its instance and removes
-    /// it from the host. A later [`discover`](Self::discover) finds it
-    /// again. Extensions that depend on it become `Rejected` until then.
-    /// The pending restart of a failed extension that depends on it is
-    /// stopped: that extension stays `Failed`.
+    /// Unloads the extension `id`, which is `Inactive`, `Failed` or
+    /// `Disabled`: drops its instance and removes it from the host. A later
+    /// [`discover`](Self::discover) finds it again, in the state `Resolved`
+    /// if it resolves. Extensions that depend on it become `Rejected` until
+    /// then. The pending restart of `id`, and of a failed extension that
+    /// depends on it, is stopped: that extension stays `Failed`.
     ///
     /// # Errors
     ///
     /// - A `user` error if the host does not know `id`.
-    /// - A `policy` error if the extension is not `Inactive`.
+    /// - A `policy` error if the extension is in another state.
     pub async fn unload(&self, id: &ExtensionId) -> Result<()> {
         let id = id.clone();
         self.operation(|host| async move {
             let unloaded = {
                 let mut inner = host.inner();
-                let entry = host.apply(&mut inner, &id, Lifecycle::Unload, None)?;
+                let entry = host.unload_entry(&mut inner, &id)?;
                 let packages = inner.unloaded_packages();
                 let mut unloaded = Vec::from_iter(entry.map(|entry| (id.clone(), entry)));
                 unloaded.extend(host.reconcile(&mut inner, packages));
@@ -833,68 +936,70 @@ impl ExtensionHost {
         .await
     }
 
-    /// Hot reload (§4.4): deactivates `id` and its dependents, unloads
-    /// `id`, reads its manifest again, resolves all extensions again and
+    /// Hot reload (§4.4): reads the package of `id` again, deactivates `id`
+    /// and its dependents, unloads `id`, resolves all extensions again and
     /// activates what was active before.
     ///
-    /// The extension must be `Active`, `Inactive`, `Resolved` or `Rejected`,
-    /// or new on disk. Only extensions that were active are activated. The
-    /// report lists them, and the dependents that could not activate again.
+    /// Only extensions that were active are activated. The report lists
+    /// them, and each extension that could not activate again, with the
+    /// reason: `id` itself if its `load` or `activate` call failed (it is
+    /// `Failed` then), and its dependents.
+    ///
+    /// A `Failed` or `Disabled` extension is replaced by the new package
+    /// and is `Resolved`, with a failure count of zero: its next activation
+    /// event loads the new version. This is the way out of `Disabled`.
     ///
     /// # Errors
     ///
-    /// The reload fails in these cases. The host stays consistent: no
-    /// extension of the tree is active, and each extension that does not
-    /// resolve is `Rejected` with its reason.
-    ///
-    /// - A `policy` error if the extension is `Failed` or `Disabled`.
+    /// - A `user` error if the package is not on disk any more, or if the
+    ///   new manifest is invalid or does not resolve. If the extension was
+    ///   activated before (`Active`, `Inactive`, `Failed` or `Disabled`),
+    ///   the host checks this first and changes nothing: the old version
+    ///   and its dependents stay as they are. An extension without loaded
+    ///   code is `Rejected` with the reason, or removed.
     /// - The error of its `deactivate` call. The extension is `Failed`. The
     ///   host does not restart it automatically.
-    /// - A `user` error if the package is not on disk any more, or if the
-    ///   new manifest is invalid or does not resolve.
-    /// - The error of its `load` or `activate` call. The extension is
-    ///   `Failed`.
+    /// - An `internal` error if the read of the directories panicked.
     pub async fn reload(&self, id: &ExtensionId) -> Result<ActivationReport> {
         let id = id.clone();
-        self.operation(|host| async move { host.reload_locked(&id).await })
+        self.scanned(|host, scan| async move { host.reload_locked(&id, scan?).await })
             .await
     }
 
-    /// The body of [`reload`](Self::reload).
-    async fn reload_locked(&self, id: &ExtensionId) -> Result<ActivationReport> {
+    /// The body of [`reload`](Self::reload). `scan` is what is on disk.
+    async fn reload_locked(&self, id: &ExtensionId, mut scan: Scan) -> Result<ActivationReport> {
         let state = |host: &Self| host.inner().entries.get(id).map(|entry| entry.state);
+        // Only `id` is read again. The other extensions keep their package.
+        let new = scan.packages.remove(id);
         let mut was_active = BTreeSet::new();
         let mut report = ActivationReport::default();
-        match state(self) {
-            Some(ExtensionState::Active) => {
-                was_active.extend(self.inner().active_dependents(id));
+        {
+            let inner = self.inner();
+            let entry = inner.entries.get(id);
+            // The old version stops only if the new package can replace it.
+            if entry.is_some_and(Entry::keeps_package) {
+                self.replaceable(&inner, id, new.as_ref())?;
+            }
+            if entry.is_some_and(|entry| entry.state == ExtensionState::Active) {
+                was_active.extend(inner.active_dependents(id));
                 was_active.insert(id.clone());
-                if let Err(error) = self.deactivate_tree(id).await
-                    && state(self) != Some(ExtensionState::Inactive)
-                {
-                    return Err(error);
-                }
             }
-            Some(from @ (ExtensionState::Failed | ExtensionState::Disabled)) => {
-                return Err(Error::policy(format!(
-                    "extension `{id}` cannot reload from the state {from:?}"
-                )));
-            }
-            _ => {}
         }
-        let mut scan = self.scan().await?;
+        if !was_active.is_empty()
+            && let Err(error) = self.deactivate_tree(id).await
+            && state(self) != Some(ExtensionState::Inactive)
+        {
+            return Err(error);
+        }
         let unloaded = {
             let mut inner = self.inner();
             let old = match inner.entries.get(id) {
-                Some(entry) if entry.state == ExtensionState::Inactive => {
-                    self.apply(&mut inner, id, Lifecycle::Unload, None)?
-                }
+                Some(entry) if entry.keeps_package() => self.unload_entry(&mut inner, id)?,
                 _ => None,
             };
-            // Only `id` is read again. The other extensions keep their package.
             let mut packages = inner.unloaded_packages();
             packages.remove(id);
-            packages.extend(scan.packages.remove_entry(id));
+            packages.extend(new.map(|package| (id.clone(), package)));
             let mut unloaded = Vec::from_iter(old.map(|entry| (id.clone(), entry)));
             unloaded.extend(self.reconcile(&mut inner, packages));
             unloaded
@@ -904,11 +1009,7 @@ impl ExtensionHost {
         let order: Vec<ExtensionId> = {
             let inner = self.inner();
             match inner.entries.get(id) {
-                None => {
-                    return Err(Error::user(format!(
-                        "extension `{id}` is not in a discovery directory"
-                    )));
-                }
+                None => return Err(not_on_disk(id)),
                 Some(entry) if entry.state == ExtensionState::Rejected => {
                     return Err(Error::user(entry.reason.clone().unwrap_or_default()));
                 }
@@ -926,10 +1027,39 @@ impl ExtensionHost {
             order.filter(|&x| was_active.contains(x)).cloned().collect()
         };
         self.activate_all(order, &mut report).await;
-        match report.not_activated.remove(id) {
-            Some(error) => Err(error),
-            None => Ok(report),
+        Ok(report)
+    }
+
+    /// Checks that `package` can replace the package of `id`: it is on
+    /// disk, its manifest is valid and it resolves with the other
+    /// extensions.
+    fn replaceable(
+        &self,
+        inner: &Inner,
+        id: &ExtensionId,
+        package: Option<&Package>,
+    ) -> Result<()> {
+        let package = package.ok_or_else(|| not_on_disk(id))?;
+        let manifest = package.manifest.clone().map_err(Error::user)?;
+        let others = inner.entries.iter().filter(|(other, _)| *other != id);
+        let mut manifests: Vec<Manifest> = others
+            .filter_map(|(_, entry)| entry.package.manifest.clone().ok())
+            .collect();
+        manifests.push(manifest);
+        match resolve(&manifests, &self.sdk_version).outcomes().get(id) {
+            Some(Outcome::Rejected { reason }) => Err(Error::user(reason.message().to_owned())),
+            _ => Ok(()),
         }
+    }
+
+    /// Removes the extension `id`, which has no active code, and stops its
+    /// pending restart. Returns the entry for `drop_instances`.
+    fn unload_entry(&self, inner: &mut Inner, id: &ExtensionId) -> Result<Option<Entry>> {
+        let entry = self.apply(inner, id, Lifecycle::Unload, None)?;
+        Ok(entry.map(|mut entry| {
+            entry.cancel_restart(id, "the extension was unloaded");
+            entry
+        }))
     }
 
     /// Activates the failed extension `id` again, without the delay of the
@@ -942,8 +1072,8 @@ impl ExtensionHost {
     /// - A `user` error if the host does not know `id`.
     /// - A `policy` error if the extension is not `Failed`, or if it has
     ///   `requires_ui = true` in a headless host.
-    /// - An `internal` error if a dependency is not active. This counts as
-    ///   a failed restart.
+    /// - A `policy` error if a dependency is not active. This counts as a
+    ///   failed restart.
     /// - The error of the `load` or `activate` call. The extension stays
     ///   `Failed`, and the failure counts as a failed restart.
     pub async fn restart(&self, id: &ExtensionId) -> Result<()> {
@@ -1006,7 +1136,8 @@ impl ExtensionHost {
     }
 
     /// Disables the failed extension `id` and stops its pending restart. A
-    /// disabled extension does not activate again.
+    /// disabled extension does not activate again until a
+    /// [`reload`](Self::reload).
     ///
     /// # Errors
     ///
@@ -1071,12 +1202,46 @@ impl ExtensionHost {
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send,
     {
-        let host = self.this.upgrade();
-        let host = host.expect("a host that is in use is not dropped");
-        let task = tokio::spawn(async move {
+        self.detached(|host| async move {
             let _lifecycle = host.lifecycle.lock().await;
             body(Arc::clone(&host)).await
-        });
+        })
+        .await
+    }
+
+    /// Runs one lifecycle operation like [`operation`](Self::operation),
+    /// and gives it what is on disk.
+    ///
+    /// The read of the directories can be slow, so it is before the
+    /// lifecycle lock: it delays no activation and no shutdown. This is
+    /// safe, because the read uses no state of the host, and because the
+    /// `scanning` lock applies the results in the order of the reads: a
+    /// newer read is never replaced by an older one.
+    async fn scanned<T, F, Fut>(&self, body: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>, Result<Scan>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send,
+    {
+        self.detached(|host| async move {
+            let _scanning = host.scanning.lock().await;
+            let scan = host.scan().await;
+            let _lifecycle = host.lifecycle.lock().await;
+            body(Arc::clone(&host), scan).await
+        })
+        .await
+    }
+
+    /// Runs `body` in its own task and waits for it.
+    async fn detached<T, F, Fut>(&self, body: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send,
+    {
+        let host = self.this.upgrade();
+        let host = host.expect("a host that is in use is not dropped");
+        let task = tokio::spawn(async move { body(host).await });
         match task.await.map_err(tokio::task::JoinError::try_into_panic) {
             Ok(result) => result,
             // A panic of the host itself, not of an extension.
@@ -1113,9 +1278,11 @@ impl ExtensionHost {
 
     async fn scan(&self) -> Result<Scan> {
         let directories = self.directories.clone();
-        tokio::task::spawn_blocking(move || scan(&directories))
-            .await
-            .map_err(|error| Error::internal("extension discovery panicked").with_source(error))
+        let scan = tokio::task::spawn_blocking(move || scan(&directories)).await;
+        scan.map_err(|error| {
+            let message = format!("extension discovery {}", ended(&error));
+            Error::internal(message).with_source(error)
+        })
     }
 
     fn publish(
@@ -1259,6 +1426,7 @@ impl ExtensionHost {
     async fn release(&self, owner: &Owner) {
         self.services.registry.unregister_owner(owner);
         self.services.commands.unregister_owner(owner);
+        self.services.events.unsubscribe_owner(owner);
         self.services.jobs.stop_owner(owner).await;
     }
 
@@ -1414,7 +1582,7 @@ impl ExtensionHost {
             match manifest.dependencies.keys().find(inactive) {
                 Some(dependency) => {
                     let reason = format!("its dependency `{dependency}` is not active");
-                    Err(Error::internal(refuse(&reason)))
+                    Err(Error::policy(refuse(&reason)))
                 }
                 None => {
                     let directory = entry.package.directory.clone();
@@ -1571,8 +1739,13 @@ mod tests {
         calls: Mutex<Vec<String>>,
         modes: Mutex<BTreeMap<String, Mode>>,
         jobs: Mutex<BTreeMap<String, JobHandle<()>>>,
+        subscriptions: Mutex<BTreeMap<String, Subscription<Ping>>>,
         gate: tokio::sync::Notify,
     }
+
+    /// An event that each fake extension subscribes to.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Ping;
 
     impl Fake {
         fn log(&self, call: &str) {
@@ -1654,7 +1827,8 @@ mod tests {
 
     impl ExtensionInstance for FakeInstance {
         /// Registers the service `<id>.service` and the command
-        /// `<id>.command`, and starts a job that runs until it is cancelled.
+        /// `<id>.command`, subscribes to `Ping` and starts a job that runs
+        /// until it is cancelled.
         fn activate(&self, context: ExtensionContext) -> BoxFuture<'_, Result<()>> {
             Box::pin(async move {
                 let ExtensionContext { owner, services } = context;
@@ -1667,6 +1841,12 @@ mod tests {
                 let name = format!("{owner}.command");
                 let handler = |(): ()| async { Ok(()) };
                 services.commands.register(owner.clone(), &name, handler)?;
+                let subscription = services.events.subscribe_owned(owner.clone());
+                self.fake
+                    .subscriptions
+                    .lock()
+                    .unwrap()
+                    .insert(owner.to_string(), subscription);
                 // `job <id>` = `Hang`: the job ignores the cancel request.
                 let stubborn = self.fake.mode(&format!("job {owner}")).is_some();
                 let job = services
@@ -1811,6 +1991,11 @@ mod tests {
 
         /// The state changes since the last call, as `id: from -> to`.
         async fn changes(&mut self) -> Vec<String> {
+            self.events().await.iter().map(line).collect()
+        }
+
+        /// The state change events since the last call.
+        async fn events(&mut self) -> Vec<ExtensionStateChanged> {
             let end = ExtensionStateChanged {
                 id: id("end"),
                 from: None,
@@ -1818,11 +2003,11 @@ mod tests {
                 reason: None,
             };
             self.services.events.publish(end.clone());
-            let mut changes = Vec::new();
+            let mut events = Vec::new();
             loop {
                 match self.events.recv().await {
-                    Some(Received::Event(event)) if event == end => return changes,
-                    Some(Received::Event(event)) => changes.push(line(&event)),
+                    Some(Received::Event(event)) if event == end => return events,
+                    Some(Received::Event(event)) => events.push(event),
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -1917,6 +2102,8 @@ mod tests {
             (Failed, Disable, Some(Disabled)),
             (Inactive, Unload, None),
             // Not in the diagram: see the module documentation.
+            (Failed, Unload, None),
+            (Disabled, Unload, None),
             (Resolved, Forget, None),
             (Rejected, Forget, None),
         ];
@@ -2148,6 +2335,8 @@ mod tests {
             assert_eq!(report.not_activated[&id("a")].category(), category);
             let b = &report.not_activated[&id("b")];
             assert!(b.message().contains("dependency `a` is not active"));
+            // An expected condition, not a defect.
+            assert_eq!(b.category(), ErrorCategory::Policy);
             assert_eq!(f.state("a"), Some(Failed));
             assert!(f.reason("a").contains("activate"));
             assert_eq!(f.state("b"), Some(Resolved));
@@ -2186,17 +2375,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_load_is_contained() {
-        let f = fixture(true);
-        f.add("a", &[]);
-        f.host.discover().await.unwrap();
-        f.fake.set("load a@1.0.0", Some(Mode::Panic));
+        for (mode, category) in [
+            (Mode::Fail, ErrorCategory::Connectivity),
+            (Mode::Panic, ErrorCategory::Internal),
+        ] {
+            let f = fixture(true);
+            f.add("a", &[]);
+            f.host.discover().await.unwrap();
+            f.fake.set("load a@1.0.0", Some(mode));
 
-        let report = f.go("a").await;
+            let report = f.go("a").await;
 
-        let error = &report.not_activated[&id("a")];
-        assert_eq!(error.category(), ErrorCategory::Internal);
-        assert_eq!(f.state("a"), Some(Failed));
-        assert_eq!(f.fake.take_calls(), ["load a@1.0.0"]);
+            let error = &report.not_activated[&id("a")];
+            assert_eq!(error.category(), category);
+            assert_eq!(f.state("a"), Some(Failed));
+            assert_eq!(f.reason("a"), error.message());
+            assert_eq!(f.fake.take_calls(), ["load a@1.0.0"]);
+        }
     }
 
     #[tokio::test]
@@ -2220,7 +2415,6 @@ mod tests {
             ErrorCategory::Policy
         );
         f.host.restart(&id("a")).await.unwrap_err();
-        f.host.reload(&id("a")).await.unwrap_err();
         assert_eq!(f.state("a"), Some(Disabled));
     }
 
@@ -2385,14 +2579,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_to_an_invalid_manifest_fails_and_leaves_a_consistent_host() {
-        let f = fixture(true);
+    async fn reload_validates_the_new_package_before_it_stops_the_old_version() {
+        let mut f = fixture(true);
         f.add("a", &[]);
         f.add("b", &["a"]);
         f.host.discover().await.unwrap();
         f.go("b").await;
         f.fake.take_calls();
+        f.changes().await;
+        let folder = f.roots[USER].path().join("a");
+
+        // An invalid manifest, a manifest that does not resolve, no package.
         f.write(USER, "a", "id = \"a\"\nversion = \"not a version\"\n");
+        let invalid = f.host.reload(&id("a")).await.unwrap_err();
+        f.write(USER, "a", &manifest("a", "1.1.0", &["missing"], ""));
+        let unresolved = f.host.reload(&id("a")).await.unwrap_err();
+        std::fs::remove_dir_all(&folder).unwrap();
+        let removed = f.host.reload(&id("a")).await.unwrap_err();
+
+        assert!(invalid.message().contains("invalid extension manifest"));
+        assert!(unresolved.message().contains("`missing` is not present"));
+        assert!(removed.message().contains("not in a discovery directory"));
+        for error in [invalid, unresolved, removed] {
+            assert_eq!(error.category(), ErrorCategory::User);
+        }
+        // The old version and its dependent were not stopped.
+        assert!(f.fake.take_calls().is_empty());
+        assert!(f.changes().await.is_empty());
+        for owner in ["a", "b"] {
+            assert_eq!(f.state(owner), Some(Active));
+            assert_eq!(f.registered(owner).await, (true, true));
+        }
+
+        // The reload of the corrected manifest replaces the old version.
+        f.write(USER, "a", &manifest("a", "1.1.0", &[], ""));
+        let report = f.host.reload(&id("a")).await.unwrap();
+        assert_eq!(report.activated, [id("a"), id("b")]);
+        assert_eq!(f.fake.count("load a@1.1.0"), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_of_an_extension_without_loaded_code_reads_its_manifest_again() {
+        let f = fixture(true);
+        f.add("b", &["a"]);
+        f.write(USER, "a", "id = \"a\"\nversion = \"not a version\"\n");
+        f.host.discover().await.unwrap();
 
         let error = f.host.reload(&id("a")).await.unwrap_err();
 
@@ -2400,18 +2631,9 @@ mod tests {
         assert!(error.message().contains("invalid extension manifest"));
         assert_eq!(f.state("a"), Some(Rejected));
         assert_eq!(f.reason("a"), error.message());
-        assert_eq!(f.state("b"), Some(Rejected));
         // An invalid manifest is not an input of the resolver.
+        assert_eq!(f.state("b"), Some(Rejected));
         assert!(f.reason("b").contains("`a` is not present"));
-        // Nothing is half active.
-        assert_eq!(
-            f.fake.take_calls(),
-            ["deactivate b", "deactivate a", "unload a", "unload b"]
-        );
-        for owner in ["a", "b"] {
-            assert_eq!(f.registered(owner).await, (false, false));
-        }
-        assert!(f.go("b").await.activated.is_empty());
 
         // The reload of the corrected manifest resolves both again.
         f.add("a", &[]);
@@ -2438,12 +2660,6 @@ mod tests {
         assert_eq!(f.state("a"), Some(Active));
         assert_eq!(f.state("b"), Some(Rejected));
         assert_eq!(f.registered("b").await, (false, false));
-
-        // A removed package fails the reload.
-        std::fs::remove_dir_all(f.roots[USER].path().join("a")).unwrap();
-        let error = f.host.reload(&id("a")).await.unwrap_err();
-        assert_eq!(error.category(), ErrorCategory::User);
-        assert_eq!(f.state("a"), None);
     }
 
     #[tokio::test]
@@ -2830,6 +3046,9 @@ mod tests {
         // The extension was not called.
         assert!(f.fake.take_calls().is_empty());
         assert!(f.changes().await.is_empty());
+        // An expected condition, not a defect.
+        let error = f.host.restart(&id("b")).await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3119,5 +3338,308 @@ mod tests {
         pass(HOUR).await;
         assert!(f.fake.take_calls().is_empty());
         assert_eq!(f.state("a"), Some(Failed));
+    }
+
+    // --- Review findings R-19, R-20, R-23 ---
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_does_not_read_a_manifest_that_is_not_a_regular_file() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        let evil = f.roots[USER].path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        let fifo = evil.join(MANIFEST_FILE);
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+
+        // Real time: a read of the FIFO never ends.
+        let found = tokio::time::timeout(Duration::from_secs(5), f.host.discover()).await;
+        if found.is_err() {
+            // Ends the read that waits in the FIFO, so that the test can end.
+            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        }
+        found.expect("discovery does not wait for a FIFO").unwrap();
+
+        let invalid = f.host.invalid_packages();
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].0, evil);
+        assert!(invalid[0].1.contains("not a regular file"), "{invalid:?}");
+        // The other extensions and the other operations work.
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert!(f.host.shutdown().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_does_not_follow_symbolic_links() {
+        use std::os::unix::fs::symlink;
+        let f = fixture(true);
+        let outside = tempfile::tempdir().unwrap();
+        let package = outside.path().join("out");
+        std::fs::create_dir(&package).unwrap();
+        let text = manifest("out", "1.0.0", &[], "");
+        std::fs::write(package.join(MANIFEST_FILE), text).unwrap();
+        let user = f.roots[USER].path();
+        // A link to a directory, and a real directory with a link to a manifest.
+        symlink(&package, user.join("link")).unwrap();
+        std::fs::create_dir(user.join("file-link")).unwrap();
+        let target = package.join(MANIFEST_FILE);
+        symlink(target, user.join("file-link").join(MANIFEST_FILE)).unwrap();
+
+        f.host.discover().await.unwrap();
+
+        assert!(f.host.extensions().is_empty());
+        let invalid = f.host.invalid_packages();
+        assert_eq!(invalid.len(), 2, "{invalid:?}");
+        assert_eq!(invalid[0].0, user.join("file-link"));
+        assert!(invalid[0].1.contains("not a regular file"), "{invalid:?}");
+        assert_eq!(invalid[1].0, user.join("link"));
+        assert!(invalid[1].1.contains("symbolic link"), "{invalid:?}");
+    }
+
+    #[tokio::test]
+    async fn discovery_refuses_a_manifest_above_the_size_limit() {
+        let f = fixture(true);
+        let limit = 1024 * 1024;
+        let text = manifest("at-limit", "1.0.0", &[], "");
+        let padding = "#".repeat(limit - text.len());
+        f.write(USER, "at-limit", &format!("{text}{padding}"));
+        let text = manifest("above", "1.0.0", &[], "");
+        let padding = "#".repeat(limit + 1 - text.len());
+        f.write(USER, "above", &format!("{text}{padding}"));
+
+        f.host.discover().await.unwrap();
+
+        assert_eq!(f.state("at-limit"), Some(Resolved));
+        assert_eq!(f.state("above"), None);
+        let invalid = f.host.invalid_packages();
+        assert_eq!(invalid.len(), 1);
+        assert!(invalid[0].0.ends_with("above"));
+        assert!(invalid[0].1.contains("larger than"), "{invalid:?}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_package_does_not_replace_a_valid_one_from_an_earlier_directory() {
+        let f = fixture(true);
+        f.write(BUNDLED, "a", &manifest("a", "1.0.0", &[], ""));
+        // No version.
+        f.write(WORKSPACE, "whatever", "id = \"a\"\n");
+        f.write(BUNDLED, "b", &manifest("b", "1.0.0", &[], ""));
+        f.write(USER, "b-1", &manifest("b", "1.1.0", &[], ""));
+        f.write(USER, "b-2", &manifest("b", "1.2.0", &[], ""));
+
+        f.host.discover().await.unwrap();
+
+        for extension in ["a", "b"] {
+            let status = f.status(extension).unwrap();
+            assert_eq!(status.state, Resolved, "{extension}");
+            let bundled = f.roots[BUNDLED].path().join(extension);
+            assert_eq!(status.directory, bundled);
+        }
+        let invalid = f.host.invalid_packages();
+        assert_eq!(invalid.len(), 2, "{invalid:?}");
+        assert_eq!(invalid[0].0, f.roots[USER].path().join("b-2"));
+        assert!(invalid[0].1.contains("two packages"), "{invalid:?}");
+        assert_eq!(invalid[1].0, f.roots[WORKSPACE].path().join("whatever"));
+        assert!(invalid[1].1.contains("missing field"), "{invalid:?}");
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert_eq!(f.fake.take_calls(), ["load a@1.0.0", "activate a"]);
+    }
+
+    #[tokio::test]
+    async fn the_event_subscriptions_of_an_extension_end_when_it_stops() {
+        let f = fixture(true);
+        for extension in ["stays", "deactivated", "crashed", "failed"] {
+            f.add(extension, &[]);
+        }
+        f.host.discover().await.unwrap();
+        f.fake.set("activate failed", Some(Mode::Fail));
+        for extension in ["stays", "deactivated", "crashed", "failed"] {
+            f.go(extension).await;
+        }
+        let subscription = |owner: &str| f.fake.subscriptions.lock().unwrap().remove(owner);
+
+        f.host.deactivate(&id("deactivated")).await.unwrap();
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("crashed"), crash).await.unwrap();
+        f.services.events.publish(Ping);
+
+        let mut open = subscription("stays").unwrap();
+        assert_eq!(open.recv().await, Some(Received::Event(Ping)));
+        for owner in ["deactivated", "crashed", "failed"] {
+            let mut closed = subscription(owner).unwrap();
+            assert_eq!(closed.recv().await, None, "{owner}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_disabled_extension_can_be_replaced() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.host.discover().await.unwrap();
+        f.fake.set("activate a", Some(Mode::Fail));
+        f.go("a").await;
+        assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
+        f.fake.set("activate a", None);
+        f.fake.take_calls();
+        f.changes().await;
+
+        // Reload from `Failed`, with the version 1.1.0 on disk.
+        f.write(USER, "a", &manifest("a", "1.1.0", &[], ""));
+        let report = f.host.reload(&id("a")).await.unwrap();
+        assert!(report.activated.is_empty());
+        assert_eq!(
+            f.changes().await,
+            [
+                "a: Failed -> none",
+                "a: none -> Discovered",
+                "a: Discovered -> Resolved",
+            ]
+        );
+        // The pending restart of the old version is stopped.
+        pass(HOUR).await;
+        assert!(f.fake.take_calls().is_empty());
+        assert_eq!(f.go("b").await.activated, [id("a"), id("b")]);
+        assert_eq!(f.fake.count("load a@1.1.0"), 1);
+
+        // Unload from `Failed`. Discovery finds the extension again.
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.fake.take_calls();
+        f.host.unload(&id("a")).await.unwrap();
+        assert_eq!(f.state("a"), None);
+        pass(HOUR).await;
+        // `b` was loaded and cannot resolve without `a`. No restart of `a`.
+        assert_eq!(f.fake.take_calls(), ["unload b"]);
+        f.host.discover().await.unwrap();
+        assert_eq!(f.go("b").await.activated, [id("a"), id("b")]);
+
+        // Reload from `Disabled`: the same as from `Failed`.
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.disable(&id("a")).await.unwrap();
+        f.write(USER, "a", &manifest("a", "2.0.0", &[], ""));
+        f.changes().await;
+        let report = f.host.reload(&id("a")).await.unwrap();
+        assert!(report.activated.is_empty());
+        // `b` needs `a` `^1`: the host resolved with the new manifest.
+        assert_eq!(
+            f.changes().await,
+            [
+                "a: Disabled -> none",
+                "a: none -> Discovered",
+                "a: Discovered -> Resolved",
+                "b: Inactive -> none",
+                "b: none -> Discovered",
+                "b: Discovered -> Rejected",
+            ]
+        );
+        assert!(f.reason("b").contains("`^1`"));
+        assert_eq!(f.go("a").await.activated, [id("a")]);
+        assert_eq!(f.fake.count("load a@2.0.0"), 1);
+
+        // Unload from `Disabled`. Discovery finds the extension again.
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.disable(&id("a")).await.unwrap();
+        f.host.unload(&id("a")).await.unwrap();
+        assert_eq!(f.state("a"), None);
+        f.host.discover().await.unwrap();
+        assert_eq!(f.state("a"), Some(Resolved));
+    }
+
+    #[tokio::test]
+    async fn reload_returns_the_report_when_the_activation_fails() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.add("b", &["a"]);
+        f.host.discover().await.unwrap();
+        f.go("b").await;
+        f.fake.set("activate a", Some(Mode::Fail));
+
+        let report = f.host.reload(&id("a")).await.unwrap();
+
+        assert!(report.activated.is_empty());
+        let a = &report.not_activated[&id("a")];
+        assert_eq!(a.category(), ErrorCategory::Connectivity);
+        let b = &report.not_activated[&id("b")];
+        assert!(b.message().contains("dependency `a` is not active"));
+        assert_eq!(f.state("a"), Some(Failed));
+        assert_eq!(f.state("b"), Some(Inactive));
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_activate_a_version_that_requires_a_ui_in_a_headless_host() {
+        let f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        f.fake.take_calls();
+        let ui = manifest("a", "1.1.0", &[], "requires_ui = true");
+        f.write(USER, "a", &ui);
+
+        let report = f.host.reload(&id("a")).await.unwrap();
+
+        assert!(report.activated.is_empty());
+        let error = &report.not_activated[&id("a")];
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert!(error.message().contains("requires_ui"), "{error}");
+        assert_eq!(f.state("a"), Some(Resolved));
+        assert_eq!(f.fake.take_calls(), ["deactivate a", "unload a"]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_call_is_not_reported_as_a_panic() {
+        let cancelled: JoinHandle<Result<()>> = tokio::spawn(std::future::pending());
+        cancelled.abort();
+        let panicked: JoinHandle<Result<()>> = tokio::spawn(async { panic!("defect") });
+
+        let cancelled = joined(&id("a"), "activate", DAY, cancelled).await;
+        let panicked = joined(&id("a"), "activate", DAY, panicked).await;
+
+        let (cancelled, panicked) = (cancelled.unwrap_err(), panicked.unwrap_err());
+        assert_eq!(cancelled.category(), ErrorCategory::Internal);
+        assert_eq!(
+            cancelled.message(),
+            "extension `a` was cancelled in `activate`"
+        );
+        assert_eq!(panicked.message(), "extension `a` panicked in `activate`");
+    }
+
+    #[tokio::test]
+    async fn a_state_change_event_gives_the_reason() {
+        let config = HostConfig {
+            restart_limit: 0,
+            ..HostConfig::default()
+        };
+        let mut f = fixture_with(true, config);
+        f.add("a", &[]);
+        f.add("needs-missing", &["missing"]);
+        f.host.discover().await.unwrap();
+        f.fake.set("activate a", Some(Mode::Fail));
+        f.go("a").await;
+
+        let events = f.events().await;
+
+        let reasons: Vec<(String, Option<String>)> = events
+            .iter()
+            .map(|event| (line(event), event.reason.clone()))
+            .collect();
+        let reason = |change: &str| {
+            let found = reasons.iter().find(|(line, _)| line == change);
+            found.unwrap_or_else(|| panic!("no {change}")).1.clone()
+        };
+        assert_eq!(reason("a: none -> Discovered"), None);
+        assert_eq!(reason("a: Discovered -> Resolved"), None);
+        let rejected = reason("needs-missing: Discovered -> Rejected").unwrap();
+        assert!(rejected.contains("`missing` is not present"), "{rejected}");
+        let failed = reason("a: Resolved -> Failed");
+        assert_eq!(failed.as_deref(), Some("activate a failed"));
+        let disabled = reason("a: Failed -> Disabled").unwrap();
+        assert!(disabled.contains("restart limit of 0"), "{disabled}");
+        // The reason in the event is the reason in the status.
+        assert_eq!(f.reason("a"), disabled);
     }
 }
