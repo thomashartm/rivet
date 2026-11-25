@@ -42,6 +42,9 @@ struct Registered {
 
 /// Cuts `text` to a maximum of `max` bytes at a character boundary. Returns
 /// the start of the text, and the mark `…` if the text was cut.
+///
+/// The start has `max` bytes at most. With the mark (3 bytes) the two parts
+/// have `max + 3` bytes at most.
 pub(crate) fn cut(text: &str, max: usize) -> (&str, &'static str) {
     let start = &text[..text.floor_char_boundary(max)];
     (start, if start.len() < text.len() { "…" } else { "" })
@@ -50,6 +53,10 @@ pub(crate) fn cut(text: &str, max: usize) -> (&str, &'static str) {
 /// Returns text from outside for an error message: cut to `max` bytes
 /// ([`cut`]), and with each control character escaped so that it cannot
 /// start a line in a log.
+///
+/// The escape is after the cut, so the result can be longer than `max`
+/// bytes. One byte becomes 6 bytes at most (`\u{1b}`), so the result has
+/// `6 * max + 3` bytes at most.
 pub(crate) fn shown(text: &str, max: usize) -> String {
     let (start, mark) = cut(text, max);
     format!("{}{mark}", start.escape_debug())
@@ -515,6 +522,20 @@ mod tests {
         assert_eq!(cut("", 0), ("", ""));
         assert_eq!(shown("a\nb\u{1b}'\"", 64), "a\\nb\\u{1b}\\'\\\"");
         assert_eq!(shown("a\nbc", 2), "a\\n…");
+    }
+
+    #[test]
+    fn shown_has_six_times_the_cut_plus_the_mark_at_most() {
+        // The worst case: each byte is a character with a 6 byte escape.
+        let worst = "\u{1b}".repeat(2000);
+        let (start, mark) = cut(&worst, 1024);
+        assert_eq!((start.len(), mark.len()), (1024, 3));
+        assert_eq!(shown(&worst, 1024).len(), 6 * 1024 + 3);
+        // No character has a longer escape for each of its bytes.
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let text = c.to_string();
+            assert!(shown(&text, 4).len() <= 6 * text.len(), "{c:?}");
+        }
     }
 
     #[test]

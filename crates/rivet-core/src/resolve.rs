@@ -97,6 +97,8 @@ pub const MAX_RANGE_CHARS: usize = 64;
 
 /// Returns `range` cut to [`MAX_RANGE_CHARS`] characters.
 fn cut(range: &str) -> String {
+    // Not `logging::cut`: that one counts bytes and marks with `…`. The
+    // public limit here is in characters and the mark is `...`.
     match range.char_indices().nth(MAX_RANGE_CHARS) {
         Some((end, _)) => format!("{}...", &range[..end]),
         None => range.to_owned(),

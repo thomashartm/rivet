@@ -227,22 +227,29 @@ type Slots = Mutex<HashMap<ExtensionId, Arc<Semaphore>>>;
 /// supervisor task of the process keeps it to its end. The drop lets the
 /// next load of the extension continue.
 struct Slot {
-    id: ExtensionId,
-    slots: Arc<Slots>,
+    // Before `_user`: the permit is an owner of the semaphore, and the drop
+    // of the user counts the owners without it.
     _permit: OwnedSemaphorePermit,
+    _user: SlotUser,
 }
 
-impl Drop for Slot {
-    /// Removes the entry of the extension if no load waits for it, so the
-    /// map does not grow.
+/// One load that waits for the slot of an extension or has it.
+struct SlotUser {
+    id: ExtensionId,
+    slots: Arc<Slots>,
+    slot: Arc<Semaphore>,
+}
+
+impl Drop for SlotUser {
+    /// Removes the entry of the extension if this is its last user, so the
+    /// map does not grow. A load that is cancelled while it waits is a user
+    /// also.
     fn drop(&mut self) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        // The two owners are the map and the permit of this slot. A load
-        // that waits is one more, and it became one with this lock held.
-        if slots
-            .get(&self.id)
-            .is_some_and(|slot| Arc::strong_count(slot) == 2)
-        {
+        // The two owners are the map and this user: its permit or its wait
+        // for the permit is dropped before it. Each other user is one or
+        // two more, and it became a user with this lock held.
+        if Arc::strong_count(&self.slot) == 2 {
             slots.remove(&self.id);
         }
     }
@@ -286,23 +293,25 @@ impl NativeRuntime {
     /// Waits until no process of `id` runs. A load of a different
     /// extension does not wait, and no lock is held during the wait.
     async fn slot(&self, id: &ExtensionId) -> Result<Slot> {
-        let slot = {
+        let user = {
             let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(
-                slots
-                    .entry(id.clone())
-                    .or_insert_with(|| Arc::new(Semaphore::new(1))),
-            )
+            let slot = slots
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)));
+            SlotUser {
+                id: id.clone(),
+                slots: Arc::clone(&self.slots),
+                slot: Arc::clone(slot),
+            }
         };
         // Nothing closes the semaphore.
-        let permit = slot
+        let permit = Arc::clone(&user.slot)
             .acquire_owned()
             .await
             .map_err(|error| failure(id, "the process slot is closed").with_source(error))?;
         Ok(Slot {
-            id: id.clone(),
-            slots: Arc::clone(&self.slots),
             _permit: permit,
+            _user: user,
         })
     }
 }
@@ -724,4 +733,82 @@ async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Re
         tracing::info!(extension, guest_message, "extension error output");
     }
     log.renew();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> NativeRuntime {
+        // No test here starts the program.
+        let program = std::env::current_exe().unwrap();
+        NativeRuntime::new(
+            NativeConfig::new(program),
+            Redactor::new(),
+            Arc::new(|_, _| {}),
+        )
+        .unwrap()
+    }
+
+    fn entries(runtime: &NativeRuntime) -> usize {
+        runtime.slots.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_slot_removes_its_entry() {
+        let runtime = runtime();
+        let ids: Vec<ExtensionId> = (0..8)
+            .map(|n| format!("acme.e{n}").parse().unwrap())
+            .collect();
+        let mut slots = Vec::new();
+        for id in &ids {
+            slots.push(runtime.slot(id).await.unwrap());
+        }
+        assert_eq!(entries(&runtime), ids.len());
+        drop(slots);
+        assert_eq!(entries(&runtime), 0);
+    }
+
+    #[tokio::test]
+    async fn a_load_that_waits_keeps_the_entry_and_gets_the_slot() {
+        let runtime = runtime();
+        let id: ExtensionId = "acme.native".parse().unwrap();
+        let old = runtime.slot(&id).await.unwrap();
+        let waiter = runtime.slot(&id);
+        tokio::pin!(waiter);
+        // One poll: the waiter is in the queue of the slot.
+        tokio::select! {
+            biased;
+            _ = &mut waiter => panic!("two slots for one extension"),
+            () = std::future::ready(()) => {}
+        }
+        drop(old);
+        assert_eq!(entries(&runtime), 1);
+        let new = waiter.await.unwrap();
+        assert_eq!(entries(&runtime), 1);
+        drop(new);
+        assert_eq!(entries(&runtime), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_load_that_waited_leaves_no_entry() {
+        let runtime = runtime();
+        let id: ExtensionId = "acme.native".parse().unwrap();
+        let old = runtime.slot(&id).await.unwrap();
+        {
+            let waiter = runtime.slot(&id);
+            tokio::pin!(waiter);
+            tokio::select! {
+                biased;
+                _ = &mut waiter => panic!("two slots for one extension"),
+                () = std::future::ready(()) => {}
+            }
+            // The old slot ends while the load waits, then the load is
+            // cancelled.
+            drop(old);
+        }
+        assert_eq!(entries(&runtime), 0);
+        // The next load does not wait.
+        let _slot = runtime.slot(&id).await.unwrap();
+    }
 }
