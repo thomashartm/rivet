@@ -5,6 +5,15 @@
 //! network I/O (§3.3). Unknown fields are rejected. A failure is an
 //! [`Error`] of the category `user`.
 //!
+//! A manifest is untrusted input. Thus:
+//!
+//! - Each of the lists `contributes`, `activation`, `capabilities.network`,
+//!   `capabilities.filesystem` and `capabilities.secrets` has a maximum of
+//!   [`LIST_MAX_ENTRIES`] entries.
+//! - An error message repeats a maximum of 128 characters of a value of the
+//!   manifest and shows a control character as an escape (for example
+//!   `\u{1b}`). It does not contain a line break.
+//!
 //! # Extension id rules
 //!
 //! An [`ExtensionId`] is valid when all of these are true:
@@ -29,15 +38,16 @@
 //! - An IP address literal, for example `10.0.0.5`, `::1` or `[::1]`. The
 //!   `[]` are permitted only for IPv6.
 //! - A DNS name of 1 to 253 characters: labels separated by `.`. Each label
-//!   has 1 to 63 ASCII letters, digits or `-`, and does not start or end
-//!   with `-`. Upper case is permitted. The last label is not a number (only
-//!   digits, or `0x` and hexadecimal digits), because some resolvers read
-//!   such a name as an address.
+//!   has 1 to 63 ASCII letters, digits, `-` or `_`, and does not start or
+//!   end with `-`. Upper case is permitted. The last label is not a number
+//!   (only digits, or `0x` and hexadecimal digits), because some resolvers
+//!   read such a name as an address.
 //!
-//! A port, a scheme, a path, a wildcard and whitespace are not permitted.
-//! Each host has one table. Two hosts are the same when their text is equal
-//! (ASCII case ignored) or when they are the same IP address. A port is in
-//! the `ports` list one time only.
+//! A port, a scheme, a path, a wildcard, whitespace and a `.` at the end
+//! (`db.example.com.`) are not permitted.
+//! Each host has one table. Two hosts are the same when [`same_host`] says
+//! so: their text is equal (ASCII case ignored) or they are the same IP
+//! address. A port is in the `ports` list one time only.
 //!
 //! A filesystem `path` obeys these rules. They are the same on each operating
 //! system; the permission service decides at run time if the path exists on
@@ -47,8 +57,13 @@
 //! - It is `~`, or it starts with `~/`, with `/`, with a Windows drive
 //!   (`C:\` or `C:/`) or with `\\` (UNC). A relative path and `~user` are not
 //!   permitted.
-//! - It has no `..` component. Components are separated by `/` or `\`.
-//! - A `path` with the same `access` is declared one time only.
+//! - It has no control character (for example NUL, a line feed or ESC).
+//! - It has no `.` or `..` component. Components are separated by `/` or `\`.
+//! - It has one spelling: no empty component (`/a//b`) and no separator at
+//!   the end (`/a/`, `~/`). A root (`/`, `C:\`) and the `\\` at the start of
+//!   a UNC path are permitted.
+//! - A `path` is declared one time only, whatever the `access`. Two paths are
+//!   the same when their text is equal.
 //!
 //! A secret namespace has one or more segments, separated by `/`. A segment
 //! has one or more ASCII letters, digits, `.`, `_` or `-`, and is not `.` or
@@ -79,9 +94,9 @@
 //! # Ok::<(), rivet_sdk::error::Error>(())
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
 pub use semver::{Version, VersionReq};
@@ -91,6 +106,19 @@ use crate::error::{Error, Result};
 
 /// The maximum length of an [`ExtensionId`] in characters.
 pub const EXTENSION_ID_MAX_LEN: usize = 128;
+
+/// The maximum number of entries in each of the lists `contributes`,
+/// `activation`, `capabilities.network`, `capabilities.filesystem` and
+/// `capabilities.secrets`.
+pub const LIST_MAX_ENTRIES: usize = 256;
+
+/// The maximum number of characters of a manifest value that an error message
+/// repeats.
+const ERROR_VALUE_MAX_CHARS: usize = 128;
+
+/// The maximum number of characters of a TOML parser message that an error
+/// message repeats.
+const PARSE_MESSAGE_MAX_CHARS: usize = 512;
 
 /// The validated id of an extension. See the [module documentation](self) for
 /// the rules.
@@ -127,7 +155,8 @@ impl TryFrom<String> for ExtensionId {
     fn try_from(value: String) -> Result<Self> {
         match id_rule_violation(&value) {
             Some(reason) => Err(Error::user(format!(
-                "invalid extension id `{value}`: {reason}"
+                "invalid extension id `{}`: {reason}",
+                shown(&value, ERROR_VALUE_MAX_CHARS)
             ))),
             None => Ok(Self(value)),
         }
@@ -161,19 +190,57 @@ fn id_rule_violation(value: &str) -> Option<&'static str> {
     None
 }
 
-/// Parses an IP address literal, with or without the `[]` of a URL.
+/// Returns `value` in the form that an error message can show: a maximum of
+/// `max` characters, and no character that changes the line or the direction
+/// of the text in a terminal or in a log. A manifest is untrusted input.
+fn shown(value: &str, max: usize) -> String {
+    let mut text = String::new();
+    for character in value.chars().take(max) {
+        // Control characters, line separators and direction controls.
+        let unsafe_to_show = character.is_control()
+            || matches!(character, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if unsafe_to_show {
+            text.extend(character.escape_default());
+        } else {
+            text.push(character);
+        }
+    }
+    if value.chars().nth(max).is_some() {
+        text.push_str("...");
+    }
+    text
+}
+
+/// Parses an IP address literal. An IPv6 address can have the `[]` of a
+/// URL; an IPv4 address in `[]` is not an address.
 fn ip_literal(host: &str) -> Option<IpAddr> {
-    host.strip_prefix('[')
+    match host
+        .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host)
-        .parse()
-        .ok()
+    {
+        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        None => host.parse().ok(),
+    }
+}
+
+/// The form of a host in which two equal hosts are equal values.
+#[derive(PartialEq, Eq, Hash)]
+enum HostKey {
+    Address(IpAddr),
+    Name(String),
+}
+
+fn host_key(host: &str) -> HostKey {
+    match ip_literal(host) {
+        Some(address) => HostKey::Address(address),
+        None => HostKey::Name(host.to_ascii_lowercase()),
+    }
 }
 
 /// `true` if `host` obeys the [network host rules](self#capability-scope-rules).
 fn is_network_host(host: &str) -> bool {
-    if let Some(address) = ip_literal(host) {
-        return address.is_ipv6() || !host.starts_with('[');
+    if ip_literal(host).is_some() {
+        return true;
     }
     let is_number = |label: &str| {
         let digits = label
@@ -187,21 +254,34 @@ fn is_network_host(host: &str) -> bool {
             (1..=63).contains(&label.len())
                 && label
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
                 && !label.starts_with('-')
                 && !label.ends_with('-')
         })
         && !host.rsplit('.').next().is_some_and(is_number)
 }
 
-/// `true` if the permission service reads the two valid hosts as one host:
-/// equal text (ASCII case ignored) or equal IP addresses (ADR-0020).
-fn same_host(left: &str, right: &str) -> bool {
-    match (ip_literal(left), ip_literal(right)) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => left.eq_ignore_ascii_case(right),
-        _ => false,
-    }
+/// Returns `true` if the two hosts are the same host (ADR-0020). This is the
+/// one comparison of hosts: the manifest validation and the permission
+/// service use it.
+///
+/// - Two IP address literals are the same when they are the same address. An
+///   IPv6 address can have the `[]` of a URL.
+/// - All other texts are the same when they are equal, ASCII case ignored.
+///
+/// There is no name resolution, no wildcard and no conversion between IPv4
+/// and IPv6. The function does not validate: a text that is not a valid host
+/// is the same only as an equal text.
+///
+/// ```
+/// use rivet_sdk::manifest::same_host;
+///
+/// assert!(same_host("db.example.com", "DB.Example.com"));
+/// assert!(same_host("::1", "[0:0:0:0:0:0:0:1]"));
+/// assert!(!same_host("localhost", "127.0.0.1"));
+/// ```
+pub fn same_host(left: &str, right: &str) -> bool {
+    host_key(left) == host_key(right)
 }
 
 /// `true` if `namespace` obeys the
@@ -226,12 +306,20 @@ fn is_scope_path_start(path: &str) -> bool {
         || matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
-/// Returns the index of the first item before `items[index]` that is the
-/// `same` as `items[index]`.
-fn earlier_same<T>(items: &[T], index: usize, same: impl Fn(&T, &T) -> bool) -> Option<usize> {
-    items[..index]
-        .iter()
-        .position(|earlier| same(earlier, &items[index]))
+/// `true` if the valid-start `path` has an empty component or ends with a
+/// separator. A root (`/`, `C:\`) and the `\\` of a UNC path are not empty
+/// components.
+fn has_empty_component(path: &str) -> bool {
+    let separators = ['/', '\\'];
+    match path.strip_prefix(r"\\") {
+        Some(unc) => unc.split(separators).any(str::is_empty),
+        None => {
+            path == "~/"
+                || path.split_once(separators).is_some_and(|(_, rest)| {
+                    !rest.is_empty() && rest.split(separators).any(str::is_empty)
+                })
+        }
+    }
 }
 
 impl FromStr for ExtensionId {
@@ -330,7 +418,7 @@ impl Contribution {
 
 /// An event that activates an extension (§4.4): an `[[activation]]` table.
 /// The field `on` selects the event.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(tag = "on", rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ActivationEvent {
@@ -576,15 +664,36 @@ impl Manifest {
     /// - a network scope has an empty `ports` list, contains port 0 or contains
     ///   a port more than once;
     /// - two contributions have the same `kind` and `id`;
-    /// - an activation event, a network host, a filesystem scope, a secret
+    /// - an activation event, a network host, a filesystem path, a secret
     ///   namespace or a clipboard access is declared more than once;
+    /// - a list has more than [`LIST_MAX_ENTRIES`] entries;
     /// - an activation event is `on = "extension-point"` and there is no
     ///   `[[contributes]]` table;
     /// - a UI extension point is contributed and `requires_ui` is not `true`.
     pub fn parse(text: &str) -> Result<Self> {
-        // The TOML error shows the line of the manifest, so it names the field.
+        // The line of the manifest names the field. The parser error is not
+        // the source: its text repeats the manifest with no limit.
         let manifest: Self = toml::from_str(text).map_err(|error| {
-            Error::user(format!("invalid extension manifest: {error}")).with_source(error)
+            let place = error
+                .span()
+                .and_then(|span| text.get(..span.start))
+                .map(|before| {
+                    let line_start = before.rfind('\n').map_or(0, |end| end + 1);
+                    format!(
+                        "line {}, column {} (`{}`): ",
+                        before.matches('\n').count() + 1,
+                        before[line_start..].chars().count() + 1,
+                        shown(
+                            text[line_start..].lines().next().unwrap_or(""),
+                            ERROR_VALUE_MAX_CHARS
+                        )
+                    )
+                })
+                .unwrap_or_default();
+            Error::user(format!(
+                "invalid extension manifest: {place}{}",
+                shown(error.message(), PARSE_MESSAGE_MAX_CHARS)
+            ))
         })?;
         manifest.validate()?;
         Ok(manifest)
@@ -594,6 +703,8 @@ impl Manifest {
     fn validate(&self) -> Result<()> {
         let invalid =
             |reason: String| Err(Error::user(format!("invalid extension manifest: {reason}")));
+        // The text of a value in a message.
+        let shown = |value: &str| shown(value, ERROR_VALUE_MAX_CHARS);
         let not_blank = |field: String, value: &str| {
             if value.trim().is_empty() {
                 return invalid(format!("field `{field}` must not be empty"));
@@ -602,9 +713,26 @@ impl Manifest {
         };
         // After `not_blank`, for a text with the extension id rules.
         let valid_id = |field: String, value: &str| match id_rule_violation(value) {
-            Some(reason) => invalid(format!("field `{field}` (`{value}`) is invalid: {reason}")),
+            Some(reason) => invalid(format!(
+                "field `{field}` (`{}`) is invalid: {reason}",
+                shown(value)
+            )),
             None => Ok(()),
         };
+        let capabilities = &self.capabilities;
+        for (field, entries) in [
+            ("contributes", self.contributes.len()),
+            ("activation", self.activation.len()),
+            ("capabilities.network", capabilities.network.len()),
+            ("capabilities.filesystem", capabilities.filesystem.len()),
+            ("capabilities.secrets", capabilities.secrets.len()),
+        ] {
+            if entries > LIST_MAX_ENTRIES {
+                return invalid(format!(
+                    "field `{field}` has {entries} entries; the maximum is {LIST_MAX_ENTRIES}"
+                ));
+            }
+        }
 
         if self.dependencies.contains_key(&self.id) {
             return invalid(format!(
@@ -612,27 +740,28 @@ impl Manifest {
                 self.id
             ));
         }
+        // Each `seen` map gives the index of the first entry with a key, so a
+        // duplicate check does not compare an entry with each earlier entry.
+        let mut seen = HashMap::new();
         for (index, contribution) in self.contributes.iter().enumerate() {
             not_blank(format!("contributes[{index}].id"), &contribution.id)?;
             valid_id(format!("contributes[{index}].id"), &contribution.id)?;
-            if let Some(first) = self.contributes[..index]
-                .iter()
-                .position(|earlier| earlier == contribution)
-            {
+            if let Some(first) = seen.insert((contribution.kind, &contribution.id), index) {
                 return invalid(format!(
                     "field `contributes[{index}]` has the same `kind` and `id` (`{}`) as \
                      `contributes[{first}]`",
-                    contribution.id
+                    shown(&contribution.id)
                 ));
             }
             if contribution.kind.is_ui() && !self.requires_ui {
                 return invalid(format!(
                     "field `requires_ui` must be `true` because the UI contribution `{}` \
                      is declared in `contributes`",
-                    contribution.id
+                    shown(&contribution.id)
                 ));
             }
         }
+        let mut seen = HashMap::new();
         for (index, event) in self.activation.iter().enumerate() {
             match event {
                 ActivationEvent::ExtensionPoint => {
@@ -652,31 +781,38 @@ impl Manifest {
                     valid_id(format!("activation[{index}].type"), connection_type)?;
                 }
             }
-            if let Some(first) = earlier_same(&self.activation, index, PartialEq::eq) {
+            if let Some(first) = seen.insert(event, index) {
                 return invalid(format!(
                     "field `activation[{index}]` is the same as `activation[{first}]`"
                 ));
             }
         }
-        for (index, scope) in self.capabilities.network.iter().enumerate() {
+        let mut seen = HashMap::new();
+        for (index, scope) in capabilities.network.iter().enumerate() {
             not_blank(format!("capabilities.network[{index}].host"), &scope.host)?;
+            if scope.host.strip_suffix('.').is_some_and(is_network_host) {
+                return invalid(format!(
+                    "field `capabilities.network[{index}].host` (`{}`) must not end with `.`; \
+                     remove the `.` at the end",
+                    shown(&scope.host)
+                ));
+            }
             if !is_network_host(&scope.host) {
                 return invalid(format!(
                     "field `capabilities.network[{index}].host` (`{}`) must be a DNS name or an \
-                     IP address. A DNS name has labels of ASCII letters, digits and `-`, \
+                     IP address. A DNS name has labels of ASCII letters, digits, `-` and `_`, \
                      separated by `.`; a label does not start or end with `-` and the last \
                      label is not a number. A port, a scheme, a path, a wildcard and \
                      whitespace are not permitted",
-                    scope.host
+                    shown(&scope.host)
                 ));
             }
-            if let Some(first) = earlier_same(&self.capabilities.network, index, |a, b| {
-                same_host(&a.host, &b.host)
-            }) {
+            // The key of `same_host`.
+            if let Some(first) = seen.insert(host_key(&scope.host), index) {
                 return invalid(format!(
                     "field `capabilities.network[{index}].host` (`{}`) is the same host as \
                      `capabilities.network[{first}].host`; put all ports of a host in one table",
-                    scope.host
+                    shown(&scope.host)
                 ));
             }
             if scope.ports.is_empty() {
@@ -689,16 +825,16 @@ impl Manifest {
                     "field `capabilities.network[{index}].ports` must not contain port 0"
                 ));
             }
-            if let Some(port) = (1..scope.ports.len())
-                .find(|&port| earlier_same(&scope.ports, port, PartialEq::eq).is_some())
-            {
+            let mut ports = HashSet::new();
+            if let Some(port) = scope.ports.iter().find(|&port| !ports.insert(port)) {
                 return invalid(format!(
-                    "field `capabilities.network[{index}].ports` contains port {} more than once",
-                    scope.ports[port]
+                    "field `capabilities.network[{index}].ports` contains port {port} more than \
+                     once"
                 ));
             }
         }
-        for (index, scope) in self.capabilities.filesystem.iter().enumerate() {
+        let mut seen = HashMap::new();
+        for (index, scope) in capabilities.filesystem.iter().enumerate() {
             not_blank(
                 format!("capabilities.filesystem[{index}].path"),
                 &scope.path,
@@ -707,48 +843,76 @@ impl Manifest {
                 return invalid(format!(
                     "field `capabilities.filesystem[{index}].path` (`{}`) must not start or end \
                      with whitespace",
-                    scope.path
+                    shown(&scope.path)
                 ));
             }
             if !is_scope_path_start(&scope.path) {
                 return invalid(format!(
                     "field `capabilities.filesystem[{index}].path` (`{}`) must be an absolute \
                      path, `~` or a path that starts with `~/`",
-                    scope.path
+                    shown(&scope.path)
                 ));
             }
             if scope.path.split(['/', '\\']).any(|part| part == "..") {
                 return invalid(format!(
                     "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
                      `..` component",
-                    scope.path
+                    shown(&scope.path)
                 ));
             }
-            if let Some(first) = earlier_same(&self.capabilities.filesystem, index, PartialEq::eq) {
+            if scope.path.contains(char::is_control) {
                 return invalid(format!(
-                    "field `capabilities.filesystem[{index}]` has the same `path` and `access` \
-                     as `capabilities.filesystem[{first}]`"
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
+                     control character",
+                    shown(&scope.path)
+                ));
+            }
+            if scope.path.split(['/', '\\']).any(|part| part == ".") {
+                return invalid(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
+                     `.` component",
+                    shown(&scope.path)
+                ));
+            }
+            if has_empty_component(&scope.path) {
+                return invalid(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain an \
+                     empty component or end with a separator",
+                    shown(&scope.path)
+                ));
+            }
+            // Exact text, as the update review compares paths (ADR-0020).
+            if let Some(first) = seen.insert(&scope.path, index) {
+                return invalid(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) is the same path as \
+                     `capabilities.filesystem[{first}].path`; declare a path one time, with \
+                     the access it needs",
+                    shown(&scope.path)
                 ));
             }
         }
-        for (index, namespace) in self.capabilities.secrets.iter().enumerate() {
+        let mut seen = HashMap::new();
+        for (index, namespace) in capabilities.secrets.iter().enumerate() {
             not_blank(format!("capabilities.secrets[{index}]"), namespace)?;
             if !is_secret_namespace(namespace) {
                 return invalid(format!(
-                    "field `capabilities.secrets[{index}]` (`{namespace}`) must be segments \
+                    "field `capabilities.secrets[{index}]` (`{}`) must be segments \
                      separated by `/`; a segment has one or more ASCII letters, digits, `.`, \
-                     `_` or `-` and is not `.` or `..`"
+                     `_` or `-` and is not `.` or `..`",
+                    shown(namespace)
                 ));
             }
-            if let Some(first) = earlier_same(&self.capabilities.secrets, index, PartialEq::eq) {
+            if let Some(first) = seen.insert(namespace, index) {
                 return invalid(format!(
-                    "field `capabilities.secrets[{index}]` (`{namespace}`) is the same as \
-                     `capabilities.secrets[{first}]`"
+                    "field `capabilities.secrets[{index}]` (`{}`) is the same as \
+                     `capabilities.secrets[{first}]`",
+                    shown(namespace)
                 ));
             }
         }
-        for index in 0..self.capabilities.clipboard.len() {
-            if let Some(first) = earlier_same(&self.capabilities.clipboard, index, PartialEq::eq) {
+        let mut seen = HashMap::new();
+        for (index, access) in capabilities.clipboard.iter().enumerate() {
+            if let Some(first) = seen.insert(access, index) {
                 return invalid(format!(
                     "field `capabilities.clipboard[{index}]` is the same as \
                      `capabilities.clipboard[{first}]`"
@@ -905,7 +1069,10 @@ mod tests {
         ];
         for (id, reason) in cases {
             let text = MINIMAL.replace("acme.postgres", id);
-            rejected(&text, &["id = ", "\ninvalid extension id", reason]);
+            rejected(
+                &text,
+                &["line 1, column 6", "id = ", "invalid extension id", reason],
+            );
         }
         let long = "a".repeat(EXTENSION_ID_MAX_LEN + 1);
         rejected(
@@ -1149,10 +1316,8 @@ mod tests {
             "db.example.com/path",
             "db..example.com",
             ".example.com",
-            "db.example.com.",
             "-db.example.com",
             "db-.example.com",
-            "db_1.example.com",
             "user@db.example.com",
             "b\u{fc}cher.example",
             "[db.example.com]",
@@ -1230,8 +1395,8 @@ mod tests {
         rejected(
             &format!("{MINIMAL}{}{}", scope("read"), scope("read")),
             &[
-                "field `capabilities.filesystem[1]`",
-                "same `path` and `access` as `capabilities.filesystem[0]`",
+                "field `capabilities.filesystem[1].path` (`~/.pg`)",
+                "is the same path as `capabilities.filesystem[0].path`",
             ],
         );
     }
@@ -1437,5 +1602,307 @@ mod tests {
     #[test]
     fn rejects_invalid_toml() {
         rejected("id = ", &["invalid extension manifest"]);
+    }
+
+    // R-54: each list has a maximum number of entries.
+    #[test]
+    fn rejects_list_with_more_than_the_maximum_number_of_entries() {
+        // One entry of each list. `secrets` is an array in one line.
+        type Entry = fn(usize) -> String;
+        let lists: [(&str, Entry); 5] = [
+            ("contributes", |n| {
+                format!("[[contributes]]\nkind = \"driver\"\nid = \"d{n}\"\n")
+            }),
+            ("activation", |n| {
+                format!("[[activation]]\non = \"command\"\ncommand = \"c{n}\"\n")
+            }),
+            ("capabilities.network", |n| {
+                network(&format!("2001:db8::{n:x}"), "[1]")
+            }),
+            ("capabilities.filesystem", |n| {
+                format!("[[capabilities.filesystem]]\npath = \"/d{n}\"\naccess = \"read\"\n")
+            }),
+            ("capabilities.secrets", |n| format!("\"s{n}\",")),
+        ];
+        for (field, entry) in lists {
+            let manifest = |count: usize| {
+                let entries: String = (0..count).map(entry).collect();
+                if field == "capabilities.secrets" {
+                    return format!("{MINIMAL}[capabilities]\nsecrets = [{entries}]\n");
+                }
+                format!("{MINIMAL}{entries}")
+            };
+            Manifest::parse(&manifest(LIST_MAX_ENTRIES))
+                .unwrap_or_else(|error| panic!("{field}: {error}"));
+            rejected(
+                &manifest(LIST_MAX_ENTRIES + 1),
+                &[
+                    &format!("field `{field}` has 257 entries"),
+                    "the maximum is 256",
+                ],
+            );
+        }
+    }
+
+    // R-54: a port is a `u16`, so the list needs no limit; the check is linear.
+    #[test]
+    fn accepts_every_port_and_rejects_a_duplicate_after_them() {
+        let all: Vec<String> = (1..=u16::MAX).map(|port| port.to_string()).collect();
+        let ports = format!("[{}]", all.join(","));
+        let manifest = Manifest::parse(&format!("{MINIMAL}{}", network("h", &ports))).unwrap();
+        assert_eq!(manifest.capabilities.network[0].ports.len(), 65535);
+        let ports = format!("[{},65535]", all.join(","));
+        rejected(
+            &format!("{MINIMAL}{}", network("h", &ports)),
+            &["contains port 65535 more than once"],
+        );
+    }
+
+    // R-55a: an error message cuts and escapes the text of the manifest.
+    #[test]
+    fn error_message_cuts_and_escapes_untrusted_text() {
+        let long = "a".repeat(1_000_000);
+        // TOML escapes: the parsed value has ESC, a line feed, a line
+        // separator and a right-to-left override.
+        let hostile = "a\\u001b[31mX\\nfake line\\u2028\\u202e";
+        let raw_escape = format!("{MINIMAL}x = \"a\u{1b}[31m\"\n");
+        let mut manifests = vec![raw_escape, format!("{MINIMAL}{long} = 1\n")];
+        for value in [long.as_str(), hostile] {
+            manifests.extend([
+                MINIMAL.replace("acme.postgres", value),
+                MINIMAL.replace("1.0.0", value),
+                format!("{MINIMAL}[dependencies]\n\"{value}\" = \"1\"\n"),
+                format!("{MINIMAL}[[contributes]]\nkind = \"{value}\"\nid = \"x\"\n"),
+                format!("{MINIMAL}[[contributes]]\nkind = \"driver\"\nid = \"{value}\"\n"),
+                format!("{MINIMAL}[[activation]]\non = \"command\"\ncommand = \"{value}\"\n"),
+                format!("{MINIMAL}[[activation]]\non = \"connection\"\ntype = \"{value}\"\n"),
+                format!("{MINIMAL}{}", network(value, "[1]")),
+                format!("{MINIMAL}{}", network(&format!("{value}."), "[1]")),
+                format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"{value}\"\naccess = \"read\"\n"
+                ),
+                format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"/{value}/..\"\naccess = \"read\"\n"
+                ),
+                format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"/{value}/.\"\naccess = \"read\"\n"
+                ),
+                format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"/{value}//\"\naccess = \"read\"\n"
+                ),
+                format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"/{value}\\u0000\"\naccess = \"read\"\n"
+                ),
+                // `%`: a long namespace is valid.
+                format!("{MINIMAL}[capabilities]\nsecrets = [\"{value}%\"]\n"),
+            ]);
+        }
+        // Duplicates: the value is valid for the first rules of its field.
+        let path = format!("/{long}");
+        let scope = format!("[[capabilities.filesystem]]\npath = \"{path}\"\naccess = \"read\"\n");
+        manifests.push(format!("{MINIMAL}{scope}{scope}"));
+        for manifest in manifests {
+            let error = Manifest::parse(&manifest).expect_err("manifest must be rejected");
+            let message = error.message();
+            let head: String = message.chars().take(200).collect();
+            assert!(message.len() <= 1024, "{} bytes: {head}", message.len());
+            assert!(
+                !message.chars().any(|c| c.is_control()
+                    || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+                "{message:?}"
+            );
+            // The parser error has the same text with no limit.
+            assert!(std::error::Error::source(&error).is_none(), "{head}");
+        }
+        rejected(
+            &format!("{MINIMAL}{}", network(hostile, "[1]")),
+            &["(`a\\u{1b}[31mX\\nfake line\\u{2028}\\u{202e}`)"],
+        );
+        let cut = format!("(`{}...`)", "a".repeat(ERROR_VALUE_MAX_CHARS));
+        rejected(&format!("{MINIMAL}{}", network(&long, "[1]")), &[&cut]);
+        // A value with the maximum length is not cut.
+        let whole = "a".repeat(ERROR_VALUE_MAX_CHARS);
+        rejected(
+            &format!("{MINIMAL}{}", network(&whole, "[1]")),
+            &[&format!("(`{whole}`)")],
+        );
+    }
+
+    // R-55b: `_` is permitted in a label of a host, not in an id.
+    #[test]
+    fn accepts_underscore_in_network_host_only() {
+        for host in [
+            "db_1.example.com",
+            "_dmarc.example.com",
+            "db_.example.com",
+            "a._",
+        ] {
+            Manifest::parse(&format!("{MINIMAL}{}", network(host, "[1]")))
+                .unwrap_or_else(|error| panic!("{host}: {error}"));
+        }
+        for id in ["pg_vacuum", "PgVacuum"] {
+            rejected(
+                &format!("{MINIMAL}[[contributes]]\nkind = \"driver\"\nid = \"{id}\"\n"),
+                &["field `contributes[0].id`", "only lowercase letters"],
+            );
+            rejected(
+                &format!("{MINIMAL}[[activation]]\non = \"command\"\ncommand = \"{id}\"\n"),
+                &["field `activation[0].command`", "only lowercase letters"],
+            );
+            rejected(
+                &format!("{MINIMAL}[[activation]]\non = \"connection\"\ntype = \"{id}\"\n"),
+                &["field `activation[0].type`", "only lowercase letters"],
+            );
+        }
+        rejected(
+            &format!(
+                "{MINIMAL}{}{}",
+                network("db_1.example.com", "[1]"),
+                network("DB_1.Example.com", "[2]")
+            ),
+            &["is the same host as `capabilities.network[0].host`"],
+        );
+    }
+
+    // R-55b: the message for a `.` at the end says what to do.
+    #[test]
+    fn rejects_network_host_with_dot_at_the_end() {
+        for host in ["db.example.com.", "localhost.", "10.0.0.5."] {
+            rejected(
+                &format!("{MINIMAL}{}", network(host, "[1]")),
+                &[
+                    "field `capabilities.network[0].host`",
+                    "remove the `.` at the end",
+                ],
+            );
+        }
+    }
+
+    // R-55d: the one host comparison of the SDK and of the permission service.
+    #[test]
+    fn same_host_ignores_ascii_case_and_compares_ip_addresses() {
+        for (left, right) in [
+            ("db.example.com", "DB.Example.COM"),
+            ("db_1.example.com", "DB_1.example.com"),
+            ("::1", "[::1]"),
+            ("::1", "0:0:0:0:0:0:0:1"),
+            ("[2001:DB8::1]", "2001:db8:0::1"),
+            ("10.0.0.5", "10.0.0.5"),
+        ] {
+            assert!(same_host(left, right), "{left} {right}");
+            assert!(same_host(right, left), "{right} {left}");
+        }
+        for (left, right) in [
+            ("db.example.com", "db.example.org"),
+            ("db_1.example.com", "db-1.example.com"),
+            ("db_1.example.com", "db1.example.com"),
+            ("db.example.com", "db.example.com."),
+            ("::1", "::2"),
+            ("10.0.0.5", "10.0.0.6"),
+            // An IPv4 address in `[]` is not an address.
+            ("10.0.0.5", "[10.0.0.5]"),
+            // No name resolution and no conversion between address families.
+            ("localhost", "127.0.0.1"),
+            ("::ffff:10.0.0.5", "10.0.0.5"),
+            // Only ASCII case is ignored.
+            ("b\u{fc}cher.example", "b\u{dc}cher.example"),
+        ] {
+            assert!(!same_host(left, right), "{left} {right}");
+            assert!(!same_host(right, left), "{right} {left}");
+        }
+    }
+
+    // R-55c: a path has one spelling.
+    #[test]
+    fn rejects_filesystem_path_with_a_second_spelling() {
+        // TOML literal strings (`'`): a `\` is not an escape.
+        let scope = |path: &str| {
+            format!("{MINIMAL}[[capabilities.filesystem]]\npath = '{path}'\naccess = \"read\"\n")
+        };
+        for path in ["/a/./b", "/a/.", "~/.", r"C:\a\.\b"] {
+            rejected(
+                &scope(path),
+                &[
+                    "field `capabilities.filesystem[0].path`",
+                    "must not contain a `.` component",
+                ],
+            );
+        }
+        for path in [
+            "/a//b",
+            "//host/share",
+            "/a/",
+            "~/",
+            "~/.pg/",
+            r"C:\data\",
+            r"C:\\data",
+            r"\\host\share\",
+            r"\\host\\share",
+            r"\\",
+            r"\\\host",
+        ] {
+            rejected(
+                &scope(path),
+                &[
+                    "field `capabilities.filesystem[0].path`",
+                    "must not contain an empty component or end with a separator",
+                ],
+            );
+        }
+        // A root ends with its separator. A name can start with `.`.
+        for path in [
+            "/",
+            r"C:\",
+            "C:/",
+            "~",
+            "~/.pg",
+            "/a/.b/c.",
+            r"\\host",
+            r"\\host\share",
+        ] {
+            Manifest::parse(&scope(path)).unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    // R-55c
+    #[test]
+    fn rejects_filesystem_path_with_control_character() {
+        for path in [
+            "/a\\u0000b",
+            "~/\\u0000",
+            "/a\\u0000",
+            "/a\\nb",
+            "/a\\u001b[31mb",
+            "/a\\tb",
+            "/a\\u007fb",
+            "/a\\u0085b",
+        ] {
+            rejected(
+                &format!(
+                    "{MINIMAL}[[capabilities.filesystem]]\npath = \"{path}\"\naccess = \"read\"\n"
+                ),
+                &[
+                    "field `capabilities.filesystem[0].path`",
+                    "must not contain a control character",
+                ],
+            );
+        }
+    }
+
+    // R-55c: a path is declared one time, whatever the access.
+    #[test]
+    fn rejects_filesystem_path_declared_with_two_accesses() {
+        let scope = |access: &str| {
+            format!("[[capabilities.filesystem]]\npath = \"~/.pg\"\naccess = \"{access}\"\n")
+        };
+        for (first, second) in [("read", "read-write"), ("read-write", "read")] {
+            rejected(
+                &format!("{MINIMAL}{}{}", scope(first), scope(second)),
+                &[
+                    "field `capabilities.filesystem[1].path` (`~/.pg`)",
+                    "is the same path as `capabilities.filesystem[0].path`",
+                ],
+            );
+        }
     }
 }
