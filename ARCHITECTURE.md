@@ -2,7 +2,7 @@
 
 This document defines the core architecture of the database client described in [MISSION.md](MISSION.md). Constraints use the keywords MUST, MUST NOT, SHOULD and MAY as defined in RFC 2119 (see [§10](#10-architectural-governance)).
 
-Items marked **(proposed)** are not decided yet. They need an ADR before implementation. All of them are listed in [Open Decisions](#open-decisions).
+Accepted decisions are recorded as ADRs in [`docs/adr/`](docs/adr/) and listed in [Decisions](#decisions). Items marked **(proposed)** are not decided yet and are listed in [Open Decisions](#open-decisions).
 
 ## 1. Architectural Principles
 
@@ -24,7 +24,7 @@ Items marked **(proposed)** are not decided yet. They need an ADR before impleme
 | --- | --- | --- | --- |
 | 1 | Core Engine | Runtime, extension host, service registry, event and command bus, core services (settings, secrets, logging, jobs), canonical data model | yes |
 | 2 | Capability Extensions | Drivers, auth providers, credential sources, tunnels, metadata, execution, transfer, administration, model providers, security policies | yes |
-| 3 | Headless Interfaces | CLI, daemon, control API, tunnel service, auth proxy, scripting | yes |
+| 3 | Headless Interfaces | CLI, daemon, control API, tunnel service, auth proxy, scripting host | yes |
 | 4 | UI Shell | Windowing, rendering, layout, input, theming, platform services | no |
 | 5 | UI Extensions | Editor, grid, navigator, diagrams, dashboards, wizards, assistant panel | no |
 
@@ -101,7 +101,7 @@ flowchart TB
 
 ## 3. Dependency Rules
 
-### 3.1 Crate Layout (proposed)
+### 3.1 Crate Layout ([ADR-0009](docs/adr/0009-crate-layout.md))
 
 | Crate | Layer | Content |
 | --- | --- | --- |
@@ -166,6 +166,7 @@ flowchart TB
 | Result sink | Consume an Arrow stream (grid, file, network) | WASM or native |
 | Importer / exporter | Convert between Arrow streams and external formats | WASM |
 | Model provider | Send a policy-filtered prompt, return a response | WASM |
+| Script engine | Language adapter that runs scripts against the Engine API ([ADR-0007](docs/adr/0007-scripting-adapters.md)); Rhai is the first adapter | native |
 | CLI command | Register a subcommand with typed arguments | WASM |
 | API endpoint | Register a control API method | WASM |
 | UI view / command / panel | Contribute UI elements (requires `requires_ui = true`) | WASM or native |
@@ -174,16 +175,16 @@ flowchart TB
 
 | Runtime | Use | Isolation | Crash containment |
 | --- | --- | --- | --- |
-| WASM component (default) | All extensions unless they need native performance or OS access | Sandbox; host enforces permissions at every import | A trap stops only that instance; the host restarts it |
-| Native plugin (C ABI) | Drivers, tunnels, credential sources, performance-critical code | Separate extension host process (proposed) | Process crash is contained; the engine restarts the host process |
+| WASM component on Wasmtime ([ADR-0002](docs/adr/0002-wasm-runtime.md)), default | All extensions unless they need native performance or OS access | Sandbox; host enforces permissions at every import | A trap stops only that instance; the host restarts it |
+| Native plugin (C ABI) | Drivers, tunnels, credential sources, performance-critical code | Separate extension host process ([ADR-0003](docs/adr/0003-native-plugin-placement.md)) | Process crash is contained; the engine restarts the host process |
 
-- A native plugin running in the engine process cannot be contained after memory corruption. Native plugins SHOULD therefore run in an out-of-process extension host. In-process native loading MAY be allowed for signed first-party extensions where the latency cost is measured as unacceptable (proposed).
+- A native plugin running in the engine process cannot be contained after memory corruption. Native plugins MUST therefore run in an out-of-process extension host by default. In-process native loading MAY be allowed only for signed first-party extensions where a benchmark shows the out-of-process cost is unacceptable ([ADR-0003](docs/adr/0003-native-plugin-placement.md)).
 - Each extension MUST have resource limits: memory, CPU time per call (WASM fuel or epoch interruption), open handles, concurrent jobs.
 
 ### 4.4 Discovery, Activation and Lifecycle
 
 - Extensions are discovered from: bundled packages, the user extension directory, the workspace extension directory and the registry.
-- Each extension has a manifest (`extension.toml`, proposed name) with:
+- Each extension has a manifest named `extension.toml` ([ADR-0008](docs/adr/0008-manifest-and-secret-uris.md)) with:
   - id, version, SDK version range;
   - dependencies with semver ranges;
   - contributed extension points;
@@ -241,14 +242,14 @@ stateDiagram-v2
 ### 4.8 Packaging and Distribution
 
 - An extension package contains: manifest, WASM component or native libraries per target, signature, licence, SDK docs reference.
-- Packages MUST be signed. The registry stores versioned packages and supports rollback to a previous version.
+- Packages MUST be signed with minisign ([ADR-0006](docs/adr/0006-extension-signing.md)). The registry stores versioned packages and supports rollback to a previous version.
 - Built-in extensions use the same package format and are bundled with the binary.
 
 ## 5. Runtime Architecture
 
 ### 5.1 Asynchronous Execution and Concurrency
 
-- The engine uses one multi-threaded async runtime (Tokio, proposed).
+- The engine uses one multi-threaded Tokio runtime ([ADR-0001](docs/adr/0001-async-runtime.md)).
 - Blocking work (file compression, Parquet encoding, CPU-heavy parsing) MUST run on a dedicated blocking pool, never on async worker threads.
 - The UI thread MUST be separate from the async runtime and MUST NOT wait on I/O. It receives results through channels.
 
@@ -325,13 +326,13 @@ Shutdown order:
 
 ### 6.2 State Ownership and Persistence
 
-| State | Owner | Storage (proposed) |
+| State | Owner | Storage |
 | --- | --- | --- |
 | Settings, profiles, policies | Core settings service | Versionable TOML files |
 | Secrets | Secret store service | OS keychain or cloud secret manager |
-| Query history | Execution extension | Local embedded database (SQLite, proposed) |
-| Metadata cache | Metadata extension | Local embedded database |
-| Audit logs (query, prompt) | Security extension | Append-only local store, optional export |
+| Query history | Execution extension | SQLite ([ADR-0005](docs/adr/0005-local-persistence.md)) |
+| Metadata cache | Metadata extension | SQLite |
+| Audit logs (query, prompt) | Security extension | Append-only SQLite store, optional export |
 | Job state | Job scheduler | Memory; daemon persists scheduled jobs |
 
 - Each piece of state has exactly one owner. Other components read it through that owner's service.
@@ -341,7 +342,7 @@ Shutdown order:
 
 - Layers: default → user → workspace → connection. A lower layer overrides a higher one per key.
 - Configuration files MUST carry a `schema_version` and are migrated forward on load.
-- Configuration as code: profiles and policies MUST be plain, diffable files with no secrets. They reference secrets by URI, e.g. `keychain://…`, `aws-sm://…`, `gcp-sm://…` (proposed scheme).
+- Configuration as code: profiles and policies MUST be plain, diffable files with no secrets. They reference secrets by URI: `keychain://…`, `aws-sm://…`, `gcp-sm://…` ([ADR-0008](docs/adr/0008-manifest-and-secret-uris.md)).
 
 ### 6.4 Credential and Secret Storage
 
@@ -365,7 +366,7 @@ Shutdown order:
 | In-process, Rust | Native Rust types and Arrow arrays in memory |
 | Host ↔ WASM extension | WIT records; bulk data as Arrow IPC buffers |
 | Host ↔ out-of-process native host | Arrow IPC over a local socket; control messages in a typed schema |
-| Engine ↔ remote client (daemon) | Control API; result data as Arrow IPC streams |
+| Engine ↔ remote client (daemon) | Control API over gRPC; result data over Arrow Flight ([ADR-0004](docs/adr/0004-control-api-protocol.md)) |
 | Engine ↔ external tools | CSV, JSON, Parquet, Excel, SQL, Markdown via exporters |
 
 ## 7. Security Architecture
@@ -417,7 +418,7 @@ Shutdown order:
 
 - Packages MUST be signed. The host verifies signatures on install and on load.
 - Unsigned extensions MAY be loaded only in an explicit developer mode.
-- The signing scheme is an open decision.
+- Signing uses minisign ([ADR-0006](docs/adr/0006-extension-signing.md)). Built-in extensions are signed with the project key. Third-party publisher keys are pinned on first install and a key change requires a new review.
 
 ## 8. Deployment Architecture
 
@@ -461,7 +462,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | Interface | Versioning | Breaking change |
 | --- | --- | --- |
 | Extension SDK (Rust, WIT, C ABI) | Semver | Major version only; deprecated items stay for at least one minor release |
-| Control API | Versioned API namespace | New version runs next to the old one for at least one minor release |
+| Control API | Versioned gRPC package (`rivet.control.v1`) | New version runs next to the old one for at least one minor release |
 | CLI | Semver of the binary | Major version only; flags deprecated with a warning first |
 | Configuration format | `schema_version` field | Automatic forward migration |
 
@@ -472,18 +473,23 @@ All targets are binding and MUST be checked by benchmarks in CI.
   - WIT interface compatibility check;
   - benchmarks for [§9](#9-quality-attributes) targets.
 
-## Open Decisions
+## Decisions
 
-Each item needs an ADR before work that depends on it starts.
+| # | Decision | Outcome | ADR |
+| --- | --- | --- | --- |
+| 1 | Async runtime | Tokio | [0001](docs/adr/0001-async-runtime.md) |
+| 2 | WASM runtime | Wasmtime; WASI version pinned in the ADR | [0002](docs/adr/0002-wasm-runtime.md) |
+| 3 | Native plugin placement | Out-of-process by default; in-process only for signed first-party extensions with a measured need | [0003](docs/adr/0003-native-plugin-placement.md) |
+| 4 | Control API protocol | gRPC, with Arrow Flight for result streams | [0004](docs/adr/0004-control-api-protocol.md) |
+| 5 | Local persistence | SQLite for history, metadata cache and audit log | [0005](docs/adr/0005-local-persistence.md) |
+| 6 | Extension signing | minisign | [0006](docs/adr/0006-extension-signing.md) |
+| 7 | Scripting | Adapter framework for multiple languages; Rhai first | [0007](docs/adr/0007-scripting-adapters.md) |
+| 8 | Manifest and secret URIs | `extension.toml`; `keychain://`, `aws-sm://`, `gcp-sm://` | [0008](docs/adr/0008-manifest-and-secret-uris.md) |
+| 9 | Crate layout | `rivet-*` crates as in §3.1 | [0009](docs/adr/0009-crate-layout.md) |
+
+## Open Decisions
 
 | # | Decision | Proposed |
 | --- | --- | --- |
-| 1 | Async runtime | Tokio |
-| 2 | WASM runtime and WASI version | Wasmtime; WASI version pinned in the ADR |
-| 3 | Native plugin placement | Out-of-process extension host by default; in-process only for signed first-party extensions with a measured need |
-| 4 | Control API protocol (mission allows gRPC or JSON-RPC) | gRPC, with Arrow Flight for result streams |
-| 5 | Local persistence for history, cache and audit log | SQLite |
-| 6 | Extension signing scheme | Not decided |
-| 7 | Embedded scripting language | Not decided |
-| 8 | Manifest file name and secret URI scheme | `extension.toml`; `keychain://`, `aws-sm://`, `gcp-sm://` |
-| 9 | Crate naming and layout | As in §3.1 |
+| 1 | Architecture check tool (§3.3) | `xtask check-arch` reading `cargo metadata` |
+| 2 | Control API token scopes (§7.2) | Scopes: read-only, run queries, manage tunnels |
