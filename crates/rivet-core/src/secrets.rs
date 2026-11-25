@@ -30,8 +30,9 @@ pub(crate) const BUILT_IN_SCHEMES: [&str; 2] = ["aws-sm", "gcp-sm"];
 /// The publisher segment of the built-in extensions.
 const BUILT_IN_PUBLISHER: &str = "rivet";
 
-/// The time limit of one read through [`ExtensionSecrets`]: the default of
-/// the call time limit of an extension (ADR-0021). A read that takes longer
+/// The time limit of one read of a backend that an extension registered: the
+/// default of the call time limit of an extension (ADR-0021). The limit does
+/// not depend on who reads. A read that takes longer
 /// fails with a `retryable` error, and the future of the backend is dropped
 /// (ADR-0020). The extension is not failed for it.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -174,6 +175,10 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
 /// For an extension, the store keeps one copy of each different value in
 /// memory that is set to zero, at most [`MAX_VALUES_PER_OWNER`] values. A
 /// read of one more value is refused.
+///
+/// A value shorter than [`MIN_REDACTED_LEN`] bytes is returned and is not
+/// hidden. Each read of such a value writes one `warn` event with the URI and
+/// without the value (ADR-0022).
 ///
 /// A value from a backend of an extension that is equal to the id of the
 /// reading extension or of an extension that has a backend is refused with
@@ -348,8 +353,9 @@ impl SecretStore {
 
     /// Reads the secret that `uri` references from the backend of its scheme.
     ///
-    /// This read has no time limit: the caller sets one. A read of an
-    /// extension has the limit [`READ_TIMEOUT`].
+    /// A read of a backend of an extension has the limit [`READ_TIMEOUT`]:
+    /// the backend is guest code. A read of the keychain has no limit: the
+    /// caller sets one.
     ///
     /// # Errors
     ///
@@ -360,6 +366,8 @@ impl SecretStore {
     ///   redacted, cleaned and cut as each text from an extension, and it
     ///   follows a text of the store that names the scheme. Its source is
     ///   dropped.
+    /// - Returns a `retryable` error if a backend of an extension does not
+    ///   answer in [`READ_TIMEOUT`].
     /// - Returns a `policy` error if a backend of an extension returns a
     ///   value that is equal to the id of an extension that has a backend.
     ///   See [Redaction](Self#redaction).
@@ -389,10 +397,10 @@ impl SecretStore {
                 ))
             })?;
         let read = backend.resolve(uri.path());
-        // The limit is for a backend of an extension that an extension
-        // reads. The keychain can ask the user, who can need more time
-        // (ADR-0020).
-        let result = if of_extension && reader.is_some() {
+        // The limit is for a backend of an extension, for each reader: the
+        // backend is guest code. The keychain can ask the user, who can
+        // need more time (ADR-0020).
+        let result = if of_extension {
             let Ok(result) = tokio::time::timeout(READ_TIMEOUT, read).await else {
                 return Err(Error::retryable(format!(
                     "the secret backend for the scheme `{}` did not answer in {} s",
@@ -408,6 +416,14 @@ impl SecretStore {
             Err(error) if of_extension => return Err(self.backend_error(scheme, &error)),
             result => result?,
         };
+        if secret.expose().len() < MIN_REDACTED_LEN {
+            // The event has the URI and never the value (ADR-0022).
+            warn!(
+                uri = %shown(&uri.to_string()),
+                reader = reader.map_or("core", Owner::as_str),
+                "a secret value is shorter than {MIN_REDACTED_LEN} bytes; the log cannot hide it"
+            );
+        }
         if let Some(redactor) = &self.redactor {
             self.register_value(redactor, reader, of_extension, &secret)?;
         }
@@ -416,6 +432,9 @@ impl SecretStore {
 
     /// Builds the error for a failure of a backend of an extension. The text
     /// of such a backend is text from a guest (ADR-0020).
+    ///
+    /// The source is dropped: guest code made it, it has no length limit, and
+    /// it can hold a secret value that is not registered for redaction yet.
     fn backend_error(&self, scheme: &str, error: &Error) -> Error {
         let redactor = self.redactor.clone().unwrap_or_default();
         let text = guest_text(&redactor, error.message());
@@ -531,6 +550,13 @@ impl Default for SecretStore {
 ///   still holds. The values that the extension read stay hidden until the
 ///   host calls [`SecretStore::unregister_owner`] for it; this includes a
 ///   value of a denied read.
+/// - An extension can read [`MAX_VALUES_PER_OWNER`] (256) different values.
+///   Then a read of a new value is refused with a `policy` error; a value
+///   that the extension read before can still be read. A secret that rotates
+///   is a new value at each rotation, so such an extension reaches the limit
+///   and is then refused. The values stay after [`Permissions::revoke`] and
+///   after the service is dropped. The only recovery is to unload the
+///   extension ([`SecretStore::unregister_owner`]).
 ///
 /// ```
 /// use rivet_core::logging::Redactor;
@@ -1005,11 +1031,7 @@ mod tests {
         let (secrets, _, backend) = extension_secrets(redactor.clone());
         let capture = Capture::default();
         let error = {
-            let _guard = tracing::dispatcher::set_default(&capture.dispatch(
-                Level::WARN,
-                LogFormat::Human,
-                &redactor,
-            ));
+            let _guard = capture_logs(&capture.dispatch(Level::WARN, LogFormat::Human, &redactor));
             secrets.resolve(&uri("aws-sm://other/prod")).await
         }
         .unwrap_err();
@@ -1103,6 +1125,30 @@ mod tests {
         "acme.postgres".parse().unwrap()
     }
 
+    /// Awaits a read that must end at [`READ_TIMEOUT`]. A read without the
+    /// limit fails the test here; without this bound it waits without end.
+    async fn bounded<T>(read: impl Future<Output = T>) -> T {
+        tokio::time::timeout(READ_TIMEOUT * 2, read)
+            .await
+            .expect("the read has no time limit")
+    }
+
+    /// Adds `backend` for the scheme `built-in` as the keychain is added:
+    /// without an owner.
+    fn register_built_in(store: &SecretStore, backend: Arc<dyn SecretBackend>) {
+        store
+            .backends
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                String::from("built-in"),
+                Registration {
+                    owner: None,
+                    backend,
+                },
+            );
+    }
+
     /// The secret service of `acme.postgres` (namespace `acme-postgres`) on
     /// a store in which `rivet.aws` owns `backend` for the scheme `aws-sm`.
     fn service_with(
@@ -1155,7 +1201,18 @@ mod tests {
         let (secrets, _, _) = service_with(&Redactor::new(), Arc::new(Gated::default()));
         let start = tokio::time::Instant::now();
         let read = uri("aws-sm://acme-postgres/prod");
-        let error = secrets.resolve(&read).await.unwrap_err();
+        let error = bounded(secrets.resolve(&read)).await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Retryable);
+        assert!(error.message().contains("`aws-sm`"), "{error}");
+        assert_eq!(start.elapsed(), READ_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_core_read_of_an_extension_backend_has_the_time_limit_too() {
+        let (_, _, store) = service_with(&Redactor::new(), Arc::new(Gated::default()));
+        let start = tokio::time::Instant::now();
+        let read = uri("aws-sm://acme-postgres/prod");
+        let error = bounded(store.resolve(&read)).await.unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Retryable);
         assert!(error.message().contains("`aws-sm`"), "{error}");
         assert_eq!(start.elapsed(), READ_TIMEOUT);
@@ -1165,18 +1222,7 @@ mod tests {
     async fn a_built_in_backend_that_does_not_answer_has_no_time_limit() {
         let built_in = Arc::new(Gated::default());
         let (secrets, _, store) = service_with(&Redactor::new(), Arc::new(Gated::default()));
-        // As the keychain: a backend without an owner.
-        store
-            .backends
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                String::from("built-in"),
-                Registration {
-                    owner: None,
-                    backend: Arc::clone(&built_in) as Arc<dyn SecretBackend>,
-                },
-            );
+        register_built_in(&store, Arc::clone(&built_in) as _);
         let read = uri("built-in://acme-postgres/prod");
         let mut resolve = std::pin::pin!(secrets.resolve(&read));
         let waited = tokio::time::timeout(READ_TIMEOUT * 10, &mut resolve).await;
@@ -1220,6 +1266,29 @@ mod tests {
         let read = uri("aws-sm://acme-postgres/prod");
         let secret = secrets.resolve(&read).await.unwrap();
         assert_eq!(redactor.redact(secret.expose()), REDACTED);
+    }
+
+    #[tokio::test]
+    async fn a_built_in_value_that_is_an_extension_id_is_registered() {
+        let redactor = Redactor::new();
+        let (secrets, _, store) = service_with(&redactor, InMemory::with(&[]));
+        let built_in = InMemory::with(&[
+            ("acme-postgres/reader", "acme.postgres"),
+            ("acme-postgres/owner", "rivet.aws"),
+        ]);
+        register_built_in(&store, built_in);
+
+        // An extension reads its id, and the host reads the id of a backend
+        // owner: a secret of the user is never left without redaction.
+        let read = uri("built-in://acme-postgres/reader");
+        assert_eq!(
+            secrets.resolve(&read).await.unwrap().expose(),
+            "acme.postgres"
+        );
+        assert_eq!(redactor.redact("acme.postgres"), REDACTED);
+        let read = uri("built-in://acme-postgres/owner");
+        assert_eq!(store.resolve(&read).await.unwrap().expose(), "rivet.aws");
+        assert_eq!(redactor.redact("rivet.aws"), REDACTED);
     }
 
     #[tokio::test]
@@ -1353,6 +1422,88 @@ mod tests {
 
         let entry = keychain_error("s", &"é".repeat(MIB), keyring::Error::NoEntry);
         assert!(entry.message().len() < MAX_SHOWN_BYTES + 300);
+    }
+
+    #[tokio::test]
+    async fn a_text_over_the_limit_is_cut_at_a_character_and_gets_the_mark() {
+        // The first `MAX_SHOWN_BYTES` bytes, then the mark.
+        let long = "a".repeat(MAX_SHOWN_BYTES + 1);
+        let error = SecretStore::new()
+            .resolve(&uri(&format!("{long}://x")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.message(),
+            format!(
+                "no secret backend is registered for the scheme `{}…`",
+                "a".repeat(MAX_SHOWN_BYTES)
+            )
+        );
+        // A text of exactly the limit is not cut.
+        let exact = "a".repeat(MAX_SHOWN_BYTES);
+        let error = keychain_entry(&exact).unwrap_err();
+        assert!(error.message().contains(&format!("//{exact} must")));
+
+        // `é` is two bytes. It is kept whole if it ends at the limit, and
+        // left out if the limit is in it.
+        for (fits, expected) in [(2, "é…"), (1, "…")] {
+            let start = "a".repeat(MAX_SHOWN_BYTES - fits);
+            let error = keychain_entry(&format!("{start}éé")).unwrap_err();
+            assert_eq!(
+                error.message(),
+                format!(
+                    "the secret URI keychain://{start}{expected} must have the form \
+                     keychain://<service>/<account>"
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_value_too_short_for_redaction_is_one_warning_without_the_value() {
+        let redactor = Redactor::new();
+        let backend = InMemory::with(&[
+            ("acme-postgres/short", "zq9"),
+            ("acme-postgres/prod", "zq9x"),
+        ]);
+        let (secrets, _, store) = service_with(&redactor, backend);
+        let read = |name: &str| uri(&format!("aws-sm://acme-postgres/{name}"));
+        let lines = |read: SecretUri, of_extension: bool| {
+            let (secrets, store, redactor) = (&secrets, &store, &redactor);
+            async move {
+                let capture = Capture::default();
+                {
+                    let _guard =
+                        capture_logs(&capture.dispatch(Level::WARN, LogFormat::Human, redactor));
+                    if of_extension {
+                        secrets.resolve(&read).await.unwrap();
+                    } else {
+                        store.resolve(&read).await.unwrap();
+                    }
+                }
+                capture.text()
+            }
+        };
+
+        let output = lines(read("short"), true).await;
+        assert_eq!(output.lines().count(), 1, "{output}");
+        for part in [
+            "WARN",
+            "shorter than 4 bytes",
+            "uri=aws-sm://acme-postgres/short",
+            "reader=\"acme.postgres\"",
+        ] {
+            assert!(output.contains(part), "no {part} in: {output}");
+        }
+        assert!(!output.contains("zq9"), "{output}");
+
+        let output = lines(read("short"), false).await;
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(output.contains("reader=\"core\""), "{output}");
+        assert!(!output.contains("zq9"), "{output}");
+
+        // A value of the minimum length is redacted: no event.
+        assert_eq!(lines(read("prod"), true).await, "");
     }
 
     #[tokio::test]
