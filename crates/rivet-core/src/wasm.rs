@@ -27,9 +27,12 @@
 //!   (ADR-0021), although a restart cannot repair the file.
 //! - The component file must be a regular file. A symbolic link is refused,
 //!   so a package cannot make the host read a file outside its directory.
-//! - [`Limits::call_timeout`] is not set from the setting
-//!   `extensions.call_timeout_ms` yet. The code that builds the runtime and
-//!   the host must copy the value; that wiring comes in a later ticket.
+//! - The code that builds the runtime and the host makes the limits with
+//!   [`Limits::for_host`] from the [`HostConfig`] that it gives to the host.
+//!   Then the time limit of the host and [`Limits::call_timeout`] are one
+//!   value: guest code stops not later than the overshoot of "Limits" after
+//!   the host gave up a call. With a longer limit in the runtime, the guest
+//!   code of a failed call runs on a blocking thread until that limit.
 //!
 //! # Sandbox
 //!
@@ -42,6 +45,9 @@
 //!
 //! - Memory: each instance has a limit for its linear memories and tables
 //!   together ([`Limits::memory_bytes`]).
+//! - Objects: each instance can have [`MAX_CORE_INSTANCES`] core instances,
+//!   [`MAX_MEMORIES`] memories and [`MAX_TABLES`] tables at most (ADR-0018).
+//!   A memory of zero pages costs no bytes, but it reserves address space.
 //! - CPU: each call has a fuel budget ([`Limits::fuel_per_call`]). Fuel
 //!   gives the same result on each run. Fuel counts WASM instructions. It
 //!   does not count the work of the host in an import.
@@ -64,6 +70,8 @@
 //!   the log level of the host is not written: it uses no budget and is not
 //!   in that number. Fuel limits the number of such messages.
 //! - File: a component file can have [`Limits::component_bytes`] at most.
+//!   The compilation has no time limit and cannot be stopped: this size
+//!   limit is its only bound.
 //!
 //! # Errors
 //!
@@ -72,7 +80,13 @@
 //! | Invalid file, wrong world, import that the host does not give | `user` |
 //! | Component file past the size limit | `user` |
 //! | Trap, CPU limit, time limit, memory limit, data limit | `internal` |
+//! | Instantiation fails without a trap, for example past an object limit | `internal` |
+//! | A call breaks the rules of the component model | `internal` |
 //! | The component returns an error | the category that the component gives |
+//!
+//! The message of an error that the component returns starts with a fixed
+//! text of the host that names the extension. So the text of the component
+//! cannot imitate a message of the host.
 //!
 //! After a trap, a limit violation or a panic of the host in an import
 //! (ARCHITECTURE.md §5.6) the instance cannot be used: each later call gives
@@ -85,7 +99,7 @@
 //! the caller drops continues until it returns or reaches a limit: the fuel
 //! or the time limit.
 
-use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
+use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime, HostConfig};
 use crate::logging::Redactor;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::BoxFuture;
@@ -115,12 +129,17 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
 /// The default of [`Limits::fuel_per_call`].
 pub const DEFAULT_FUEL_PER_CALL: u64 = 1_000_000_000;
 
-/// The default of [`Limits::call_timeout`]: 30 s, the call time limit of
-/// ADR-0021.
-pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The default of [`Limits::component_bytes`]: 4 MiB (ADR-0018).
+pub const DEFAULT_COMPONENT_BYTES: usize = 4 << 20;
 
-/// The default of [`Limits::component_bytes`]: 16 MiB.
-pub const DEFAULT_COMPONENT_BYTES: usize = 16 << 20;
+/// The most core instances that one instance of a component can have.
+pub const MAX_CORE_INSTANCES: usize = 64;
+
+/// The most linear memories that one instance of a component can have.
+pub const MAX_MEMORIES: usize = 8;
+
+/// The most tables that one instance of a component can have.
+pub const MAX_TABLES: usize = 64;
 
 /// The most bytes that a component can pass to the host in one call of an
 /// import or in one result of an export. More is a trap.
@@ -135,6 +154,9 @@ pub const LOG_BYTES_PER_CALL: usize = 64 * 1024;
 
 /// Log or error text from a component is cut to this number of bytes.
 const MAX_GUEST_TEXT_BYTES: usize = 8 * 1024;
+
+/// A path in an error text is cut to this number of bytes.
+const MAX_PATH_TEXT_BYTES: usize = 256;
 
 /// The shortest time between two epoch ticks of an engine. A call can run
 /// two ticks longer than [`Limits::call_timeout`], plus the time that the
@@ -155,29 +177,42 @@ pub struct Limits {
     /// also one call. The call does not end before this time. It can end
     /// later: see "Limits" in the module documentation.
     ///
-    /// The value has one owner: the code that builds the runtime and the
-    /// extension host sets it from
+    /// The value has one owner,
     /// [`HostConfig::call_timeout`](crate::host::HostConfig::call_timeout)
-    /// (ADR-0018). This module reads no settings.
+    /// (ADR-0018): [`for_host`](Self::for_host) copies it. This module reads
+    /// no settings.
     pub call_timeout: Duration,
     /// The most bytes that a component file can have.
     pub component_bytes: usize,
 }
 
 impl Default for Limits {
-    /// [`DEFAULT_MEMORY_BYTES`], [`DEFAULT_FUEL_PER_CALL`],
-    /// [`DEFAULT_CALL_TIMEOUT`] and [`DEFAULT_COMPONENT_BYTES`].
+    /// [`for_host`](Self::for_host) with the default [`HostConfig`]: the
+    /// call time limit has one default, that of the host (ADR-0018).
     fn default() -> Self {
-        Self {
-            memory_bytes: DEFAULT_MEMORY_BYTES,
-            fuel_per_call: DEFAULT_FUEL_PER_CALL,
-            call_timeout: DEFAULT_CALL_TIMEOUT,
-            component_bytes: DEFAULT_COMPONENT_BYTES,
-        }
+        Self::for_host(&HostConfig::default())
     }
 }
 
 impl Limits {
+    /// The limits for a runtime whose extensions run in a host with
+    /// `config`: [`DEFAULT_MEMORY_BYTES`], [`DEFAULT_FUEL_PER_CALL`],
+    /// [`DEFAULT_COMPONENT_BYTES`], and the call time limit of the host.
+    ///
+    /// The code that builds the runtime and the host must use this function
+    /// and give the same `config` to the host. With a longer time limit in
+    /// the runtime, the guest code of a call that the host gave up continues
+    /// until the limit of the runtime.
+    #[must_use]
+    pub fn for_host(config: &HostConfig) -> Self {
+        Self {
+            memory_bytes: DEFAULT_MEMORY_BYTES,
+            fuel_per_call: DEFAULT_FUEL_PER_CALL,
+            call_timeout: config.call_timeout,
+            component_bytes: DEFAULT_COMPONENT_BYTES,
+        }
+    }
+
     /// The epoch ticks after which a call has run for `call_timeout` at
     /// least. The quotient is rounded up. One more: the first tick can come
     /// at once.
@@ -254,6 +289,19 @@ impl ResourceLimiter for State {
                 .saturating_mul(size_of::<usize>()),
         )
     }
+
+    // The counts: an object of size zero is not seen by `charge`.
+    fn instances(&self) -> usize {
+        MAX_CORE_INSTANCES
+    }
+
+    fn tables(&self) -> usize {
+        MAX_TABLES
+    }
+
+    fn memories(&self) -> usize {
+        MAX_MEMORIES
+    }
 }
 
 impl logging::Host for State {
@@ -295,10 +343,15 @@ impl logging::Host for State {
 
 impl types::Host for State {}
 
-/// Turns an error that a component returned into the error of the SDK. The
-/// category stays.
-fn guest_error(redactor: &Redactor, error: &types::Error) -> Error {
-    let message = guest_text(redactor, &error.message);
+/// Turns an error that a component returned from `action` into the error of
+/// the SDK. The category stays. The message starts with a fixed text of the
+/// host, so the text of the component cannot imitate a message of the host.
+fn guest_error(state: &State, action: &str, error: &types::Error) -> Error {
+    let message = format!(
+        "extension `{}`: {action} failed: the component returned an error: {}",
+        state.id,
+        guest_text(&state.redactor, &error.message)
+    );
     match error.category {
         GuestCategory::User => Error::user(message),
         GuestCategory::Auth => Error::auth(message),
@@ -330,6 +383,17 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
         })
         .collect();
     text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
+    text
+}
+
+/// Makes a path safe for an error message: the rules of [`guest_text`], and a
+/// cut to [`MAX_PATH_TEXT_BYTES`]. The name of a directory is untrusted.
+fn path_text(redactor: &Redactor, path: &Path) -> String {
+    let mut text = guest_text(redactor, &path.display().to_string());
+    if text.len() > MAX_PATH_TEXT_BYTES {
+        text.truncate(text.floor_char_boundary(MAX_PATH_TEXT_BYTES));
+        text.push('…');
+    }
     text
 }
 
@@ -382,6 +446,9 @@ async fn blocking<T: Send + 'static>(
     .map_err(|error| Error::internal("the WASM runtime task failed").with_source(error))?
 }
 
+/// The `action` of [`failure`] for the instantiation.
+const INSTANTIATE: &str = "instantiate";
+
 /// Turns a failure of Wasmtime in guest code into an `internal` error.
 fn failure(id: &ExtensionId, action: &str, error: wasmtime::Error) -> Error {
     let reason = if error.is::<MemoryLimitExceeded>() {
@@ -391,7 +458,10 @@ fn failure(id: &ExtensionId, action: &str, error: wasmtime::Error) -> Error {
             Some(Trap::OutOfFuel) => "the CPU limit was exceeded",
             Some(Trap::Interrupt) => "the call time limit was exceeded",
             Some(Trap::HostcallFuelExhausted) => "the component passed too much data to the host",
-            _ => "the component trapped",
+            Some(_) => "the component trapped",
+            // Not a trap: Wasmtime gives no type for the cause, only text.
+            None if action == INSTANTIATE => "the component could not be instantiated",
+            None => "the call broke the rules of the component model",
         }
     };
     Error::internal(format!("extension `{id}`: {action} failed: {reason}")).with_source(error)
@@ -496,8 +566,9 @@ impl WasmRuntime {
         let linker = Arc::clone(&self.linker);
         blocking(move || {
             // shortcut: no time limit for the compilation, it is bounded by the
-            // size limit only; add one (a thread that can be left behind) when
-            // a component of the allowed size compiles for too long.
+            // size limit only (4 MiB, ADR-0018: 16 MiB compiled for 43 s on one
+            // thread); add a compile cache or parallel compilation when a
+            // component of the allowed size compiles for too long.
             let component = Component::new(&engine, &bytes).map_err(|error| {
                 Error::user("the file is not a valid WASM component").with_source(error)
             })?;
@@ -532,10 +603,11 @@ impl WasmRuntime {
         // file of any size costs this much memory at most.
         let most =
             u64::try_from(self.limits.component_bytes).map_or(u64::MAX, |n| n.saturating_add(1));
+        let redactor = self.redactor.clone();
         let bytes = blocking(move || {
+            let shown = path_text(&redactor, &path);
             let unreadable = |error| {
-                Error::user(format!("cannot read the WASM component {}", path.display()))
-                    .with_source(error)
+                Error::user(format!("cannot read the WASM component {shown}")).with_source(error)
             };
             // Not `metadata`: that follows a symbolic link.
             // shortcut: the file can be replaced between this check and the
@@ -546,8 +618,7 @@ impl WasmRuntime {
                 .is_file()
             {
                 return Err(Error::user(format!(
-                    "the WASM component {} is not a regular file",
-                    path.display()
+                    "the WASM component {shown} is not a regular file"
                 )));
             }
             let mut bytes = Vec::new();
@@ -590,7 +661,7 @@ impl WasmRuntime {
             store.limiter(|state| state);
             store.set_hostcall_fuel(MAX_GUEST_CALL_BYTES);
             let extension = limited(&mut store, &limits, |store| component.instantiate(store))
-                .map_err(|error| failure(&id, "instantiate", error))?;
+                .map_err(|error| failure(&id, INSTANTIATE, error))?;
             Ok(WasmInstance {
                 inner: Arc::new(Mutex::new(Inner {
                     store,
@@ -701,7 +772,7 @@ impl WasmInstance {
             }
             match limited(store, &limits, |store| export(extension, store)) {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(guest_error(&store.data().redactor, &error)),
+                Ok(Err(error)) => Err(guest_error(store.data(), action, &error)),
                 Err(error) => {
                     *failed = true;
                     Err(failure(&store.data().id, action, error))
@@ -750,7 +821,7 @@ mod tests {
     const SMALL: Limits = Limits {
         memory_bytes: 2 * 65536,
         fuel_per_call: 100_000,
-        call_timeout: DEFAULT_CALL_TIMEOUT,
+        call_timeout: Duration::from_secs(30),
         component_bytes: DEFAULT_COMPONENT_BYTES,
     };
 
@@ -759,6 +830,11 @@ mod tests {
     /// core function: it returns the address of a `result<_, error>`.
     /// Address 0 holds zeros, which is `ok`.
     fn guest_with(imports: &str, data: &str, activate: &str) -> Vec<u8> {
+        component(imports, data, activate, "(i32.const 0)")
+    }
+
+    /// As [`guest_with`]. `deactivate` is the body of the core function.
+    fn component(imports: &str, data: &str, activate: &str, deactivate: &str) -> Vec<u8> {
         let text = format!(
             r#"(component
   {imports}
@@ -782,7 +858,7 @@ mod tests {
     (import "host" "memory" (memory 1))
     {data}
     (func (export "activate") (result i32) {activate})
-    (func (export "deactivate") (result i32) (i32.const 0)))
+    (func (export "deactivate") (result i32) {deactivate}))
   (core instance $guest (instantiate $guest (with "host" (instance
     (export "log" (func $log))
     (export "memory" (memory $mem))))))
@@ -845,7 +921,7 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.memory_bytes, DEFAULT_MEMORY_BYTES);
         assert_eq!(limits.fuel_per_call, DEFAULT_FUEL_PER_CALL);
-        assert_eq!(limits.call_timeout, DEFAULT_CALL_TIMEOUT);
+        assert_eq!(limits.call_timeout, HostConfig::default().call_timeout);
         assert_eq!(limits.component_bytes, DEFAULT_COMPONENT_BYTES);
     }
 
@@ -893,7 +969,10 @@ mod tests {
         let instance = instance(&runtime(), bytes, "acme.refuses").await;
         let error = instance.activate().await.unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Policy);
-        assert_eq!(error.message(), "nope");
+        assert_eq!(
+            error.message(),
+            "extension `acme.refuses`: activate failed: the component returned an error: nope"
+        );
         // It is not a trap: the instance still works.
         instance.deactivate().await.unwrap();
     }
@@ -938,14 +1017,21 @@ mod tests {
             Retryable,
             Internal,
         ];
+        let state = State {
+            id: id("acme.any"),
+            memory_limit: 0,
+            memory_used: 0,
+            redactor: Redactor::new(),
+            log_lines: 0,
+            log_bytes: 0,
+            log_dropped: 0,
+        };
         for (category, name) in all.into_iter().zip(wit) {
-            let error = guest_error(
-                &Redactor::new(),
-                &types::Error {
-                    category,
-                    message: String::new(),
-                },
-            );
+            let error = types::Error {
+                category,
+                message: String::new(),
+            };
+            let error = guest_error(&state, "activate", &error);
             assert_eq!(error.category().to_string(), name);
         }
     }
@@ -1450,6 +1536,15 @@ mod tests {
     /// restart of a failed extension one hour later: not in the time of a
     /// test.
     fn hosted(runtime: Arc<dyn ExtensionRuntime>) -> Hosted {
+        let config = HostConfig {
+            backoff_initial: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        hosted_with(runtime, config)
+    }
+
+    fn hosted_with(runtime: Arc<dyn ExtensionRuntime>, config: HostConfig) -> Hosted {
         let services = Services {
             registry: Arc::new(ServiceRegistry::new()),
             commands: Arc::new(CommandBus::new()),
@@ -1457,11 +1552,6 @@ mod tests {
             jobs: JobScheduler::new(NonZeroUsize::MIN, 0),
         };
         let root = tempfile::tempdir().unwrap();
-        let config = HostConfig {
-            backoff_initial: Duration::from_secs(3600),
-            backoff_max: Duration::from_secs(3600),
-            ..HostConfig::default()
-        };
         let directories = vec![root.path().to_owned()];
         let sdk = Version::new(0, 1, 0);
         let host = ExtensionHost::new(
@@ -1728,7 +1818,7 @@ mod tests {
         assert_eq!(ticks(Duration::from_millis(101)), 3);
         assert_eq!(ticks(Duration::from_millis(250)), 4);
         assert_eq!(ticks(Duration::from_millis(3000)), 31);
-        assert_eq!(ticks(DEFAULT_CALL_TIMEOUT), 301);
+        assert_eq!(ticks(Duration::from_secs(30)), 301);
         // The cap: the sum with the current epoch stays in a `u64`.
         assert_eq!(ticks(Duration::MAX), u64::from(u32::MAX));
     }
@@ -1756,5 +1846,282 @@ mod tests {
             assert!(error.message().contains("time limit"), "{error}");
             assert!(elapsed >= limits.call_timeout, "{elapsed:?}");
         }
+    }
+
+    /// `true` when no call runs in the instance: it was dropped, or no call
+    /// holds its lock.
+    fn idle(instance: &std::sync::Weak<Mutex<Inner>>) -> bool {
+        instance.upgrade().is_none_or(|inner| {
+            !matches!(inner.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+        })
+    }
+
+    #[tokio::test]
+    async fn guest_code_stops_soon_after_the_host_gave_up_the_call() {
+        // R-80: the host limit is below the default of the runtime.
+        let config = HostConfig {
+            call_timeout: Duration::from_millis(300),
+            backoff_initial: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        let limits = Limits {
+            fuel_per_call: u64::MAX,
+            ..Limits::for_host(&config)
+        };
+        let watched = Arc::new(Watched {
+            runtime: runtime_with(limits, &Redactor::new()),
+            instances: Mutex::default(),
+        });
+        let hosted = hosted_with(Arc::clone(&watched) as Arc<dyn ExtensionRuntime>, config);
+        hosted.install(
+            "acme.spin",
+            "1.0.0",
+            &guest("", "(loop $l (br $l)) unreachable"),
+        );
+
+        let report = hosted.start("acme.spin").await;
+        let gave_up = std::time::Instant::now();
+        let error = &report.not_activated[&id("acme.spin")];
+        assert!(
+            error.message().contains("exceeded the time limit"),
+            "{error}"
+        );
+        assert_eq!(hosted.state("acme.spin"), Some(ExtensionState::Failed));
+
+        // The overshoot of the module documentation: two ticks, plus the
+        // time that the timer thread sleeps too long.
+        let instances = watched.instances.lock().unwrap().clone();
+        assert_eq!(instances.len(), 1);
+        while !idle(&instances[0]) {
+            let late = gave_up.elapsed();
+            assert!(
+                late < Duration::from_secs(1),
+                "guest code still runs after {late:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_number_of_memories_tables_and_core_instances_has_a_limit() {
+        // R-81: an object of size zero costs no memory budget. The guest of
+        // these tests has 1 memory, 0 tables and 2 core instances.
+        let empty = "(core module $e) ";
+        let more = "(core instance (instantiate $e)) ";
+        let within = guest_with(
+            &(empty.to_owned() + &more.repeat(62)),
+            &("(memory 0) ".repeat(7) + &"(table 0 funcref) ".repeat(64)),
+            "(i32.const 0)",
+        );
+        let runtime = runtime();
+        instance(&runtime, within, "acme.many").await;
+
+        let past = [
+            guest(&"(memory 0) ".repeat(8), "(i32.const 0)"),
+            guest(&"(table 0 funcref) ".repeat(65), "(i32.const 0)"),
+            guest_with(&(empty.to_owned() + &more.repeat(63)), "", "(i32.const 0)"),
+        ];
+        for bytes in past {
+            let component = runtime.load(bytes).await.unwrap();
+            let error = runtime
+                .instantiate(&component, id("acme.hostile"))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
+            assert!(
+                error.message().contains("could not be instantiated"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_component_size_limit_is_4_mib() {
+        // R-82: the compilation has no time limit; the size bounds it.
+        assert_eq!(DEFAULT_COMPONENT_BYTES, 4 << 20);
+    }
+
+    #[tokio::test]
+    async fn a_failed_instantiation_is_not_called_a_trap() {
+        // R-83a: one table more than the limit; no guest code ran.
+        let bytes = guest(&"(table 0 funcref) ".repeat(65), "(i32.const 0)");
+        let runtime = runtime();
+        let component = runtime.load(bytes).await.unwrap();
+        let error = runtime
+            .instantiate(&component, id("acme.tables"))
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.message().contains("trapped"), "{error}");
+        assert!(
+            error.message().contains("could not be instantiated"),
+            "{error}"
+        );
+
+        // A trap in the start function is a trap.
+        let bytes = guest("(func $s unreachable) (start $s)", "(i32.const 0)");
+        let component = runtime.load(bytes).await.unwrap();
+        let error = runtime
+            .instantiate(&component, id("acme.start"))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.message().contains("the component trapped"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_result_that_breaks_the_component_model_is_not_called_a_trap() {
+        // R-83a: `err` with a text of 4 bytes at an address past the memory.
+        let bytes = guest(
+            r#"(data (i32.const 32) "\01\00\00\00\00\00\00\00\00\00\ff\7f\04\00\00\00")"#,
+            "(i32.const 32)",
+        );
+        let instance = instance(&runtime(), bytes, "acme.wild").await;
+        let error = instance.activate().await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal);
+        assert!(!error.message().contains("trapped"), "{error}");
+        assert!(error.message().contains("component model"), "{error}");
+        let error = instance.deactivate().await.unwrap_err();
+        assert!(error.message().contains("earlier call"), "{error}");
+    }
+
+    /// A component whose `activate` returns the error `category` 0 (`user`)
+    /// with the text `message`.
+    fn refusing_guest(message: &str) -> Vec<u8> {
+        let text: String = message.bytes().map(|b| format!("\\{b:02x}")).collect();
+        let length: String = u32::try_from(message.len())
+            .unwrap()
+            .to_le_bytes()
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect();
+        guest(
+            &format!(
+                r#"(data (i32.const 32) "\01\00\00\00\00\00\00\00\00\01\00\00{length}")
+                   (data (i32.const 256) "{text}")"#
+            ),
+            "(i32.const 32)",
+        )
+    }
+
+    #[tokio::test]
+    async fn an_error_text_of_a_component_cannot_imitate_a_host_message() {
+        // R-83b: the text of the time limit error of the host.
+        let forged = "extension `acme.other` exceeded the time limit of 30s in `activate`";
+        let hosted = hosted(Arc::new(runtime()));
+        hosted.install("acme.liar", "1.0.0", &refusing_guest(forged));
+        let report = hosted.start("acme.liar").await;
+        let error = &report.not_activated[&id("acme.liar")];
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        let reason = hosted.status("acme.liar").unwrap().reason.unwrap();
+        for text in [error.message(), reason.as_str()] {
+            let head = "extension `acme.liar`: activate failed: the component returned an error: ";
+            assert!(text.contains(&format!("{head}{forged}")), "{text}");
+            assert!(!text.starts_with(forged), "{text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_in_an_error_text_cannot_add_a_line() {
+        // R-83c: a directory name with a line break and an escape sequence.
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("a\nERROR forged\u{1b}[2J");
+        std::fs::create_dir(&directory).unwrap();
+        let runtime = runtime();
+
+        let missing = runtime
+            .load_file(&directory.join("x.wasm"))
+            .await
+            .err()
+            .unwrap();
+        let not_a_file = runtime.load_file(&directory).await.err().unwrap();
+        for error in [missing, not_a_file] {
+            let text = error.message();
+            assert!(text.contains("a ERROR forged [2J"), "{text:?}");
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+
+        // The path is cut.
+        let long = root.path().join("b".repeat(200)).join("c".repeat(200));
+        let error = runtime.load_file(&long).await.err().unwrap();
+        assert!(error.message().len() < 300, "{}", error.message().len());
+    }
+
+    #[tokio::test]
+    async fn a_trap_in_deactivate_puts_the_extension_in_failed() {
+        // R-83e.
+        let hosted = hosted(Arc::new(runtime()));
+        let bytes = component("", "", "(i32.const 0)", "unreachable");
+        hosted.install("acme.broken", "1.0.0", &bytes);
+        hosted.install("acme.healthy", "1.0.0", &logging_guest("hello"));
+        hosted.start("acme.healthy").await;
+        hosted.start("acme.broken").await;
+        assert_eq!(hosted.state("acme.broken"), Some(ExtensionState::Active));
+
+        let error = hosted
+            .host
+            .deactivate(&id("acme.broken"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
+        assert!(
+            error
+                .message()
+                .contains("deactivate failed: the component trapped"),
+            "{error}"
+        );
+        let status = hosted.status("acme.broken").unwrap();
+        assert_eq!(status.state, ExtensionState::Failed);
+        assert!(status.reason.unwrap().contains("trapped"));
+        hosted.host.deactivate(&id("acme.healthy")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_trap_in_the_start_function_puts_the_extension_in_failed() {
+        // R-83e: the start function runs in `load`, before `activate`.
+        let hosted = hosted(Arc::new(runtime()));
+        let bytes = guest("(func $s unreachable) (start $s)", "(i32.const 0)");
+        hosted.install("acme.broken", "1.0.0", &bytes);
+        let report = hosted.start("acme.broken").await;
+        let error = &report.not_activated[&id("acme.broken")];
+        assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
+        assert!(
+            error
+                .message()
+                .contains("instantiate failed: the component trapped"),
+            "{error}"
+        );
+        assert_eq!(hosted.state("acme.broken"), Some(ExtensionState::Failed));
+    }
+
+    #[tokio::test]
+    async fn the_host_restarts_a_failed_component_until_it_is_disabled() {
+        // R-83e: the automatic restart (ADR-0021) with a real component.
+        let config = HostConfig {
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(10),
+            restart_limit: 2,
+            ..HostConfig::default()
+        };
+        let watched = Arc::new(Watched {
+            runtime: runtime(),
+            instances: Mutex::default(),
+        });
+        let hosted = hosted_with(Arc::clone(&watched) as Arc<dyn ExtensionRuntime>, config);
+        hosted.install("acme.broken", "1.0.0", &trapping_guest());
+        hosted.start("acme.broken").await;
+
+        let start = std::time::Instant::now();
+        while hosted.state("acme.broken") != Some(ExtensionState::Disabled) {
+            assert!(start.elapsed().as_secs() < 10, "not disabled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The first load and two restarts: each made a new instance.
+        assert_eq!(watched.instances.lock().unwrap().len(), 3);
+        let reason = hosted.status("acme.broken").unwrap().reason.unwrap();
+        assert!(reason.contains("the component trapped"), "{reason}");
     }
 }
