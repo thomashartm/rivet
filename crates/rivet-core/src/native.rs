@@ -572,6 +572,7 @@ impl Process {
                 }
             }
         }
+        // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
         .map_err(|error| {
             failure(&self.id, "the output of the process cannot be read").with_source(error)
         })?;
@@ -632,6 +633,7 @@ impl Process {
         tokio::select! {
             status = self.child.wait() => match status {
                 Ok(status) => failure(id, &format!("the process ended ({status})")),
+                // No test: `wait` fails only if another party has taken the exit status of the child (ECHILD); a test cannot do that without `unsafe` or a new crate.
                 Err(error) => {
                     failure(id, "the state of the process cannot be read").with_source(error)
                 }
@@ -641,6 +643,7 @@ impl Process {
             bytes = self.output.fill_buf() => match bytes {
                 Ok([]) => failure(id, "the process ended or closed its output"),
                 Ok(_) => failure(id, "the process sent a message that answers no request"),
+                // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
                 Err(error) => {
                     failure(id, "the output of the process cannot be read").with_source(error)
                 }
@@ -719,6 +722,7 @@ async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Re
         let chunk = match read_chunk(&mut errors, ERROR_OUTPUT_LINE_BYTES).await {
             Ok(chunk) if chunk.is_empty() => break,
             Ok(chunk) => chunk,
+            // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
             Err(error) => {
                 tracing::warn!(extension, %error, "the error output of the process cannot be read");
                 break;
