@@ -28,6 +28,7 @@ Behaviour:
 
 - A runtime reports the crash of an active extension to the host. The extension code gets no handle for this.
 - A call that exceeds the timeout gives an `internal` error and the state `Failed`. The host drops the instance.
+- A call that ends after the limit with an error keeps its own error; the host refuses only a success that comes late (review finding R-51; not on `main` on this date, described by the orchestrator, code not read for this record). Reason: the WASM runtime has the same limit and ends the call with its own error, which says more than the error of the host timer.
 - A job above the limit is refused with a `policy` error.
 - When an extension fails, its active dependents are deactivated first. After a successful restart they are activated again. If the extension ends in `Disabled`, they stay `Inactive`.
 - The automatic restart applies to a failed activation, a call timeout of load or activate, and a reported crash. A failure in a `deactivate` call starts no automatic restart: the extension stays `Failed` until a manual restart or disable, because the caller asked to stop it.

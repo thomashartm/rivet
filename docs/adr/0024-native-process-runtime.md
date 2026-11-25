@@ -44,7 +44,7 @@ This ADR changes two accepted texts. They change only when the maintainer accept
 - Limits of this part, not resolved here:
   - A native process has no memory limit and no CPU limit (§4.3 requires limits per extension). No ticket has it.
   - The process is not sandboxed by the OS. §4.7 then requires that the install review says "runs with full user privileges"; that text is for #51 and does not exist.
-  - Nothing says yet which files of a native package the signature covers; the package format has no entry for native libraries (ADR-0023). A native extension MUST NOT ship before that is defined.
+  - Nothing says yet which files of a native package the signature covers; the package format has no entry for native libraries (ADR-0023). A native extension MUST NOT ship before that is defined. No code enforces this rule (review finding R-113). On this date nothing can break it: no manifest field selects the native runtime, and the program of the child comes from the code that builds the runtime, not from a package. The rule becomes a check with part 2 of ticket #95 (runtime selection): a native package is refused until the signature rule exists.
   - The capability checks of ADR-0020 do not apply to a native process: it can open files and connections itself.
 - A crash of a native extension stops one process and one extension. Each native extension costs one process.
 - No new crate and no `unsafe` for this part.
