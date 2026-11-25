@@ -60,10 +60,14 @@
 //!
 //! `<data>` MUST be a directory of the user that other users cannot write.
 //! On Unix each operation refuses, with a `user` error, a `<data>`,
-//! `<data>/store`, `<data>/store/<id>` or `<data>/extensions` that the group
-//! or other users can write. The installer creates these directories with
-//! mode 0700, so a kept package is verified again in a private directory.
-//! The owner of a directory is not checked. Windows has no check.
+//! `<data>/store`, `<data>/store/<id>`, `<data>/extensions` or
+//! `<data>/extensions/<id>` that the group or other users can write. The
+//! installer creates each directory with mode 0700 and each file with mode
+//! 0600, whatever the umask is, so a kept package is verified again in a
+//! private directory. The owner of a directory and the mode of a file that
+//! exists are not checked. On Unix a lock file with a second hard link is
+//! refused too. Windows has none of these checks. A `<data>/store/<id>`
+//! that is a symbolic link is refused on each platform.
 //! `<data>/extensions` is the user discovery directory of the host
 //! ([`Installer::extensions_dir`]). The host does not scan `<data>/store`.
 //!
@@ -116,15 +120,19 @@
 //! [`Installer::recover`] does step 4 again. Step 4 also deletes the kept
 //! packages of all versions but the active and the previous one.
 //!
-//! A `pending` file that is not a journal of this module does not stop the
-//! recovery and does not lose the active version. The recovery then reads
-//! the directories: an active directory stays; if there is none, the one
-//! retired directory in the store goes back. With two or more retired
+//! A `pending` that is not a journal of this module (a text that is not
+//! valid, a file that cannot be read, a directory, a symbolic link, more
+//! than 16 KiB) does not stop the recovery and does not lose the active
+//! version. The same applies to a journal whose old version has no
+//! directory. The recovery then reads the directories: an active directory
+//! stays; if there is none, the one retired directory in the store goes
+//! back. A symbolic link is never moved back. `pending` is then deleted, a
+//! directory with its content. With two or more retired
 //! directories the recovery changes nothing and returns an `internal` error.
 //! `previous` is not written in this case.
 //!
-//! An active version whose manifest is invalid cannot be updated or rolled
-//! back. [`Installer::install`] replaces it with a verified package and
+//! An active version whose manifest is missing, cannot be read or is invalid
+//! cannot be updated or rolled back. [`Installer::install`] replaces it with a verified package and
 //! deletes it. A stop between the two renames of this change leaves no
 //! active version.
 //!
@@ -230,8 +238,13 @@ const RECORD_BYTES: u64 = 20 * 512;
 const PENDING_FILE: &str = "pending";
 const PREVIOUS_FILE: &str = "previous";
 const STAGING_PREFIX: &str = ".staging-";
+/// The start of the name of a temporary file of [`write_atomic`].
+const TEMP_PREFIX: &str = ".tmp";
 const LOCK_FILE: &str = ".lock";
 const REVIEW_FILE: &str = "review";
+
+/// More than a journal needs: two versions.
+const JOURNAL_MAX_BYTES: u64 = 16 * 1024;
 
 /// The number of bytes of a refused entry name that an error shows.
 const ENTRY_NAME_SHOWN_BYTES: usize = 64;
@@ -311,35 +324,32 @@ impl Installer {
     /// # Errors
     ///
     /// Returns a `user` error that names the file if the manifest of the
-    /// active version cannot be read or is invalid.
+    /// active version is missing, cannot be read or is invalid.
     pub fn installed(&self, id: &ExtensionId) -> Result<Option<Manifest>> {
-        let Some(text) = self.active_manifest(id)? else {
-            return Ok(None);
-        };
+        let active = self.active(id);
+        match fs::symlink_metadata(&active) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(&active, "cannot read the directory", error)),
+        }
         // The way out of a broken active version: `install` replaces it.
-        let broken = |error: Error| {
+        let path = active.join(MANIFEST_FILE);
+        let broken = |problem: &str| {
             Error::user(format!(
-                "{}: {}; install a version of `{id}` to replace it",
-                self.active(id).join(MANIFEST_FILE).display(),
-                error.message()
+                "{}: {problem}; install a version of `{id}` to replace it",
+                path.display()
             ))
         };
-        Manifest::parse(&text).map(Some).map_err(broken)
-    }
-
-    /// Returns the manifest text of the active version of `id`, or `None`
-    /// if the extension is not installed.
-    fn active_manifest(&self, id: &ExtensionId) -> Result<Option<String>> {
-        let path = self.active(id).join(MANIFEST_FILE);
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(Some(text)),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io_error(&path, "cannot read the manifest", error)),
-        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| broken("cannot read the manifest").with_source(error))?;
+        Manifest::parse(&text)
+            .map(Some)
+            .map_err(|error| broken(error.message()))
     }
 
     /// Installs `version` of `id` from the registry and activates it. An
-    /// active version whose manifest is invalid is replaced and deleted.
+    /// active version whose manifest is missing, cannot be read or is
+    /// invalid is replaced and deleted.
     ///
     /// # Errors
     ///
@@ -357,8 +367,8 @@ impl Installer {
     pub fn install(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
         let _lock = self.lock(id)?;
         self.repair(id)?;
-        // An active version with an invalid manifest is replaced: no other
-        // operation can leave that state.
+        // An active version without a manifest that can be read and is
+        // valid is replaced: no other operation can leave that state.
         let broken = match self.installed(id) {
             Ok(None) => false,
             Ok(Some(installed)) => {
@@ -367,8 +377,7 @@ impl Installer {
                     installed.version
                 )));
             }
-            Err(_) if self.active_manifest(id)?.is_some() => true,
-            Err(error) => return Err(error),
+            Err(_) => true,
         };
         self.activate(id, version, Source::Registry, false, broken)
     }
@@ -464,7 +473,7 @@ impl Installer {
     /// Repairs `id` after a change that did not complete, for example after
     /// a crash. Each operation runs this first. A caller can run it at
     /// start-up. If no change is pending, it only removes a staging
-    /// directory that a stopped process left. For an id without a store
+    /// directory and the temporary files that a stopped process left. For an id without a store
     /// directory it does nothing and creates nothing.
     ///
     /// # Errors
@@ -472,8 +481,9 @@ impl Installer {
     /// - `user`: a file cannot be read, moved or written, or a directory
     ///   of the installer can be written by the group or by other users
     ///   (Unix). The error names the file or the directory.
-    /// - `internal`: the journal is invalid, no version is active and the
-    ///   store has two or more retired directories. Nothing changes.
+    /// - `internal`: the journal does not name the version that was
+    ///   active, no version is active and the store has two or more
+    ///   retired directories. Nothing changes.
     /// - `retryable`: another operation on `id` runs.
     pub fn recover(&self, id: &ExtensionId) -> Result<()> {
         // No store directory: no operation got to a change of this id.
@@ -525,64 +535,70 @@ impl Installer {
         // stopped, with or without a journal.
         if let Ok(entries) = fs::read_dir(&store) {
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(STAGING_PREFIX)
-                {
-                    // Best effort: a staging directory that stays is never read.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Best effort: what stays is never read. Neither call
+                // follows a symbolic link.
+                if name.starts_with(STAGING_PREFIX) {
                     let _ = fs::remove_dir_all(entry.path());
+                } else if name.starts_with(TEMP_PREFIX)
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    let _ = fs::remove_file(entry.path());
                 }
             }
         }
         let pending = store.join(PENDING_FILE);
-        let text = match fs::read_to_string(&pending) {
-            Ok(text) => text,
+        let journal_is_dir = match fs::symlink_metadata(&pending) {
+            Ok(meta) => meta.is_dir(),
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error(&pending, "cannot read the journal", error)),
         };
-        tracing::warn!(extension = %id, "an install did not complete; recovering");
+        let journal = read_journal(&pending);
+        if journal.is_some() {
+            tracing::warn!(extension = %id, "an install did not complete; recovering");
+        } else {
+            tracing::warn!(extension = %id, journal = %pending.display(), "an install did not complete and the journal cannot be read or is invalid; recovering from the directories");
+        }
         let active = self.active(id);
-        let active_missing = fs::symlink_metadata(&active).is_err();
-        let (old, new) = match parse_journal(&text) {
-            Some((old, new)) => (old, Some(new)),
-            // The journal cannot say which version was active. The
-            // directories can: a retired version has a directory in the
-            // store only while a change runs.
-            None => {
-                tracing::warn!(extension = %id, journal = %pending.display(), "the journal is invalid; recovering from the directories");
-                let retired = if active_missing {
-                    sole_retired(&store, &pending)?
-                } else {
-                    None
-                };
-                (retired, None)
-            }
-        };
-
-        if active_missing {
-            if let Some(old) = &old {
-                let retired = store.join(old.to_string());
-                if retired.is_dir() {
-                    fs::rename(&retired, &active).map_err(|error| {
-                        io_error(&active, "cannot put the old version back", error)
-                    })?;
+        if fs::symlink_metadata(&active).is_err() {
+            // The old version of the journal, if it has a directory. If
+            // not, the directories say which version was active: a retired
+            // version has a directory in the store only while a change runs.
+            let old = match &journal {
+                Some((Some(old), _)) if is_real_dir(&store.join(old.to_string())) => {
+                    Some(old.clone())
                 }
+                // A first install: no version was active, so none goes back
+                // (a retired directory here is one that a clean-up left).
+                Some((None, _)) => None,
+                _ => sole_retired(&store, &pending)?,
+            };
+            if let Some(old) = old {
+                fs::rename(store.join(old.to_string()), &active)
+                    .map_err(|error| io_error(&active, "cannot put the old version back", error))?;
             }
-        } else if let Some(new) = &new
-            // An active manifest that is invalid is not the new version.
-            && let Some(text) = self.active_manifest(id)?
-            && Manifest::parse(&text).is_ok_and(|manifest| manifest.version == *new)
+        } else if let Some((old, new)) = &journal
+            // An active version without a valid manifest is not the new version.
+            && self
+                .installed(id)
+                .is_ok_and(|active| active.is_some_and(|manifest| manifest.version == *new))
         {
             // The second rename was done: the new version is complete.
             return self.finish(id, old.as_ref(), new);
+        }
+        if journal_is_dir {
+            // Not a journal of this module. If it stays, each operation
+            // on the id runs this recovery again and fails.
+            return fs::remove_dir_all(&pending)
+                .map_err(|error| io_error(&pending, "cannot remove the directory", error));
         }
         remove_file(&pending)
     }
 
     /// Steps 1 to 6 of the [module documentation](self). `review` is `true`
     /// when added capabilities stop the operation. `broken` is `true` when
-    /// the active version has an invalid manifest and the new version
+    /// the active version has no valid manifest and the new version
     /// replaces it. The caller holds the lock of `id`.
     fn activate(
         &self,
@@ -780,11 +796,19 @@ impl Installer {
     /// checked. There is no check on Windows.
     fn lock(&self, id: &ExtensionId) -> Result<IdLock> {
         let store = self.store(id);
+        // A link could point out of `<data>` or to the store of another id.
+        if fs::symlink_metadata(&store).is_ok_and(|meta| meta.is_symlink()) {
+            return Err(Error::user(format!(
+                "{}: the directory must not be a symbolic link; remove the link",
+                store.display()
+            )));
+        }
         let dirs = [
             self.data.clone(),
             self.data.join("store"),
             store.clone(),
             self.extensions_dir(),
+            self.active(id),
         ];
         #[cfg(unix)]
         for dir in &dirs {
@@ -823,8 +847,7 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
         Error::user(format!("{name}: the package is not a valid tar archive")).with_source(error)
     };
     let refused = |reason: String| Error::policy(format!("{name}: {reason}"));
-    fs::create_dir(content)
-        .map_err(|error| io_error(content, "cannot create the directory", error))?;
+    create_private_dir(content)?;
 
     let mut archive = tar::Archive::new(file);
     // The position after the last entry.
@@ -863,7 +886,7 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             return Err(too_large());
         }
         let target = content.join(entry_name);
-        let mut out = File::create_new(&target).map_err(|error| match error.kind() {
+        let mut out = create_private_file(&target).map_err(|error| match error.kind() {
             ErrorKind::AlreadyExists => refused(format!(
                 "the entry `{entry_name}` is in the package more than one time"
             )),
@@ -941,15 +964,30 @@ fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
     create_private_dir(store)?;
     let path = store.join(LOCK_FILE);
     // Does not follow a symbolic link and does not open a FIFO.
-    match File::create_new(&path) {
+    match create_private_file(&path) {
         Err(error) if error.kind() != ErrorKind::AlreadyExists => {
             return Err(io_error(&path, "cannot create the lock file", error));
         }
         _ => {}
     }
-    // The lock file is empty. A planted symbolic link could lock or create
-    // a file out of the store; the open of a planted FIFO does not return.
-    let file = open_regular(&path, "lock", 0)?;
+    // A planted symbolic link could lock or create a file out of the store;
+    // the open of a planted FIFO does not return. The content is never
+    // read, so there is no size limit.
+    let file = open_regular(&path, "lock", u64::MAX)?;
+    // A second hard link could be the lock file of another id.
+    #[cfg(unix)]
+    {
+        let links = file
+            .metadata()
+            .map(|meta| std::os::unix::fs::MetadataExt::nlink(&meta))
+            .map_err(|error| io_error(&path, "cannot read the lock file", error))?;
+        if links > 1 {
+            return Err(Error::user(format!(
+                "{}: the lock file has {links} hard links; remove the file and try again",
+                path.display()
+            )));
+        }
+    }
     match file.try_lock() {
         Ok(()) => Ok(IdLock(file)),
         Err(fs::TryLockError::WouldBlock) => Err(Error::retryable(format!(
@@ -971,6 +1009,35 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         .map_err(|error| io_error(dir, "cannot create the directory", error))
 }
 
+/// Creates the new file `path` for writing. Fails if something has that
+/// name; does not follow a symbolic link. On Unix, only the owner can read
+/// and write the file (mode 0600), whatever the umask is.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// Reads the journal file `path`. Returns `None` for a file that cannot be
+/// read: a symbolic link, a directory, more than [`JOURNAL_MAX_BYTES`], a
+/// text that is not UTF-8 or that [`parse_journal`] refuses.
+fn read_journal(path: &Path) -> Option<(Option<Version>, Version)> {
+    let mut text = String::new();
+    open_regular(path, "journal", JOURNAL_MAX_BYTES)
+        .ok()?
+        .take(JOURNAL_MAX_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    parse_journal(&text)
+}
+
+/// Returns `true` if `path` is a directory and not a symbolic link to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
 /// Reads the journal text: the old version, if one was active, and the new
 /// version. Returns `None` for a text that [`Installer::write_pending`]
 /// does not write.
@@ -987,7 +1054,8 @@ fn parse_journal(text: &str) -> Option<(Option<Version>, Version)> {
 
 /// Returns the version of the one retired directory in `store`, or `None`
 /// if there is none. This is the answer of the directories when the journal
-/// `journal` is invalid and the active directory is missing.
+/// `journal` does not name a retired directory and the active directory is
+/// missing. A symbolic link is not a retired directory.
 ///
 /// Returns an `internal` error, and changes nothing, if there are two or
 /// more: the directories do not say which version was active.
@@ -997,15 +1065,16 @@ fn sole_retired(store: &Path, journal: &Path) -> Result<Option<Version>> {
     for entry in fs::read_dir(store).map_err(unreadable)? {
         let entry = entry.map_err(unreadable)?;
         if let Ok(version) = entry.file_name().to_string_lossy().parse::<Version>()
-            && entry.path().is_dir()
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
         {
             retired.push(version);
         }
     }
     if retired.len() > 1 {
         return Err(Error::internal(format!(
-            "{}: the journal is invalid and {} has {} directories of retired versions; keep \
-             the directory of the version that was active, remove the others and try again",
+            "{}: the journal does not name the version that was active and {} has {} \
+             directories of retired versions; keep the directory of the version that was \
+             active, remove the others and try again",
             journal.display(),
             store.display(),
             retired.len()
@@ -1019,7 +1088,7 @@ fn sole_retired(store: &Path, journal: &Path) -> Result<Option<Version>> {
 fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
     let source = open_regular(from, "registry", max_bytes)?;
     let mut target =
-        File::create_new(to).map_err(|error| io_error(to, "cannot write the file", error))?;
+        create_private_file(to).map_err(|error| io_error(to, "cannot write the file", error))?;
     // A file that grows after the size check is cut. The signature of the
     // copy then does not verify.
     io::copy(&mut source.take(max_bytes), &mut target)
@@ -1029,13 +1098,16 @@ fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
 
 /// Replaces `path` with a file that holds `text`. The text goes to a
 /// temporary file in the same directory, and that file then replaces `path`.
+/// On Unix `tempfile` creates the file with mode 0600.
 // shortcut: the directory is not synced, so a power loss can undo the last
 // rename; the journal then still describes a state that `recover` repairs
 // (ADR-0023 accepts this).
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let write = || {
         let dir = path.parent().unwrap_or(Path::new("."));
-        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(TEMP_PREFIX)
+            .tempfile_in(dir)?;
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(path).map_err(|error| error.error)?;
@@ -2026,7 +2098,12 @@ mod tests {
         set_mode(&data, 0o755);
         f.installer.update(&id(), &v("1.1.0")).unwrap();
         // The kept package of a rollback is in a directory of the group.
-        for dir in [f.store(), data.join("store"), f.installer.extensions_dir()] {
+        for dir in [
+            f.store(),
+            data.join("store"),
+            f.installer.extensions_dir(),
+            f.installer.active(&id()),
+        ] {
             set_mode(&dir, 0o770);
             let error = f.installer.rollback(&id()).unwrap_err();
             assert_eq!(error.category(), ErrorCategory::User, "{error}");
@@ -2049,10 +2126,36 @@ mod tests {
             f.installer.data.join("store"),
             f.store(),
             f.installer.extensions_dir(),
+            f.installer.active(&id()),
         ] {
             let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+        // Each file is for the owner only, whatever the umask is: the
+        // active files, the kept packages, `previous`, `review`, the
+        // journal and the lock.
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.update("1.2.0", &package("1.2.0", NETWORK)).unwrap();
+        f.installer
+            .write_pending(&id(), Some(&v("1.1.0")), &v("1.2.0"))
+            .unwrap();
+        let mut files = 0;
+        for dir in [f.installer.active(&id()), f.store()] {
+            for entry in fs::read_dir(dir).unwrap() {
+                let meta = entry.as_ref().unwrap().metadata().unwrap();
+                let path = entry.unwrap().path();
+                assert!(meta.is_file(), "{}", path.display());
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    path.display()
+                );
+                files += 1;
+            }
+        }
+        // 3 active files, 3 packages with signatures, 4 other store files.
+        assert_eq!(files, 13);
     }
 
     // R-84 (h): the journal, a broken active version, the kept packages.
@@ -2085,7 +2188,7 @@ mod tests {
         fs::write(pending(&f), "not toml [").unwrap();
         f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
         fs::create_dir(f.store().join("0.9.0")).unwrap();
-        let part = format!("{}: the journal is invalid", pending(&f).display());
+        let part = format!("{}: the journal does not name", pending(&f).display());
         assert_error(f.installer.recover(&id()), ErrorCategory::Internal, &part);
         assert!(pending(&f).exists());
         assert!(f.store().join("1.0.0").join(MANIFEST_FILE).is_file());
@@ -2245,18 +2348,20 @@ mod tests {
         f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
         // A second id whose recovery fails, and a name that is not an id.
         let other = f.installer.data.join("store/acme.mysql");
-        fs::create_dir_all(other.join(PENDING_FILE)).unwrap();
+        fs::create_dir_all(other.join("1.0.0")).unwrap();
+        fs::create_dir(other.join("2.0.0")).unwrap();
+        fs::write(other.join(PENDING_FILE), "").unwrap();
         fs::write(f.installer.data.join("store/Not An Id"), "").unwrap();
 
         assert_error(
             f.installer.recover_all(),
-            ErrorCategory::User,
-            "cannot read the journal",
+            ErrorCategory::Internal,
+            "2 directories of retired versions",
         );
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
         assert!(!f.store().join(PENDING_FILE).exists());
 
-        fs::remove_dir(other.join(PENDING_FILE)).unwrap();
+        fs::remove_dir(other.join("2.0.0")).unwrap();
         f.installer.recover_all().unwrap();
     }
 
@@ -2335,5 +2440,253 @@ mod tests {
         assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
         assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
         assert_eq!([kept("1.2.0"), kept("1.3.0")], [true, true]);
+    }
+
+    // R-108: a journal that cannot be read.
+
+    /// A name and a function that makes the file at a path that shape.
+    type Shape = (&'static str, fn(&Path));
+
+    #[test]
+    fn a_journal_that_cannot_be_read_does_not_lose_the_active_version() {
+        let mut shapes: Vec<Shape> = vec![
+            ("not UTF-8", |path| fs::write(path, [0xff, 0xfe]).unwrap()),
+            ("a directory", |path| {
+                fs::create_dir_all(path.join("inner")).unwrap();
+            }),
+        ];
+        // The open of a FIFO without a writer does not return.
+        #[cfg(unix)]
+        shapes.push(("a FIFO", |path| {
+            let made = std::process::Command::new("mkfifo").arg(path).status();
+            assert!(made.unwrap().success());
+        }));
+        #[cfg(unix)]
+        shapes.push(("mode 000", |path| {
+            fs::write(path, "old = \"0.9.0\"\nnew = \"2.0.0\"").unwrap();
+            set_mode(path, 0o000);
+        }));
+        #[cfg(unix)]
+        shapes.push(("a symbolic link", |path| {
+            let outside = path.parent().unwrap().join("../../../outside");
+            fs::write(&outside, "new = \"2.0.0\"").unwrap();
+            std::os::unix::fs::symlink(&outside, path).unwrap();
+        }));
+        for (shape, plant) in shapes {
+            // A stop between the two renames: the one retired version goes back.
+            let f = fixture();
+            let content = f.staged_update();
+            let pending = f.store().join(PENDING_FILE);
+            plant(&pending);
+            f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+            f.installer.recover(&id()).unwrap();
+            assert_eq!(f.active_version().as_deref(), Some("1.0.0"), "{shape}");
+            assert!(fs::symlink_metadata(&pending).is_err(), "{shape}");
+            assert!(!content.exists(), "{shape}");
+
+            // A stop before the first rename: the active version stays.
+            plant(&pending);
+            f.update("1.1.0", &package("1.1.0", "")).unwrap();
+            assert_eq!(f.active_version().as_deref(), Some("1.1.0"), "{shape}");
+            assert!(fs::symlink_metadata(&pending).is_err(), "{shape}");
+            // The target of a link is not deleted.
+            assert_eq!(
+                f.dir.path().join("outside").exists(),
+                shape == "a symbolic link"
+            );
+        }
+    }
+
+    #[test]
+    fn a_journal_above_the_size_limit_is_not_read() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        // Without the limit this journal says: the change to 1.0.0 is done.
+        let mut journal = "old = \"0.9.0\"\nnew = \"1.0.0\"\n#".to_owned();
+        journal.push_str(&"#".repeat(JOURNAL_MAX_BYTES as usize));
+        fs::write(f.store().join(PENDING_FILE), journal).unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert!(!f.store().join(PENDING_FILE).exists());
+        assert!(!f.store().join(PREVIOUS_FILE).exists());
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    // R-109: an active manifest that is missing or cannot be read.
+
+    #[test]
+    fn install_replaces_an_active_version_whose_manifest_cannot_be_read() {
+        let mut shapes: Vec<Shape> = vec![
+            ("missing", |path| fs::remove_file(path).unwrap()),
+            ("not UTF-8", |path| fs::write(path, [0xff, 0xfe]).unwrap()),
+            ("a directory", |path| {
+                fs::remove_file(path).unwrap();
+                fs::create_dir(path).unwrap();
+            }),
+        ];
+        #[cfg(unix)]
+        shapes.push(("mode 000", |path| set_mode(path, 0o000)));
+        for (shape, damage) in shapes {
+            let f = fixture();
+            f.install("1.0.0", &package("1.0.0", "")).unwrap();
+            f.update("1.1.0", &package("1.1.0", "")).unwrap();
+            f.publish("1.2.0", &package("1.2.0", NETWORK));
+            damage(&f.installer.active(&id()).join(MANIFEST_FILE));
+
+            let way_out = "install a version of `acme.postgres` to replace it";
+            assert_error(f.installer.installed(&id()), ErrorCategory::User, way_out);
+            assert_error(f.installer.rollback(&id()), ErrorCategory::User, way_out);
+            assert_error(
+                f.installer.update(&id(), &v("1.2.0")),
+                ErrorCategory::User,
+                way_out,
+            );
+            assert_eq!(
+                f.installer.install(&id(), &v("1.2.0")).unwrap(),
+                Outcome::Activated,
+                "{shape}"
+            );
+            assert_eq!(f.active_version().as_deref(), Some("1.2.0"), "{shape}");
+            // Only the lock file and the package and signature of 1.2.0 stay.
+            assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3, "{shape}");
+        }
+    }
+
+    // R-110: symbolic links, the lock file, temporary files, a journal
+    // that names no directory.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_directory_that_is_a_symbolic_link_is_refused() {
+        use std::os::unix::fs::symlink;
+        let f = fixture();
+        f.publish("1.0.0", &package("1.0.0", ""));
+        let outside = f.dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir_all(f.store().parent().unwrap()).unwrap();
+        symlink(&outside, f.store()).unwrap();
+
+        let part = format!("{}: the directory must not be", f.store().display());
+        assert_error(
+            f.installer.install(&id(), &v("1.0.0")),
+            ErrorCategory::User,
+            &part,
+        );
+        assert_error(f.installer.recover(&id()), ErrorCategory::User, &part);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_file(f.store()).unwrap();
+        f.installer.install(&id(), &v("1.0.0")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_recovery_does_not_move_or_follow_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+        let f = fixture();
+        f.staged_update();
+        // The active directory is moved out. A link has the name of the
+        // retired version; another has the name of a staging directory.
+        let outside = f.dir.path().join("outside");
+        fs::rename(f.installer.active(&id()), &outside).unwrap();
+        symlink(&outside, f.store().join("1.0.0")).unwrap();
+        symlink(&outside, f.store().join(".staging-link")).unwrap();
+
+        for journal in ["not toml [", "old = \"1.0.0\"\nnew = \"2.0.0\""] {
+            fs::write(f.store().join(PENDING_FILE), journal).unwrap();
+            f.installer.recover(&id()).unwrap();
+            assert!(!f.installer.active(&id()).exists(), "{journal}");
+            assert!(!f.store().join(PENDING_FILE).exists(), "{journal}");
+            assert!(outside.join(MANIFEST_FILE).is_file(), "{journal}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_with_a_second_hard_link_is_refused() {
+        let f = fixture();
+        f.publish("1.0.0", &package("1.0.0", ""));
+        let other = f.installer.data.join("store/acme.mysql");
+        drop(lock(&other, &"acme.mysql".parse().unwrap()).unwrap());
+        fs::create_dir_all(f.store()).unwrap();
+        fs::hard_link(other.join(LOCK_FILE), f.store().join(LOCK_FILE)).unwrap();
+
+        assert_error(
+            f.installer.install(&id(), &v("1.0.0")),
+            ErrorCategory::User,
+            "the lock file has 2 hard links",
+        );
+        assert_eq!(f.active_version(), None);
+    }
+
+    #[test]
+    fn the_content_of_the_lock_file_is_ignored() {
+        let f = fixture();
+        fs::create_dir_all(f.store()).unwrap();
+        fs::write(f.store().join(LOCK_FILE), "x").unwrap();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        assert_eq!(fs::read(f.store().join(LOCK_FILE)).unwrap(), b"x");
+    }
+
+    #[test]
+    fn the_temporary_files_of_a_stopped_process_are_removed() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        let left = f.store().join(".tmpAbC123");
+        fs::write(&left, "1.0.0").unwrap();
+        // Not a regular file: it stays.
+        let dir = f.store().join(".tmpdir");
+        fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        let outside = {
+            let outside = f.dir.path().join("outside");
+            fs::write(&outside, "").unwrap();
+            std::os::unix::fs::symlink(&outside, f.store().join(".tmplink")).unwrap();
+            outside
+        };
+
+        f.installer.recover(&id()).unwrap();
+        assert!(!left.exists());
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        assert!(outside.is_file());
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn a_journal_that_names_no_directory_puts_the_one_retired_version_back() {
+        let pending = |f: &Fixture| f.store().join(PENDING_FILE);
+        // The journal names an old version that has no directory: the one
+        // retired version goes back. The journal of a first install names
+        // no old version: nothing goes back.
+        let journals = [
+            ("old = \"0.8.0\"\nnew = \"2.0.0\"", Some("1.0.0")),
+            ("new = \"2.0.0\"", None),
+        ];
+        for (journal, active) in journals {
+            let f = fixture();
+            f.staged_update();
+            fs::write(pending(&f), journal).unwrap();
+            f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+            f.installer.recover(&id()).unwrap();
+            assert_eq!(f.active_version().as_deref(), active, "{journal}");
+            assert!(!pending(&f).exists());
+        }
+
+        // Two retired versions and none is the old version of the journal.
+        let f = fixture();
+        f.staged_update();
+        fs::write(pending(&f), "old = \"0.8.0\"\nnew = \"2.0.0\"").unwrap();
+        f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
+        fs::create_dir(f.store().join("0.9.0")).unwrap();
+        assert_error(
+            f.installer.recover(&id()),
+            ErrorCategory::Internal,
+            "2 directories of retired versions",
+        );
+        assert!(pending(&f).exists());
+        // The old version of the journal has a directory: it goes back.
+        fs::write(pending(&f), "old = \"1.0.0\"\nnew = \"2.0.0\"").unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
     }
 }
