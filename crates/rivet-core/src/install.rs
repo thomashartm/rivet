@@ -66,8 +66,10 @@
 //! 0600, whatever the umask is, so a kept package is verified again in a
 //! private directory. The owner of a directory and the mode of a file that
 //! exists are not checked. On Unix a lock file with a second hard link is
-//! refused too. Windows has none of these checks. A `<data>/store/<id>`
-//! that is a symbolic link is refused on each platform.
+//! refused too. Windows has none of these checks. A `<data>/store`,
+//! `<data>/store/<id>`, `<data>/extensions` or `<data>/extensions/<id>`
+//! that is a symbolic link is refused on each platform; `<data>` itself may
+//! be one.
 //! `<data>/extensions` is the user discovery directory of the host
 //! ([`Installer::extensions_dir`]). The host does not scan `<data>/store`.
 //!
@@ -356,7 +358,8 @@ impl Installer {
     /// # Errors
     ///
     /// - `user`: a directory of the installer can be written by the group
-    ///   or by other users (Unix), or the extension is installed already
+    ///   or by other users (Unix) or is a symbolic link (`<data>` may be
+    ///   one), or the extension is installed already
     ///   (use [`update`](Self::update)), or the package or the signature is not
     ///   in the registry or cannot be read, or the package is not a tar
     ///   archive, or its manifest is invalid, or the active directory with
@@ -486,7 +489,8 @@ impl Installer {
     ///
     /// - `user`: a file cannot be read, moved or written, or a directory
     ///   of the installer can be written by the group or by other users
-    ///   (Unix). The error names the file or the directory.
+    ///   (Unix) or is a symbolic link. The error names the file or the
+    ///   directory.
     /// - `internal`: the journal does not name the version that was
     ///   active, no version is active and the store has two or more
     ///   retired directories. Nothing changes.
@@ -816,6 +820,7 @@ impl Installer {
     }
 
     /// Takes the lock of `id`. Refuses first, with a `user` error, a
+    /// directory below `<data>` that is a symbolic link, and a
     /// directory of the installer that the group or other users can write
     /// (Unix): they could put another file in the place of a verified one.
     /// The rule and the category are those of the trust store file
@@ -823,12 +828,20 @@ impl Installer {
     /// checked. There is no check on Windows.
     fn lock(&self, id: &ExtensionId) -> Result<IdLock> {
         let store = self.store(id);
-        // A link could point out of `<data>` or to the store of another id.
-        if fs::symlink_metadata(&store).is_ok_and(|meta| meta.is_symlink()) {
-            return Err(Error::user(format!(
-                "{}: the directory must not be a symbolic link; remove the link",
-                store.display()
-            )));
+        // A link could point out of `<data>`, to the store of another id or
+        // to another filesystem. `<data>` itself may be a link (ADR-0023).
+        for dir in [
+            self.data.join("store"),
+            store.clone(),
+            self.extensions_dir(),
+            self.active(id),
+        ] {
+            if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_symlink()) {
+                return Err(Error::user(format!(
+                    "{}: the directory must not be a symbolic link; remove the link",
+                    dir.display()
+                )));
+            }
         }
         let dirs = [
             self.data.clone(),
@@ -2734,6 +2747,49 @@ mod tests {
 
         fs::remove_file(f.store()).unwrap();
         f.installer.install(&id(), &v("1.0.0")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_the_installer_that_is_a_symbolic_link_is_refused() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let outside = f.dir.path().join("outside");
+        for dir in [
+            f.installer.data.join("store"),
+            f.installer.extensions_dir(),
+            f.installer.active(&id()),
+        ] {
+            fs::rename(&dir, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+            let part = format!("{}: the directory must not be", dir.display());
+            let installer = &f.installer;
+            assert_error(
+                installer.install(&id(), &v("1.2.0")),
+                ErrorCategory::User,
+                &part,
+            );
+            assert_error(
+                installer.update(&id(), &v("1.2.0")),
+                ErrorCategory::User,
+                &part,
+            );
+            assert_error(installer.rollback(&id()), ErrorCategory::User, &part);
+            let review = installer.activate_after_review(&id(), &v("1.0.0"));
+            assert_error(review, ErrorCategory::User, &part);
+            assert_error(installer.recover(&id()), ErrorCategory::User, &part);
+            assert_error(installer.recover_all(), ErrorCategory::User, &part);
+            fs::remove_file(&dir).unwrap();
+            fs::rename(&outside, &dir).unwrap();
+        }
+        // `<data>` itself may be a link.
+        fs::rename(&f.installer.data, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &f.installer.data).unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+        f.installer.recover_all().unwrap();
     }
 
     #[cfg(unix)]
