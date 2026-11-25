@@ -48,12 +48,15 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// The schemes a [`SecretUri`] accepts (ADR-0008).
-const SCHEMES: [&str; 3] = ["keychain", "aws-sm", "gcp-sm"];
 const SCHEME_END: &str = "://";
 
-/// A reference to a stored secret: `keychain://…`, `aws-sm://…` or
-/// `gcp-sm://…` (ARCHITECTURE.md §6.3, ADR-0008).
+/// A reference to a stored secret, for example `keychain://…`, `aws-sm://…`
+/// or `gcp-sm://…` (ARCHITECTURE.md §6.3, ADR-0008).
+///
+/// The scheme names the secret backend. Extensions add backends, so any
+/// well-formed scheme is accepted: a lowercase letter, then lowercase
+/// letters, digits, `+`, `-` or `.`. A scheme without a backend fails when
+/// the secret is resolved, not when the URI is parsed.
 ///
 /// It is a reference, not a secret value, so it can be printed, cloned and
 /// written to a configuration file. It serializes as its string form.
@@ -65,7 +68,8 @@ const SCHEME_END: &str = "://";
 /// let uri: SecretUri = "aws-sm://prod/db/password".parse()?;
 /// assert_eq!(uri.scheme(), "aws-sm");
 /// assert_eq!(uri.path(), "prod/db/password");
-/// assert!("vault://prod/db".parse::<SecretUri>().is_err());
+/// assert!("vault://prod/db".parse::<SecretUri>().is_ok());
+/// assert!("prod-db".parse::<SecretUri>().is_err());
 /// # Ok::<(), rivet_sdk::error::Error>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,16 +99,19 @@ impl SecretUri {
 impl TryFrom<String> for SecretUri {
     type Error = Error;
 
-    /// Fails with a `user` error if the scheme is not `keychain`, `aws-sm`
-    /// or `gcp-sm`, or if the path is empty.
+    /// Fails with a `user` error if the scheme is not well-formed or if the
+    /// path is empty.
     fn try_from(uri: String) -> Result<Self, Error> {
         // The messages do not repeat the input: a user can put a secret value
         // in the place of the URI by mistake, and errors reach logs.
         let (scheme, path) = uri
             .split_once(SCHEME_END)
-            .filter(|(scheme, _)| SCHEMES.contains(scheme))
+            .filter(|(scheme, _)| is_scheme(scheme))
             .ok_or_else(|| {
-                Error::user("a secret URI must start with keychain://, aws-sm:// or gcp-sm://")
+                Error::user(
+                    "a secret URI must start with a lowercase scheme and ://, \
+                     for example keychain://",
+                )
             })?;
         if path.trim().is_empty() {
             return Err(Error::user(format!(
@@ -114,6 +121,14 @@ impl TryFrom<String> for SecretUri {
         let scheme_len = scheme.len();
         Ok(Self { uri, scheme_len })
     }
+}
+
+/// The RFC 3986 scheme grammar, lowercase only so that a scheme has one
+/// spelling when a backend is looked up.
+fn is_scheme(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "+-.".contains(c))
 }
 
 impl FromStr for SecretUri {
@@ -163,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_uri_accepts_the_three_schemes() {
+    fn secret_uri_accepts_built_in_and_extension_schemes() {
         for (text, scheme, path) in [
             ("keychain://rivet/prod-db", "keychain", "rivet/prod-db"),
             ("aws-sm://prod/db/password", "aws-sm", "prod/db/password"),
@@ -172,6 +187,8 @@ mod tests {
                 "gcp-sm",
                 "projects/p/secrets/db",
             ),
+            ("vault://prod/db", "vault", "prod/db"),
+            ("x1+a-b.c://entry", "x1+a-b.c", "entry"),
         ] {
             let uri: SecretUri = text.parse().expect(text);
             assert_eq!(uri.scheme(), scheme);
@@ -182,13 +199,15 @@ mod tests {
     }
 
     #[test]
-    fn secret_uri_rejects_other_schemes_and_empty_paths() {
+    fn secret_uri_rejects_malformed_schemes_and_empty_paths() {
         for text in [
             "",
             "prod-db",
-            "vault://prod/db",
-            "https://example.com/secret",
-            "file:///etc/passwd",
+            "://rivet/prod-db",
+            "1pass://rivet/prod-db",
+            "-sm://rivet/prod-db",
+            "my vault://rivet/prod-db",
+            "p@ss://word",
             "KEYCHAIN://rivet/prod-db",
             "keychain:rivet/prod-db",
             "keychain://",
@@ -219,6 +238,6 @@ mod tests {
         let text = toml::to_string(&holder).unwrap();
         assert_eq!(text, "password = \"aws-sm://prod/db/password\"\n");
         assert_eq!(toml::from_str::<Holder>(&text).unwrap(), holder);
-        assert!(toml::from_str::<Holder>("password = \"vault://x\"").is_err());
+        assert!(toml::from_str::<Holder>("password = \"hunter2\"").is_err());
     }
 }
