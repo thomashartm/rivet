@@ -391,14 +391,18 @@ fn guest_error(state: &State, action: &str, error: &types::Error) -> Error {
 
 /// Makes text from a component safe for a log line or an error message.
 ///
-/// 1. Secrets are redacted. This is before the cut, so the cut cannot leave
-///    a part of a secret that the redacting log writer does not find.
+/// 1. Secrets are redacted. This finds a secret with a character that step 2
+///    changes, for example a TAB.
 /// 2. Each character that can start a line or hide text becomes a space
 ///    ([`is_unsafe`]), and `"` becomes `'`. The human log format writes a host
 ///    field as `name="value"`, so the text cannot imitate one.
-/// 3. The text is cut to [`MAX_GUEST_TEXT_BYTES`].
+/// 3. Secrets are redacted again: step 2 maps several characters to one, so
+///    it can make a secret, for example a TAB that becomes a space.
+/// 4. The text is cut to [`MAX_GUEST_TEXT_BYTES`]. This is after the
+///    redaction, so the cut cannot leave a part of a secret: it can only
+///    cut a marker.
 pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
-    let mut text: String = redactor
+    let cleaned: String = redactor
         .redact(text)
         .chars()
         .map(|c| match c {
@@ -407,6 +411,7 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
             c => c,
         })
         .collect();
+    let mut text = redactor.redact(&cleaned).into_owned();
     // Not `logging::shown`: no escape and no mark, so the result has the
     // limit as its true maximum, and step 2 replaced the unsafe characters.
     text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
@@ -2256,6 +2261,79 @@ mod tests {
         assert!(reason.contains("wasi:[REDACTED]/x@0.2.6"), "{reason}");
         for text in all_text(&report.not_activated[&id("acme.import")]) {
             assert!(!text.contains("hunter2"), "{text}");
+        }
+    }
+
+    /// A redactor with secrets that have a space, a `'` and a TAB: the
+    /// characters that [`guest_text`] changes or makes.
+    fn cleaning_redactor() -> Redactor {
+        let redactor = Redactor::new();
+        for secret in [
+            "correct horse battery",
+            "it's-a-secret-pass",
+            "tab\tin-secret",
+        ] {
+            redactor.register(&Secret::from(secret.to_owned()));
+        }
+        redactor
+    }
+
+    /// The parts of the secrets of [`cleaning_redactor`] that no output may
+    /// contain.
+    const CLEANING_SECRET_PARTS: [&str; 3] = ["horse", "a-secret", "in-secret"];
+
+    #[test]
+    fn a_secret_that_the_cleaning_makes_or_changes_is_redacted() {
+        // R-114: the guest writes a TAB for a space and `"` for `'`, or the
+        // secret has a TAB.
+        let redactor = cleaning_redactor();
+        let cases = [
+            "a correct\thorse\u{1b}battery b",
+            "a it\"s-a-secret-pass b",
+            "a tab\tin-secret b",
+        ];
+        for case in cases {
+            let text = guest_text(&redactor, case);
+            assert_eq!(text, "a [REDACTED] b", "{case:?}");
+        }
+        let path = format!("{}/correct\thorse battery/x.wasm", "d".repeat(300));
+        let text = path_text(&redactor, Path::new(&path));
+        assert!(text.ends_with("/[REDACTED]/x.wasm"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_returned_error_or_an_import_name_is_redacted() {
+        // R-114, R-115b: through a real error of a component.
+        let redactor = cleaning_redactor();
+        let runtime = runtime_with(SMALL, &redactor);
+        for message in [
+            "correct\thorse\tbattery",
+            "it\"s-a-secret-pass",
+            "tab\tin-secret",
+        ] {
+            let instance = instance(&runtime, refusing_guest(message), "acme.leaky").await;
+            let error = instance.activate().await.unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .ends_with("the component returned an error: [REDACTED]"),
+                "{error}"
+            );
+        }
+        let import = r#"(import "correct\thorse battery" (instance (export "f" (func))))"#;
+        let error = runtime
+            .load(guest_with(import, "", "(i32.const 0)"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            all_text(&error).concat().contains("[REDACTED]"),
+            "{error:?}"
+        );
+        for text in all_text(&error) {
+            for part in CLEANING_SECRET_PARTS {
+                assert!(!text.contains(part), "{part} in {text}");
+            }
         }
     }
 
