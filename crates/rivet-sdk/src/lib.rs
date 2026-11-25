@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod extension;
 pub mod manifest;
 pub mod model;
 pub mod secret;
