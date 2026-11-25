@@ -9,7 +9,7 @@
 //! | Entry | Content | Limit |
 //! | --- | --- | --- |
 //! | `extension.toml` | The manifest ([`Manifest`]). Its `sdk` range is the SDK docs reference: the documentation is part of each SDK release. | 1 MiB |
-//! | `extension.wasm` | The WASM component. | 128 MiB |
+//! | `extension.wasm` | The WASM component. | [`DEFAULT_COMPONENT_BYTES`]: the limit of the WASM runtime, so a package that installs can load |
 //! | `LICENSE` | The licence text. | 1 MiB |
 //!
 //! The signature is not in the package. It is a separate minisign file,
@@ -26,10 +26,13 @@
 //! - An entry with another name. Thus a path with `..`, an absolute path, a
 //!   path with a directory and `./extension.toml` are refused.
 //! - An entry that is not a regular file: a symbolic link, a hard link, a
-//!   directory, a device, a FIFO.
+//!   directory, a device, a FIFO. A GNU long name entry and a PAX header
+//!   entry are entries too: they are refused, not applied to the next entry.
 //! - An entry above its size limit. The bytes are counted during the copy.
 //! - A second entry with the same name. Thus a package has three entries at
-//!   most. The archive is read to its end.
+//!   most.
+//! - A byte that is not zero after the end mark of the archive. The file is
+//!   read to its end.
 //! - A package without one of the three entries.
 //! - A manifest whose id or version is not the id or version of the
 //!   signature.
@@ -49,6 +52,7 @@
 //! <data>/store/<id>/<id>-<version>.rivetpkg.minisig
 //! <data>/store/<id>/previous             the version for a rollback
 //! <data>/store/<id>/pending              the journal of a change that is not complete
+//! <data>/store/<id>/review               the version whose review waits
 //! <data>/store/<id>/.lock                the lock of the id; never renamed, never deleted
 //! ```
 //!
@@ -66,8 +70,9 @@
 //!    returns.
 //! 4. Compare the id and the version of the manifest with the signature.
 //! 5. Update and rollback: compare the capabilities with the active version
-//!    ([`added_capabilities`]). If the new manifest adds a capability, stop
-//!    with [`Outcome::NeedsReview`]. The active version does not change.
+//!    ([`added_capabilities`]). If the new manifest adds a capability, write
+//!    `review` and stop with [`Outcome::NeedsReview`]. The active version
+//!    does not change.
 //! 6. Make the staged directory the active directory.
 //!
 //! An error in step 1 to 5 changes nothing in `<data>/extensions`. Step 6
@@ -123,7 +128,11 @@
 //! - **Review.** Call [`Installer::activate_after_review`] only after the
 //!   user reviewed the added capabilities and
 //!   [`Permissions::grant`](crate::permissions::Permissions::grant) stored
-//!   the grant (to enforce in #51; no check exists).
+//!   the grant (to enforce in #51; no check exists). The installer only
+//!   checks that a review waits for this version: the last operation on the
+//!   id returned [`Outcome::NeedsReview`] for it. An install, update or
+//!   rollback of the id that gets to step 1 removes the record of an older
+//!   review.
 //! - **First install.** [`Installer::install`] activates the package without
 //!   a review. The extension has no access until the caller grants its
 //!   capabilities: the permission service denies by default.
@@ -167,6 +176,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub use crate::wasm::COMPONENT_FILE;
+use crate::wasm::DEFAULT_COMPONENT_BYTES;
 
 /// The name of the licence text in a package.
 pub const LICENCE_FILE: &str = "LICENSE";
@@ -174,16 +184,13 @@ pub const LICENCE_FILE: &str = "LICENSE";
 /// The file name extension of a package.
 pub const PACKAGE_EXTENSION: &str = "rivetpkg";
 
-/// The maximum size of the WASM component in a package.
-pub const COMPONENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
-
 /// The maximum size of the manifest and of the licence text in a package.
 pub const TEXT_ENTRY_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The only entries of a package, each with its size limit.
 const ENTRIES: [(&str, u64); 3] = [
     (MANIFEST_FILE, TEXT_ENTRY_MAX_BYTES),
-    (COMPONENT_FILE, COMPONENT_MAX_BYTES),
+    (COMPONENT_FILE, DEFAULT_COMPONENT_BYTES as u64),
     (LICENCE_FILE, TEXT_ENTRY_MAX_BYTES),
 ];
 
@@ -194,6 +201,10 @@ const PENDING_FILE: &str = "pending";
 const PREVIOUS_FILE: &str = "previous";
 const STAGING_PREFIX: &str = ".staging-";
 const LOCK_FILE: &str = ".lock";
+const REVIEW_FILE: &str = "review";
+
+/// The number of bytes of a refused entry name that an error shows.
+const ENTRY_NAME_SHOWN_BYTES: usize = 64;
 
 /// The result of an install, an update or a rollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,7 +306,7 @@ impl Installer {
     ///
     /// Each error installs nothing.
     pub fn install(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        let _lock = lock(&self.store(id))?;
+        let _lock = lock(&self.store(id), id)?;
         self.repair(id)?;
         if let Some(installed) = self.installed(id)? {
             return Err(Error::user(format!(
@@ -314,23 +325,27 @@ impl Installer {
     /// # Errors
     ///
     /// - `user`: the extension is not installed, or `version` is not newer
-    ///   than the active version.
+    ///   than the active version. Build metadata does not make a version
+    ///   newer: `1.0.0+b` is the same version as `1.0.0+a`.
     /// - See [`install`](Self::install).
     ///
-    /// Each error leaves the active version as it was. After the
-    /// [point of no return](self#why-a-failed-change-leaves-the-old-version-usable)
+    /// Each error before the second rename leaves the active version as it
+    /// was. After the second rename
+    /// ([the point of no return](self#why-a-failed-change-leaves-the-old-version-usable))
     /// no error is returned.
     pub fn update(&self, id: &ExtensionId, version: &Version) -> Result<Outcome> {
-        let _lock = lock(&self.store(id))?;
+        let _lock = lock(&self.store(id), id)?;
         self.repair(id)?;
         match self.installed(id)? {
             None => Err(Error::user(format!(
                 "extension `{id}` is not installed; install it first"
             ))),
-            Some(installed) if *version <= installed.version => Err(Error::user(format!(
-                "extension `{id}`: version {version} is not newer than the installed version {}",
-                installed.version
-            ))),
+            Some(installed) if version.cmp_precedence(&installed.version).is_le() => {
+                Err(Error::user(format!(
+                    "extension `{id}`: version {version} is not newer than the installed version {}",
+                    installed.version
+                )))
+            }
             Some(_) => self.activate(id, version, Source::Registry, true),
         }
     }
@@ -347,11 +362,12 @@ impl Installer {
     /// - `user`: there is no previous version.
     /// - See [`install`](Self::install).
     ///
-    /// Each error leaves the active version as it was. After the
-    /// [point of no return](self#why-a-failed-change-leaves-the-old-version-usable)
+    /// Each error before the second rename leaves the active version as it
+    /// was. After the second rename
+    /// ([the point of no return](self#why-a-failed-change-leaves-the-old-version-usable))
     /// no error is returned.
     pub fn rollback(&self, id: &ExtensionId) -> Result<Outcome> {
-        let _lock = lock(&self.store(id))?;
+        let _lock = lock(&self.store(id), id)?;
         self.repair(id)?;
         let path = self.store(id).join(PREVIOUS_FILE);
         let none = || Error::user(format!("extension `{id}` has no previous version"));
@@ -371,12 +387,20 @@ impl Installer {
     ///
     /// # Errors
     ///
+    /// - `policy`: no review waits for this version of `id`.
     /// - `user`: the store has no package of this version, or the version
     ///   is active already.
     /// - See [`install`](Self::install).
     pub fn activate_after_review(&self, id: &ExtensionId, version: &Version) -> Result<()> {
-        let _lock = lock(&self.store(id))?;
+        let _lock = lock(&self.store(id), id)?;
         self.repair(id)?;
+        // A record that cannot be read or is for another version is no review.
+        let record = fs::read_to_string(self.store(id).join(REVIEW_FILE)).unwrap_or_default();
+        if record.trim().parse::<Version>().ok().as_ref() != Some(version) {
+            return Err(Error::policy(format!(
+                "extension `{id}`: no review waits for version {version}; update to it first"
+            )));
+        }
         self.activate(id, version, Source::Store, false).map(|_| ())
     }
 
@@ -390,7 +414,7 @@ impl Installer {
     ///   the file.
     /// - `retryable`: another operation on `id` runs.
     pub fn recover(&self, id: &ExtensionId) -> Result<()> {
-        let _lock = lock(&self.store(id))?;
+        let _lock = lock(&self.store(id), id)?;
         self.repair(id)
     }
 
@@ -454,6 +478,10 @@ impl Installer {
             )));
         }
         let store = self.store(id);
+        if source == Source::Registry || review {
+            // A new install, update or rollback: an older review is void.
+            remove_file(&store.join(REVIEW_FILE))?;
+        }
         let name = format!("{id}-{version}.{PACKAGE_EXTENSION}");
         let signature_name = format!("{name}.minisig");
         let (kept_package, kept_signature) = (store.join(&name), store.join(&signature_name));
@@ -514,6 +542,7 @@ impl Installer {
         if review && let Some(installed) = &installed {
             let added = added_capabilities(&installed.capabilities, &manifest.capabilities);
             if added != Capabilities::default() {
+                write_atomic(&store.join(REVIEW_FILE), &version.to_string())?;
                 tracing::info!(extension = %id, %version, "the version adds capabilities and needs a review");
                 return Ok(Outcome::NeedsReview { added });
             }
@@ -571,6 +600,8 @@ impl Installer {
     /// Completes a change after the second rename.
     fn finish(&self, id: &ExtensionId, old: Option<&Version>) -> Result<()> {
         let store = self.store(id);
+        // The review, if one waited, was for the version that is active now.
+        remove_file(&store.join(REVIEW_FILE))?;
         if let Some(old) = old {
             write_atomic(&store.join(PREVIOUS_FILE), &old.to_string())?;
         }
@@ -603,7 +634,8 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
         .map_err(|error| io_error(content, "cannot create the directory", error))?;
 
     let mut archive = tar::Archive::new(file);
-    for entry in archive.entries().map_err(malformed)? {
+    // Raw: a long name entry or a PAX entry is an entry, with its own name.
+    for entry in archive.entries().map_err(malformed)?.raw(true) {
         let mut entry = entry.map_err(malformed)?;
         let path = entry.path_bytes().into_owned();
         // The target name is the constant, never the text of the archive.
@@ -611,10 +643,14 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             .iter()
             .find(|(entry_name, _)| entry_name.as_bytes() == path)
         else {
+            let (shown, cut) = match path.get(..ENTRY_NAME_SHOWN_BYTES) {
+                Some(start) if start.len() < path.len() => (start, "..."),
+                _ => (&path[..], ""),
+            };
             return Err(refused(format!(
-                "the entry `{}` is not permitted: a package holds only `{MANIFEST_FILE}`, \
+                "the entry `{}{cut}` is not permitted: a package holds only `{MANIFEST_FILE}`, \
                  `{COMPONENT_FILE}` and `{LICENCE_FILE}`",
-                String::from_utf8_lossy(&path).escape_debug()
+                String::from_utf8_lossy(shown).escape_debug()
             )));
         };
         if entry.header().entry_type() != tar::EntryType::Regular {
@@ -644,6 +680,20 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             return Err(too_large());
         }
     }
+    // The archive library stops at the end mark. Only zero bytes may follow.
+    let mut rest = archive.into_inner();
+    let mut block = [0; 8192];
+    loop {
+        let read = rest.read(&mut block).map_err(malformed)?;
+        if read == 0 {
+            break;
+        }
+        if block[..read].iter().any(|byte| *byte != 0) {
+            return Err(refused(
+                "the package has data after the end of the archive".to_owned(),
+            ));
+        }
+    }
     match ENTRIES
         .iter()
         .find(|(entry_name, _)| !content.join(entry_name).is_file())
@@ -671,7 +721,7 @@ impl Drop for IdLock {
 ///
 /// Each call opens the file again: the lock belongs to the open file, so it
 /// also stops a second thread of this process.
-fn lock(store: &Path) -> Result<IdLock> {
+fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
     fs::create_dir_all(store)
         .map_err(|error| io_error(store, "cannot create the directory", error))?;
     let path = store.join(LOCK_FILE);
@@ -684,8 +734,7 @@ fn lock(store: &Path) -> Result<IdLock> {
     match file.try_lock() {
         Ok(()) => Ok(IdLock(file)),
         Err(fs::TryLockError::WouldBlock) => Err(Error::retryable(format!(
-            "{}: another install operation on this extension runs; try again",
-            path.display()
+            "extension `{id}`: another install operation on this extension runs; try again"
         ))),
         Err(fs::TryLockError::Error(error)) => Err(io_error(&path, "cannot lock the file", error)),
     }
@@ -1268,7 +1317,7 @@ mod tests {
         let f = fixture();
         f.install("1.0.0", &package("1.0.0", "")).unwrap();
         f.publish("1.1.0", &package("1.1.0", ""));
-        let held = lock(&f.store()).unwrap();
+        let held = lock(&f.store(), &id()).unwrap();
 
         // Each operation opens the lock file again and does not get the lock.
         let part = "another install operation";
@@ -1309,7 +1358,7 @@ mod tests {
         const NAME: &str = "install::tests::the_lock_of_one_id_stops_a_second_process";
 
         if let Some(store) = std::env::var_os(STORE) {
-            let _held = lock(Path::new(&store)).unwrap();
+            let _held = lock(Path::new(&store), &id()).unwrap();
             println!("locked");
             // Holds the lock until the parent closes the pipe.
             let _ = io::stdin().read(&mut [0]);
@@ -1374,6 +1423,8 @@ mod tests {
     #[test]
     fn activate_after_review_needs_a_kept_package() {
         let f = fixture();
+        fs::create_dir_all(f.store()).unwrap();
+        fs::write(f.store().join(REVIEW_FILE), "1.0.0").unwrap();
         assert_error(
             f.installer.activate_after_review(&id(), &v("1.0.0")),
             ErrorCategory::User,
@@ -1450,12 +1501,14 @@ mod tests {
         let mut header = tar::Header::new_ustar();
         header.as_old_mut().name[..COMPONENT_FILE.len()].copy_from_slice(COMPONENT_FILE.as_bytes());
         header.set_entry_type(EntryType::Regular);
-        header.set_size(COMPONENT_MAX_BYTES + 1);
+        // The limit of the WASM runtime: a package that installs can load.
+        let limit = DEFAULT_COMPONENT_BYTES as u64;
+        header.set_size(limit + 1);
         header.set_cksum();
         assert_error(
             f.install("1.0.0", header.as_bytes()),
             ErrorCategory::Policy,
-            "the entry `extension.wasm` is larger than 134217728 bytes",
+            &format!("the entry `extension.wasm` is larger than {limit} bytes"),
         );
         f.assert_nothing_installed();
     }
@@ -1467,6 +1520,136 @@ mod tests {
             (COMPONENT_FILE, EntryType::Regular, b"second"),
             "`extension.wasm` is in the package more than one time",
         );
+    }
+
+    // R-84: raw entries, the end of the archive, the entry name in an error.
+
+    #[test]
+    fn a_gnu_long_name_entry_is_refused() {
+        let f = fixture();
+        // The long name entry gives the next entry the name `extension.toml`.
+        let hostile = archive(&[
+            ("././@LongLink", EntryType::GNULongName, b"extension.toml\0"),
+            (
+                "../..",
+                EntryType::Regular,
+                manifest("acme.postgres", "1.0.0", "").as_bytes(),
+            ),
+            (COMPONENT_FILE, EntryType::Regular, b"\0asm component"),
+            (LICENCE_FILE, EntryType::Regular, b"MIT"),
+        ]);
+        assert_error(
+            f.install("1.0.0", &hostile),
+            ErrorCategory::Policy,
+            "`././@LongLink` is not permitted",
+        );
+        f.assert_nothing_installed();
+    }
+
+    #[test]
+    fn an_entry_after_the_end_of_the_archive_is_refused() {
+        let f = fixture();
+        let mut hostile = package("1.0.0", "");
+        hostile.extend(archive(&[("evil", EntryType::Regular, b"x")]));
+        assert_error(
+            f.install("1.0.0", &hostile),
+            ErrorCategory::Policy,
+            "data after the end of the archive",
+        );
+        f.assert_nothing_installed();
+    }
+
+    #[test]
+    fn a_long_entry_name_is_cut_in_the_error() {
+        let f = fixture();
+        let name = "a".repeat(100);
+        let hostile = package_with(
+            &manifest("acme.postgres", "1.0.0", ""),
+            &[(&name, EntryType::Regular, b"x")],
+        );
+        let error = f.install("1.0.0", &hostile).unwrap_err().to_string();
+        let shown = "a".repeat(ENTRY_NAME_SHOWN_BYTES);
+        assert!(
+            error.contains(&format!("`{shown}...` is not permitted")),
+            "{error}"
+        );
+
+        // A name of 1 MiB in a long name entry.
+        let long = vec![b'a'; 1024 * 1024];
+        let hostile = archive(&[
+            ("././@LongLink", EntryType::GNULongName, &long),
+            ("x", EntryType::Regular, b"x"),
+        ]);
+        let error = f.install("1.0.1", &hostile).unwrap_err().to_string();
+        assert!(error.len() < 512, "{} bytes", error.len());
+    }
+
+    // R-84: a review that waits, and build metadata.
+
+    #[test]
+    fn activate_after_review_needs_a_review_that_waits_for_the_version() {
+        let f = fixture();
+        f.install("3.0.0", &package("3.0.0", "")).unwrap();
+        // The update is refused, but the store has a signed package of 1.0.0.
+        assert_error(
+            f.update("1.0.0", &package("1.0.0", "")),
+            ErrorCategory::User,
+            "is not newer",
+        );
+        let from = f.installer.registry.join("acme.postgres/1.0.0");
+        for name in [
+            "acme.postgres-1.0.0.rivetpkg",
+            "acme.postgres-1.0.0.rivetpkg.minisig",
+        ] {
+            fs::copy(from.join(name), f.store().join(name)).unwrap();
+        }
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("1.0.0")),
+            ErrorCategory::Policy,
+            "no review waits",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("3.0.0"));
+
+        // A review waits for 3.1.0 only, and a newer operation removes it.
+        assert!(matches!(
+            f.update("3.1.0", &package("3.1.0", NETWORK)).unwrap(),
+            Outcome::NeedsReview { .. }
+        ));
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("1.0.0")),
+            ErrorCategory::Policy,
+            "no review waits",
+        );
+        assert_eq!(
+            f.update("3.0.1", &package("3.0.1", "")).unwrap(),
+            Outcome::Activated
+        );
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("3.1.0")),
+            ErrorCategory::Policy,
+            "no review waits",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("3.0.1"));
+
+        // The record is used one time.
+        f.installer.update(&id(), &v("3.1.0")).unwrap();
+        f.installer
+            .activate_after_review(&id(), &v("3.1.0"))
+            .unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("3.1.0"));
+        assert!(!f.store().join(REVIEW_FILE).exists());
+    }
+
+    #[test]
+    fn a_version_with_other_build_metadata_is_not_an_update() {
+        let f = fixture();
+        f.install("1.0.0+a", &package("1.0.0+a", "")).unwrap();
+        assert_error(
+            f.update("1.0.0+b", &package("1.0.0+b", "")),
+            ErrorCategory::User,
+            "is not newer",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0+a"));
     }
 
     // Criterion 6: the trust store file.
@@ -1516,8 +1699,15 @@ mod tests {
         assert!(!f.installer.active(&id()).exists());
 
         // The same package installs with the file in the permitted place.
+        // Only the user can write it, also with a wide umask (ADR-0019).
         f.installer.trust_file = f.dir.path().join("config/trust.toml");
         fs::write(&f.installer.trust_file, &trust).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&f.installer.trust_file, mode).unwrap();
+        }
         assert_eq!(
             f.installer.install(&id(), &v("1.0.0")).unwrap(),
             Outcome::Activated
