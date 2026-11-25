@@ -194,6 +194,8 @@ impl<T> JobHandle<T> {
 /// | `jobs.max_per_extension` | 8 | [`max_per_extension`](Self::max_per_extension) |
 /// | `jobs.retain_finished` | 100 | [`retain_finished`](Self::retain_finished) |
 /// | `jobs.cancel_grace_ms` | 5000 | [`cancel_grace`](Self::cancel_grace) |
+///
+/// `jobs.cancel_grace_ms` is from 1 to 60000.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobConfig {
     /// How many jobs run at the same time.
@@ -208,6 +210,10 @@ pub struct JobConfig {
     /// scheduler aborts it. The setting is in milliseconds.
     pub cancel_grace: Duration,
 }
+
+/// The longest grace period that the settings accept: a release of an
+/// extension waits this long for a job that ignores the cancel request.
+const MAX_CANCEL_GRACE_MS: u64 = 60_000;
 
 impl Default for JobConfig {
     fn default() -> Self {
@@ -226,14 +232,35 @@ impl JobConfig {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if a value has the wrong type, or if
-    /// `jobs.max_concurrent` or `jobs.max_per_extension` is `0`.
+    /// Returns a `user` error if a value has the wrong type, if
+    /// `jobs.max_concurrent`, `jobs.max_per_extension` or
+    /// `jobs.cancel_grace_ms` is `0`, or if `jobs.cancel_grace_ms` is more
+    /// than 60000 (one minute).
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         let default = Self::default();
-        let max_concurrent = settings.get("jobs.max_concurrent")?;
-        let max_per_extension = settings.get("jobs.max_per_extension")?;
+        let invalid = |problem: String| Error::user(format!("invalid settings: {problem}"));
+        // Read as a plain integer, so that the error for `0` names the key.
+        let not_zero = |key: &str| -> Result<Option<NonZeroUsize>> {
+            let value = settings.get::<usize>(key)?.map(NonZeroUsize::new);
+            match value {
+                Some(None) => Err(invalid(format!("`{key}` must not be 0"))),
+                Some(value) => Ok(value),
+                None => Ok(None),
+            }
+        };
+        let max_concurrent = not_zero("jobs.max_concurrent")?;
+        let max_per_extension = not_zero("jobs.max_per_extension")?;
         let retain_finished = settings.get("jobs.retain_finished")?;
-        let cancel_grace = settings.get("jobs.cancel_grace_ms")?;
+        let cancel_grace = settings.get::<u64>("jobs.cancel_grace_ms")?;
+        match cancel_grace {
+            Some(0) => return Err(invalid("`jobs.cancel_grace_ms` must not be 0".into())),
+            Some(millis) if millis > MAX_CANCEL_GRACE_MS => {
+                return Err(invalid(format!(
+                    "`jobs.cancel_grace_ms` must not be more than {MAX_CANCEL_GRACE_MS}"
+                )));
+            }
+            _ => {}
+        }
         Ok(Self {
             max_concurrent: max_concurrent.unwrap_or(default.max_concurrent),
             max_per_extension: max_per_extension.or(default.max_per_extension),
@@ -293,6 +320,10 @@ impl JobScheduler {
     /// - `max_concurrent`: how many jobs run at the same time.
     /// - `retain_finished`: how many finished jobs [`jobs`](Self::jobs)
     ///   still lists. Older finished jobs are forgotten.
+    ///
+    /// The limit per extension is thus the default: one owner can have at
+    /// most 8 queued and running jobs. Use [`with_config`](Self::with_config)
+    /// for another limit or for no limit.
     pub fn new(max_concurrent: NonZeroUsize, retain_finished: usize) -> Self {
         Self::with_config(JobConfig {
             max_concurrent,
@@ -324,6 +355,10 @@ impl JobScheduler {
     /// threads, so it MUST NOT block; use
     /// [`spawn_blocking`](Self::spawn_blocking) for blocking work.
     ///
+    /// The scheduler does not prove `owner`: the caller (the binding layer)
+    /// MUST give the id of the extension that starts the job, or the limit
+    /// per extension has no effect.
+    ///
     /// The final state follows from what `work` does:
     ///
     /// | `work` | State |
@@ -331,10 +366,10 @@ impl JobScheduler {
     /// | returns `Ok` | `Succeeded` |
     /// | returns `Err` after a cancel request, or an `Err` of the category `cancelled` | `Cancelled` |
     /// | does not return in [`JobConfig::cancel_grace`] after a cancel request (it is aborted) | `Cancelled` |
+    /// | returns another `Err`, or panics | `Failed` |
     ///
     /// The abort stops `work` at its next `.await`. See the
     /// [module documentation](self) for work that never reaches one.
-    /// | returns another `Err`, or panics | `Failed` |
     ///
     /// # Errors
     ///
@@ -561,8 +596,16 @@ impl Inner {
         let overdue = async {
             token.cancelled().await;
             tokio::time::sleep(grace).await;
+            // Work that ends at the same moment as the grace period gets
+            // its turn before the abort. On a runtime with more than one
+            // thread this does not fix the order: there the result is what
+            // happened first.
+            tokio::task::yield_now().await;
         };
         let joined = tokio::select! {
+            // A job that has finished keeps its result, also if the grace
+            // period ends in the same poll.
+            biased;
             joined = &mut work => joined,
             () = overdue => {
                 work.abort();
@@ -1315,6 +1358,63 @@ mod tests {
         assert_eq!(next.join().await.unwrap(), "next");
         let again = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok("again") });
         assert_eq!(again.unwrap().join().await.unwrap(), "again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_that_ends_at_the_end_of_the_grace_period_keeps_its_result() {
+        let grace = JobConfig::default().cancel_grace;
+        let scheduler = scheduler(1);
+        for round in 0..200 {
+            // The work and the grace period end at the same moment.
+            let handle = scheduler
+                .spawn(owner("ext.a"), "query", move |ctx| async move {
+                    ctx.cancelled().await;
+                    tokio::time::sleep(grace).await;
+                    Ok(round)
+                })
+                .unwrap();
+            wait_for(&handle, JobState::Running).await;
+            handle.cancel();
+
+            let watch = handle.watch();
+            assert_eq!(handle.join().await.unwrap(), round);
+            assert_eq!(watch.borrow().state, JobState::Succeeded);
+        }
+    }
+
+    #[test]
+    fn zero_and_too_long_grace_in_the_settings_are_refused_with_the_key() {
+        use crate::settings::Layer;
+        let read = |jobs: &str| {
+            let mut settings = Settings::new();
+            let text = format!("schema_version = 1\n[jobs]\n{jobs}");
+            settings.set_layer(Layer::User, "test", &text).unwrap();
+            JobConfig::from_settings(&settings)
+        };
+        for (invalid, message) in [
+            (
+                "max_concurrent = 0",
+                "invalid settings: `jobs.max_concurrent` must not be 0",
+            ),
+            (
+                "max_per_extension = 0",
+                "invalid settings: `jobs.max_per_extension` must not be 0",
+            ),
+            (
+                "cancel_grace_ms = 0",
+                "invalid settings: `jobs.cancel_grace_ms` must not be 0",
+            ),
+            (
+                "cancel_grace_ms = 60001",
+                "invalid settings: `jobs.cancel_grace_ms` must not be more than 60000",
+            ),
+        ] {
+            let error = read(invalid).expect_err(invalid);
+            assert_eq!(error.category(), ErrorCategory::User, "{invalid}");
+            assert_eq!(error.message(), message);
+        }
+        let longest = read("cancel_grace_ms = 60000").unwrap();
+        assert_eq!(longest.cancel_grace, Duration::from_secs(60));
     }
 
     #[test]
