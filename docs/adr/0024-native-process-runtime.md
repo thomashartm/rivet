@@ -27,6 +27,11 @@ ADR-0003 says native plugins run in a separate extension host process. ARCHITECT
 
 - A child lives as long as its instance. The host must drop the instance to end the process; see ADR-0021 for the shutdown.
 - A native extension that is idle for a long time and writes to its error output gets no new budget until the next request. With only lifecycle requests this means: about 100 lines for the whole time in `Active`. The first native extension point brings more requests.
+- Rules from the review of the first code (PR #142; the changes are not on `main` on this date):
+  - A crash report must not hit a newer instance. The callback gives the time of the failure; the host ignores a report that is older than the load of the instance that it has now. Without this, a report that waits behind a reload restarts the new instance one time and counts for the restart limit.
+  - The runtime reports a crash only for a child whose handshake was successful. A program that exits before the handshake gives the load error only.
+  - To drop the instance also ends the task that reads the error output, also when another process still holds the pipe.
+  - Known limit: a process that the child starts itself is not ended with the child. To end a process group needs a system call that the standard library and tokio do not give without `unsafe` or a new crate. It belongs to the OS sandbox work.
 - Limits of this part, not resolved here:
   - A native process has no memory limit and no CPU limit (§4.3 requires limits per extension). No ticket has it.
   - The process is not sandboxed by the OS. §4.7 then requires that the install review says "runs with full user privileges"; that text is for #51 and does not exist.
