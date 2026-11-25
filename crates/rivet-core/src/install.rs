@@ -60,12 +60,14 @@
 //!
 //! `<data>` MUST be a directory of the user that other users cannot write.
 //! On Unix each operation refuses, with a `user` error, a `<data>`,
-//! `<data>/store`, `<data>/store/<id>` or `<data>/extensions` that the group
-//! or other users can write. A `<data>/store/<id>` that is a symbolic link
-//! is refused on each platform. On Unix a lock file with a second hard link
-//! is refused too. The installer creates these directories with
-//! mode 0700, so a kept package is verified again in a private directory.
-//! The owner of a directory is not checked. Windows has no check.
+//! `<data>/store`, `<data>/store/<id>`, `<data>/extensions` or
+//! `<data>/extensions/<id>` that the group or other users can write. The
+//! installer creates each directory with mode 0700 and each file with mode
+//! 0600, whatever the umask is, so a kept package is verified again in a
+//! private directory. The owner of a directory and the mode of a file that
+//! exists are not checked. On Unix a lock file with a second hard link is
+//! refused too. Windows has none of these checks. A `<data>/store/<id>`
+//! that is a symbolic link is refused on each platform.
 //! `<data>/extensions` is the user discovery directory of the host
 //! ([`Installer::extensions_dir`]). The host does not scan `<data>/store`.
 //!
@@ -552,10 +554,11 @@ impl Installer {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error(&pending, "cannot read the journal", error)),
         };
-        tracing::warn!(extension = %id, "an install did not complete; recovering");
         let journal = read_journal(&pending);
-        if journal.is_none() {
-            tracing::warn!(extension = %id, journal = %pending.display(), "the journal cannot be read or is invalid; recovering from the directories");
+        if journal.is_some() {
+            tracing::warn!(extension = %id, "an install did not complete; recovering");
+        } else {
+            tracing::warn!(extension = %id, journal = %pending.display(), "an install did not complete and the journal cannot be read or is invalid; recovering from the directories");
         }
         let active = self.active(id);
         if fs::symlink_metadata(&active).is_err() {
@@ -566,13 +569,7 @@ impl Installer {
                 Some((Some(old), _)) if is_real_dir(&store.join(old.to_string())) => {
                     Some(old.clone())
                 }
-                _ => {
-                    let retired = sole_retired(&store, &pending)?;
-                    if let Some(retired) = &retired {
-                        tracing::warn!(extension = %id, version = %retired, "the one retired version goes back");
-                    }
-                    retired
-                }
+                _ => sole_retired(&store, &pending)?,
             };
             if let Some(old) = old {
                 fs::rename(store.join(old.to_string()), &active)
@@ -808,6 +805,7 @@ impl Installer {
             self.data.join("store"),
             store.clone(),
             self.extensions_dir(),
+            self.active(id),
         ];
         #[cfg(unix)]
         for dir in &dirs {
@@ -846,8 +844,7 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
         Error::user(format!("{name}: the package is not a valid tar archive")).with_source(error)
     };
     let refused = |reason: String| Error::policy(format!("{name}: {reason}"));
-    fs::create_dir(content)
-        .map_err(|error| io_error(content, "cannot create the directory", error))?;
+    create_private_dir(content)?;
 
     let mut archive = tar::Archive::new(file);
     // The position after the last entry.
@@ -886,7 +883,7 @@ fn extract(file: File, name: &str, content: &Path) -> Result<()> {
             return Err(too_large());
         }
         let target = content.join(entry_name);
-        let mut out = File::create_new(&target).map_err(|error| match error.kind() {
+        let mut out = create_private_file(&target).map_err(|error| match error.kind() {
             ErrorKind::AlreadyExists => refused(format!(
                 "the entry `{entry_name}` is in the package more than one time"
             )),
@@ -964,7 +961,7 @@ fn lock(store: &Path, id: &ExtensionId) -> Result<IdLock> {
     create_private_dir(store)?;
     let path = store.join(LOCK_FILE);
     // Does not follow a symbolic link and does not open a FIFO.
-    match File::create_new(&path) {
+    match create_private_file(&path) {
         Err(error) if error.kind() != ErrorKind::AlreadyExists => {
             return Err(io_error(&path, "cannot create the lock file", error));
         }
@@ -1007,6 +1004,17 @@ fn create_private_dir(dir: &Path) -> Result<()> {
     builder
         .create(dir)
         .map_err(|error| io_error(dir, "cannot create the directory", error))
+}
+
+/// Creates the new file `path` for writing. Fails if something has that
+/// name; does not follow a symbolic link. On Unix, only the owner can read
+/// and write the file (mode 0600), whatever the umask is.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Reads the journal file `path`. Returns `None` for a file that cannot be
@@ -1077,7 +1085,7 @@ fn sole_retired(store: &Path, journal: &Path) -> Result<Option<Version>> {
 fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
     let source = open_regular(from, "registry", max_bytes)?;
     let mut target =
-        File::create_new(to).map_err(|error| io_error(to, "cannot write the file", error))?;
+        create_private_file(to).map_err(|error| io_error(to, "cannot write the file", error))?;
     // A file that grows after the size check is cut. The signature of the
     // copy then does not verify.
     io::copy(&mut source.take(max_bytes), &mut target)
@@ -1087,6 +1095,7 @@ fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
 
 /// Replaces `path` with a file that holds `text`. The text goes to a
 /// temporary file in the same directory, and that file then replaces `path`.
+/// On Unix `tempfile` creates the file with mode 0600.
 // shortcut: the directory is not synced, so a power loss can undo the last
 // rename; the journal then still describes a state that `recover` repairs
 // (ADR-0023 accepts this).
@@ -2086,7 +2095,12 @@ mod tests {
         set_mode(&data, 0o755);
         f.installer.update(&id(), &v("1.1.0")).unwrap();
         // The kept package of a rollback is in a directory of the group.
-        for dir in [f.store(), data.join("store"), f.installer.extensions_dir()] {
+        for dir in [
+            f.store(),
+            data.join("store"),
+            f.installer.extensions_dir(),
+            f.installer.active(&id()),
+        ] {
             set_mode(&dir, 0o770);
             let error = f.installer.rollback(&id()).unwrap_err();
             assert_eq!(error.category(), ErrorCategory::User, "{error}");
@@ -2109,10 +2123,36 @@ mod tests {
             f.installer.data.join("store"),
             f.store(),
             f.installer.extensions_dir(),
+            f.installer.active(&id()),
         ] {
             let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
+        // Each file is for the owner only, whatever the umask is: the
+        // active files, the kept packages, `previous`, `review`, the
+        // journal and the lock.
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.update("1.2.0", &package("1.2.0", NETWORK)).unwrap();
+        f.installer
+            .write_pending(&id(), Some(&v("1.1.0")), &v("1.2.0"))
+            .unwrap();
+        let mut files = 0;
+        for dir in [f.installer.active(&id()), f.store()] {
+            for entry in fs::read_dir(dir).unwrap() {
+                let meta = entry.as_ref().unwrap().metadata().unwrap();
+                let path = entry.unwrap().path();
+                assert!(meta.is_file(), "{}", path.display());
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    path.display()
+                );
+                files += 1;
+            }
+        }
+        // 3 active files, 3 packages with signatures, 4 other store files.
+        assert_eq!(files, 13);
     }
 
     // R-84 (h): the journal, a broken active version, the kept packages.
@@ -2412,6 +2452,12 @@ mod tests {
                 fs::create_dir_all(path.join("inner")).unwrap();
             }),
         ];
+        // The open of a FIFO without a writer does not return.
+        #[cfg(unix)]
+        shapes.push(("a FIFO", |path| {
+            let made = std::process::Command::new("mkfifo").arg(path).status();
+            assert!(made.unwrap().success());
+        }));
         #[cfg(unix)]
         shapes.push(("mode 000", |path| {
             fs::write(path, "old = \"0.9.0\"\nnew = \"2.0.0\"").unwrap();
