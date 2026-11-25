@@ -49,14 +49,20 @@
 //!   backstop for the work that fuel does not count. One thread for each
 //!   runtime advances the epoch of Wasmtime; guest code stops when its
 //!   deadline has passed. The limit does not stop host code: each host
-//!   import must do a bounded quantity of work.
+//!   import must do a bounded quantity of work. The limit is a backstop,
+//!   not an exact timer. A call does not end before its limit. It can end
+//!   later: by two ticks of 100 ms at most, plus the time that the thread
+//!   sleeps too long at each tick. Measured on macOS: a limit of 3000 ms
+//!   ended a call after 3.30 s.
 //! - Data to the host: one call of an import, and one result of an export,
 //!   can pass [`MAX_GUEST_CALL_BYTES`] at most. Wasmtime checks this before
 //!   it copies the data. More is a trap: one log message past this size
 //!   ends the instance.
 //! - Log: the messages of one call have a budget of [`LOG_LINES_PER_CALL`]
 //!   lines and [`LOG_BYTES_PER_CALL`] bytes. The host drops the messages
-//!   past the budget and writes one line with their number.
+//!   past the budget and writes one line with their number. A message below
+//!   the log level of the host is not written: it uses no budget and is not
+//!   in that number. Fuel limits the number of such messages.
 //! - File: a component file can have [`Limits::component_bytes`] at most.
 //!
 //! # Errors
@@ -130,8 +136,9 @@ pub const LOG_BYTES_PER_CALL: usize = 64 * 1024;
 /// Log or error text from a component is cut to this number of bytes.
 const MAX_GUEST_TEXT_BYTES: usize = 8 * 1024;
 
-/// The time between two epoch ticks of an engine. A call can run this much
-/// longer than [`Limits::call_timeout`].
+/// The shortest time between two epoch ticks of an engine. A call can run
+/// two ticks longer than [`Limits::call_timeout`], plus the time that the
+/// timer thread sleeps too long at each tick.
 const EPOCH_TICK: Duration = Duration::from_millis(100);
 
 /// The resource limits of an extension instance (ARCHITECTURE.md §4.3).
@@ -145,7 +152,8 @@ pub struct Limits {
     /// instruction.
     pub fuel_per_call: u64,
     /// The longest time of one call into a component. The instantiation is
-    /// also one call. The call can end up to 100 ms later.
+    /// also one call. The call does not end before this time. It can end
+    /// later: see "Limits" in the module documentation.
     ///
     /// The value has one owner: the code that builds the runtime and the
     /// extension host sets it from
@@ -171,9 +179,10 @@ impl Default for Limits {
 
 impl Limits {
     /// The epoch ticks after which a call has run for `call_timeout` at
-    /// least. One more than the quotient: the first tick can come at once.
+    /// least. The quotient is rounded up. One more: the first tick can come
+    /// at once.
     fn epoch_ticks(&self) -> u64 {
-        let ticks = self.call_timeout.as_millis() / EPOCH_TICK.as_millis();
+        let ticks = self.call_timeout.as_nanos().div_ceil(EPOCH_TICK.as_nanos());
         // The cap keeps the sum with the current epoch in a `u64`.
         u64::try_from(ticks).map_or(u64::from(u32::MAX), |ticks| {
             ticks.min(u64::from(u32::MAX)) + 1
@@ -249,6 +258,18 @@ impl ResourceLimiter for State {
 
 impl logging::Host for State {
     fn log(&mut self, level: LogLevel, message: String) {
+        // Before the budget: a message that the host does not write costs
+        // nothing and is not a dropped line.
+        let written = match level {
+            LogLevel::Trace => tracing::enabled!(tracing::Level::TRACE),
+            LogLevel::Debug => tracing::enabled!(tracing::Level::DEBUG),
+            LogLevel::Info => tracing::enabled!(tracing::Level::INFO),
+            LogLevel::Warn => tracing::enabled!(tracing::Level::WARN),
+            LogLevel::Error => tracing::enabled!(tracing::Level::ERROR),
+        };
+        if !written {
+            return;
+        }
         // Before the work on the text: a dropped message must be cheap.
         let bytes = message.len().min(MAX_GUEST_TEXT_BYTES);
         if self.log_lines == 0 || bytes > self.log_bytes {
@@ -1665,5 +1686,75 @@ mod tests {
         }
         assert_eq!(guest_text(&Redactor::new(), kept), kept);
         assert_eq!(guest_text(&Redactor::new(), "a\u{202e}b \"c\""), "a b 'c'");
+    }
+
+    #[tokio::test]
+    async fn a_log_message_below_the_host_level_uses_no_log_budget() {
+        // R-60: the host writes from `info`. 200 `debug` messages of 8192
+        // bytes are past the two budgets; then one `error` message.
+        let capture = Capture::default();
+        let _guard =
+            capture_logs(&capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new()));
+        let body = "(local $i i32)
+            (memory.fill (i32.const 256) (i32.const 97) (i32.const 8192))
+            (loop $l
+              (call $log (i32.const 1) (i32.const 256) (i32.const 8192))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $l (i32.lt_u (local.get $i) (i32.const 200))))
+            (call $log (i32.const 4) (i32.const 256) (i32.const 8192))
+            (i32.const 0)";
+        let instance = instance(&runtime(), guest("", body), "acme.chatty").await;
+        instance.activate().await.unwrap();
+
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("ERROR") && text.contains("aaaa"), "{text}");
+        assert!(!text.contains("dropped"), "{text}");
+    }
+
+    #[test]
+    fn the_epoch_ticks_of_a_time_limit_are_rounded_up() {
+        // R-62a: ticks of 100 ms. One more than the quotient, rounded up.
+        let ticks = |call_timeout| {
+            Limits {
+                call_timeout,
+                ..SMALL
+            }
+            .epoch_ticks()
+        };
+        assert_eq!(ticks(Duration::ZERO), 1);
+        assert_eq!(ticks(Duration::from_nanos(1)), 2);
+        assert_eq!(ticks(Duration::from_millis(100)), 2);
+        assert_eq!(ticks(Duration::from_millis(101)), 3);
+        assert_eq!(ticks(Duration::from_millis(250)), 4);
+        assert_eq!(ticks(Duration::from_millis(3000)), 31);
+        assert_eq!(ticks(DEFAULT_CALL_TIMEOUT), 301);
+        // The cap: the sum with the current epoch stays in a `u64`.
+        assert_eq!(ticks(Duration::MAX), u64::from(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn an_endless_loop_does_not_end_before_the_time_limit() {
+        // R-62a: a limit that is not a multiple of the tick.
+        let limits = Limits {
+            call_timeout: Duration::from_millis(90),
+            ..HURRIED
+        };
+        let runtime = runtime_with(limits, &Redactor::new());
+        let body = "(loop $l (br $l)) unreachable";
+        let component = runtime.load(guest("", body)).await.unwrap();
+        for _ in 0..3 {
+            let instance = runtime
+                .instantiate(&component, id("acme.spin"))
+                .await
+                .unwrap();
+            // The call before ended at a tick: start this one between two ticks.
+            thread::sleep(Duration::from_millis(35));
+            let start = std::time::Instant::now();
+            let error = instance.activate().await.unwrap_err();
+            let elapsed = start.elapsed();
+            assert!(error.message().contains("time limit"), "{error}");
+            assert!(elapsed >= limits.call_timeout, "{elapsed:?}");
+        }
     }
 }
