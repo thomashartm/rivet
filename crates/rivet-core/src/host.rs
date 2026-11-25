@@ -1114,7 +1114,7 @@ impl ExtensionHost {
         let new = scan.packages.remove(id);
         let mut was_active = BTreeSet::new();
         let mut report = ActivationReport::default();
-        {
+        let old_directory = {
             let inner = self.inner();
             let entry = inner.entries.get(id);
             let in_use = entry.map(|entry| entry.package.directory.as_path());
@@ -1129,7 +1129,8 @@ impl ExtensionHost {
                 was_active.extend(inner.active_dependents(id));
                 was_active.insert(id.clone());
             }
-        }
+            in_use.map(Path::to_owned)
+        };
         if !was_active.is_empty()
             && let Err(error) = self.deactivate_tree(id).await
             && state(self) != Some(ExtensionState::Inactive)
@@ -1144,6 +1145,13 @@ impl ExtensionHost {
             };
             let mut packages = inner.unloaded_packages();
             packages.remove(id);
+            // The package in use is gone and another directory has the id
+            // (ADR-0017): what runs must not change silently.
+            if let (Some(old), Some(new)) = (&old_directory, &new)
+                && *old != new.directory
+            {
+                tracing::warn!(extension = %id, old = %old.display(), new = %new.directory.display(), "reload changed the package directory of the extension");
+            }
             packages.extend(new.map(|package| (id.clone(), package)));
             let mut unloaded = Vec::from_iter(old.map(|entry| (id.clone(), entry)));
             unloaded.extend(self.reconcile(&mut inner, packages));
@@ -4070,6 +4078,42 @@ mod tests {
         f.write(WORKSPACE, "a", &manifest("a", "2.1.0", &[], ""));
         assert_eq!(f.host.reload(&id("a")).await.unwrap().activated, [id("a")]);
         assert_eq!(f.fake.count("load a@2.1.0"), 1);
+    }
+
+    // R-72: the reload names the old and the new directory (ADR-0017).
+    #[tokio::test]
+    async fn reload_logs_a_change_of_the_package_directory() {
+        let (log, dispatch) = log();
+        let _guard = capture_logs(&dispatch);
+        let f = fixture(true);
+        f.write(BUNDLED, "a", &manifest("a", "1.0.0", &[], ""));
+        f.write(WORKSPACE, "a", &manifest("a", "2.0.0", &[], ""));
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        let (old, new) = (f.roots[WORKSPACE].path(), f.roots[BUNDLED].path());
+
+        // The same directory: no event.
+        f.host.reload(&id("a")).await.unwrap();
+        assert!(!log.text().contains("directory"), "{}", log.text());
+
+        // The package in use was deleted: the bundled package is used.
+        std::fs::remove_dir_all(old.join("a")).unwrap();
+        f.host.reload(&id("a")).await.unwrap();
+
+        assert_eq!(f.status("a").unwrap().directory, new.join("a"));
+        let text = log.text();
+        let events: Vec<&str> = text.lines().filter(|l| l.contains("directory")).collect();
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(events[0].contains("WARN"), "{text}");
+        assert!(events[0].contains("extension=a"), "{text}");
+        assert!(
+            events[0].contains(&old.join("a").display().to_string()),
+            "{text}"
+        );
+        assert!(
+            events[0].contains(&new.join("a").display().to_string()),
+            "{text}"
+        );
     }
 
     #[tokio::test]
