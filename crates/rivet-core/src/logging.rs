@@ -81,7 +81,10 @@ fn debug_escaped(value: &str) -> Zeroizing<String> {
 fn json_escaped(value: &str) -> Zeroizing<String> {
     // A string always serialises; the fallback keeps the function total.
     let quoted = Zeroizing::new(serde_json::to_string(value).unwrap_or_default());
-    Zeroizing::new(quoted.trim_matches('"').to_owned())
+    // Not `trim_matches`: it also removes the escaped quote of a value that
+    // ends with `"`.
+    let inner = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or("");
+    Zeroizing::new(inner.to_owned())
 }
 
 /// Returns `value` as the human format writes it in a message and in an
@@ -665,6 +668,14 @@ mod tests {
     }
 
     /// R-43: each escape alone, and three escapes on top of each other.
+    #[test]
+    fn json_form_of_a_secret_with_a_quote_at_the_end_is_complete() {
+        let value = "ZqXwJk7\"";
+        assert_eq!(*json_escaped(value), "ZqXwJk7\\\"");
+        let json = serde_json::to_string(value).unwrap();
+        assert_eq!(redactor(&[value]).redact(&json), format!("\"{REDACTED}\""));
+    }
+
     #[test]
     fn redact_finds_each_escaped_form_and_a_chain_of_three() {
         // No escape leaves this value as it is.
