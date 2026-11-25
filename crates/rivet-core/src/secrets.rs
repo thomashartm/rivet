@@ -266,6 +266,10 @@ impl SecretStore {
     /// Registers `backend` of the extension `owner` for the URI scheme
     /// `scheme`, for example `acme-vault`.
     ///
+    /// Known limit (ADR-0021): the store takes `owner` from the caller and
+    /// does not prove it. The binding code must give the id of the extension
+    /// that calls.
+    ///
     /// # Errors
     ///
     /// - Returns a `user` error if `scheme` is not a scheme that a

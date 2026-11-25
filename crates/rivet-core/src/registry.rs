@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// The owners that the host stops at this time (§5.2, ADR-0021).
 ///
-/// The service registry, the command bus, the event bus and the job
-/// scheduler each have their own set. They refuse a closed owner, so that
+/// The service registry, the command bus, the event bus, the job scheduler
+/// and the secret store each have their own set. They refuse a closed owner, so that
 /// code of an extension that stops cannot register again behind the host.
 ///
 /// [`check`](Self::check) MUST be called while the caller holds the lock of

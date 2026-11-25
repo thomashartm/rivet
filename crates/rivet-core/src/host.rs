@@ -1265,8 +1265,14 @@ impl ExtensionHost {
             }
         };
         if state != ExtensionState::Active {
-            let unloaded = dead.is_some();
-            tracing::warn!(extension = %id, ?state, %error, unloaded, "crash report for an extension that is not active");
+            match dead {
+                Some(_) => {
+                    tracing::warn!(extension = %id, ?state, %error, "the instance of an extension that is not active ended: it is unloaded");
+                }
+                None => {
+                    tracing::debug!(extension = %id, ?state, %error, "crash report for an extension without an instance ignored");
+                }
+            }
             self.drop_instance(id, dead).await;
             return Ok(());
         }
