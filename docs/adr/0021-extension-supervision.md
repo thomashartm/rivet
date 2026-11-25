@@ -5,7 +5,7 @@
 
 ## Context
 
-ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 requires that a restart of a failed extension takes less than 1 s. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is not merged on this date.
+ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 requires that a restart of a failed extension takes less than 1 s. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is not merged on this date: the settings and the behaviour below are decided, not implemented on `main` (ticket #11).
 
 ## Decision
 
@@ -40,7 +40,8 @@ Behaviour:
 
 ## Consequences
 
-- With the defaults the delays are 100, 200, 400, 800 and 1000 ms. No delay is above the §9 target of 1 s. The time of the restart itself is not measured yet.
+- The §9 target "a restart of a failed extension takes < 1 s" is read as: for the first restart, the time from the failure to the state `Active` is below 1 s. That is the delay of 100 ms plus the restart call. Later attempts add their backoff delay on purpose; the target does not apply to them.
+- With the defaults the delays are 100, 200, 400, 800 and 1000 ms. The time of the restart call is not measured yet, so the target is not proven.
 - An earlier text of this ADR had `backoff_max_ms` = 60000. That value gave a fifth delay of 1600 ms and was never reached with 5 restarts.
 - The defaults are not measured. They are settings and can change without a contract change.
 - A timed-out call can still run on the blocking pool until it returns or its fuel is used (ADR-0018).

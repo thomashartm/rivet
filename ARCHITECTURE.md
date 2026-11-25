@@ -455,7 +455,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | Responsiveness | UI keeps 60 fps while scrolling a 10-million-row result. No UI frame waits on I/O. |
 | Memory | Idle engine < 50 MB resident. Streaming any result size uses bounded memory set by buffer settings. |
 | Scalability and streaming | Exports and copies of 100 GB complete with constant memory. Throughput is limited by network or database, not by the client. |
-| Reliability | A crashing extension never stops the engine. A restart of a failed extension takes < 1 s. IAM token expiry never causes a user-visible error on idle pools. |
+| Reliability | A crashing extension never stops the engine. A restart of a failed extension takes < 1 s (first restart, from the failure to `Active`; [ADR-0021](docs/adr/0021-extension-supervision.md), Proposed). IAM token expiry never causes a user-visible error on idle pools. |
 | Security and isolation | Every extension runs with only its granted capabilities. No secret appears in logs, history or config. Verified by tests. |
 | Portability | Windows, macOS and Linux (X11 and Wayland) on x86_64 and aarch64. |
 | Extensibility and compatibility | An extension built against SDK 1.x runs on every engine with SDK 1.y, y ≥ x. Checked by API compatibility tools. |
