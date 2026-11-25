@@ -352,8 +352,8 @@ fn reject_secret_values(source: &str, path: &str, table: &Table) -> Result<()> {
             if !is_uri {
                 // The message never contains the value.
                 return Err(Error::user(format!(
-                    "{source}: key `{path}` must hold a secret URI (keychain://, aws-sm:// or \
-                     gcp-sm://); settings do not accept a secret value"
+                    "{source}: key `{path}` must hold a secret URI (for example \
+                     keychain://); settings do not accept a secret value"
                 )));
             }
         } else {
@@ -652,7 +652,7 @@ mod tests {
                 "[[profiles]]\nname = \"a\"\n[[profiles]]\ntoken = \"hunter2\"\n",
                 "`profiles[1].token`",
             ),
-            ("[db]\npassword = \"vault://hunter2\"\n", "`db.password`"),
+            ("[db]\npassword = \"Vault://hunter2\"\n", "`db.password`"),
         ];
         for (body, key) in cases {
             let mut settings = Settings::new();
