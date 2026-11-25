@@ -31,6 +31,17 @@ Names and hosts in a manifest (Proposed, not decided by the owner; review findin
 - A filesystem scope path has one spelling (review finding R-55c). Refused: an empty component (`/a//b`, `//host/share`; the start `\\` of a UNC path stays permitted), a `.` component, a separator at the end except for a root (`/`, `C:\`, `C:/`; write `~`, not `~/`), each control character, and the same path two times, also with different access (read-write includes read).
 - The command bus does not check the name of a command. A command with a name that the manifest rule refuses can be registered, but it cannot be an activation event.
 
+Secret check of settings files (Proposed, not decided by the owner; review findings R-44, R-64, R-65; `settings.rs`; the changes are not on `main` on this date):
+
+- The check is a guard against common mistakes. It is not a proof.
+- A key path is "about a secret" if the secret segment, or a key below it, comes with a word of one fixed list: `max`, `min`, `ttl`, `length`, `len`, `limit`, `count`, `size`, `timeout`, `retries`, `per`, `file`, `path`, `encryption`. Examples: `max_tokens`, `token_ttl`, `db_password_file`.
+- Under a secret key that is not "about a secret": a string must be a secret URI; a number and a date are refused; a boolean is accepted.
+- Under a key "about a secret": each value type is accepted. The checks of the text (URL with a password, parameter with a secret name) still apply.
+- A parameter name in a text follows the same list: `password_encryption=...` is accepted.
+- A parameter with a secret name is accepted if its whole value is a placeholder of the form `${...}`, `{...}` or `%s`.
+- A built-in secret URI gets no text check only if it has one `://`, no whitespace and no `;`.
+- Known limits: `pin` is not a secret name (it is a common word for user interface settings); `user:password@host` without `://` is not found; `password_file = "hunter2"` and `keychain://x?password=hunter2` are accepted.
+
 ## Consequences
 
 - Profiles and policies stay free of secrets and can be committed.
