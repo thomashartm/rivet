@@ -122,7 +122,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -166,12 +166,14 @@ const ERROR_OUTPUT_LINE_BYTES: usize = 8 * 1024;
 
 /// What the runtime calls when a process ends, closes its output or sends a
 /// message while no call runs. The runtime calls it only for a process whose
-/// handshake was successful. The arguments are the extension and the
-/// reason. The reason contains no text from the process.
+/// handshake was successful. The arguments are the extension, the reason
+/// and the time of the failure. The reason contains no text from the
+/// process. With the time, the host ignores a report that is older than
+/// the instance that it has now (ADR-0024).
 ///
 /// The runtime calls it from a task of the Tokio runtime. It must not
 /// block.
-pub type CrashCallback = Arc<dyn Fn(ExtensionId, Error) + Send + Sync>;
+pub type CrashCallback = Arc<dyn Fn(ExtensionId, Error, Instant) + Send + Sync>;
 
 /// How the runtime starts and limits a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,8 +477,9 @@ async fn supervise(
                 }
             }
             error = process.unexpected(), if handshake_done => {
+                let failed_at = Instant::now();
                 let _ = process.child.kill().await;
-                on_crash(process.id.clone(), error);
+                on_crash(process.id.clone(), error, failed_at);
                 break;
             }
         }
@@ -745,7 +748,7 @@ mod tests {
         NativeRuntime::new(
             NativeConfig::new(program),
             Redactor::new(),
-            Arc::new(|_, _| {}),
+            Arc::new(|_, _, _| {}),
         )
         .unwrap()
     }

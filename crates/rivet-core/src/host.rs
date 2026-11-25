@@ -525,6 +525,9 @@ struct Entry {
     /// `Some` in the states `Active` and `Inactive`, until the shutdown or
     /// a crash report for the `Inactive` extension.
     instance: Option<Arc<dyn ExtensionInstance>>,
+    /// When the load of `instance` started. A crash report with an older
+    /// failure time is from an instance before it (ADR-0021).
+    loaded_at: Option<std::time::Instant>,
     /// The failures in a row. See [`Entry::end_run`].
     failures: u32,
     /// When the extension became `Active`. `Some` in the state `Active`.
@@ -1256,7 +1259,12 @@ impl ExtensionHost {
     /// Handles a crash of the extension `id`, for example a WASM trap
     /// outside a lifecycle call or the end of a native process. The runtime
     /// of the extension calls it. `error` is the reason; it must not contain
-    /// secrets.
+    /// secrets. `failed_at` is the time of the failure.
+    ///
+    /// The host ignores a report that is older than the start of the load of
+    /// the instance that it has now (ADR-0021): the report is from an
+    /// instance before it, for example one that a reload replaced. The call
+    /// returns success and nothing changes.
     ///
     /// The host deactivates the active dependents first, puts `id` in the
     /// state `Failed`, releases what it owns (§5.2) and drops its instance.
@@ -1273,17 +1281,36 @@ impl ExtensionHost {
     /// # Errors
     ///
     /// - A `user` error if the host does not know `id`.
-    pub async fn report_crash(&self, id: &ExtensionId, error: Error) -> Result<()> {
+    pub async fn report_crash(
+        &self,
+        id: &ExtensionId,
+        error: Error,
+        failed_at: std::time::Instant,
+    ) -> Result<()> {
         let id = id.clone();
-        self.operation(|host| async move { host.crash(&id, &error).await })
+        self.operation(move |host| async move { host.crash(&id, &error, failed_at).await })
             .await?
     }
 
     /// The body of [`report_crash`](Self::report_crash).
-    async fn crash(&self, id: &ExtensionId, error: &Error) -> Result<()> {
+    async fn crash(
+        &self,
+        id: &ExtensionId,
+        error: &Error,
+        failed_at: std::time::Instant,
+    ) -> Result<()> {
         let (state, dead) = {
             let mut inner = self.inner();
             let entry = inner.entries.get_mut(id).ok_or_else(|| unknown(id))?;
+            // The report waited, for example behind a reload: it is from an
+            // instance that the host has no more.
+            if entry
+                .loaded_at
+                .is_some_and(|loaded_at| failed_at < loaded_at)
+            {
+                tracing::debug!(extension = %id, %error, "crash report that is older than the instance of the extension ignored");
+                return Ok(());
+            }
             match entry.state {
                 ExtensionState::Active => (entry.state, None),
                 // The instance has ended. The next activation loads a new one.
@@ -1686,6 +1713,7 @@ impl ExtensionHost {
                 state: ExtensionState::Discovered,
                 reason: None,
                 instance: None,
+                loaded_at: None,
                 failures: 0,
                 active_since: None,
                 restart: None,
@@ -1936,10 +1964,12 @@ impl ExtensionHost {
                 None => {
                     let runtime = Arc::clone(&self.runtime);
                     let load = async move { runtime.load(&manifest, &directory).await };
+                    let loaded_at = std::time::Instant::now();
                     let instance: Arc<dyn ExtensionInstance> =
                         self.contained(id, "load", None, load).await?.into();
                     if let Some(entry) = self.inner().entries.get_mut(id) {
                         entry.instance = Some(Arc::clone(&instance));
+                        entry.loaded_at = Some(loaded_at);
                     }
                     instance
                 }
@@ -2364,6 +2394,11 @@ mod tests {
 
     fn id(text: &str) -> ExtensionId {
         text.parse().unwrap()
+    }
+
+    /// The failure time of a crash report: this moment.
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
     }
 
     /// A log output and a subscriber that writes each line from `WARN` up
@@ -3414,11 +3449,11 @@ mod tests {
         let crash = || Error::internal("trap");
 
         // Two crashes with a short run between them: the count grows.
-        f.host.report_crash(&id("a"), crash()).await.unwrap();
+        f.host.report_crash(&id("a"), crash(), now()).await.unwrap();
         assert_eq!(f.scheduled().await.attempt, 1);
         f.until("a", Active).await;
         pass(reset_after - MS).await;
-        f.host.report_crash(&id("a"), crash()).await.unwrap();
+        f.host.report_crash(&id("a"), crash(), now()).await.unwrap();
         let second = f.scheduled().await;
         assert_eq!((second.attempt, second.delay), (2, 200 * MS));
         f.until("a", Active).await;
@@ -3426,15 +3461,15 @@ mod tests {
         // After a stable run the count starts again. Without the reset this
         // third failure reaches the limit.
         pass(reset_after).await;
-        f.host.report_crash(&id("a"), crash()).await.unwrap();
+        f.host.report_crash(&id("a"), crash(), now()).await.unwrap();
         let third = f.scheduled().await;
         assert_eq!((third.attempt, third.delay), (1, 100 * MS));
         f.until("a", Active).await;
 
         // A short run again: two more failures reach the limit.
-        f.host.report_crash(&id("a"), crash()).await.unwrap();
+        f.host.report_crash(&id("a"), crash(), now()).await.unwrap();
         f.until("a", Active).await;
-        f.host.report_crash(&id("a"), crash()).await.unwrap();
+        f.host.report_crash(&id("a"), crash(), now()).await.unwrap();
         assert_eq!(f.state("a"), Some(Disabled));
     }
 
@@ -3454,7 +3489,7 @@ mod tests {
         let start = Instant::now();
 
         let crash = Error::internal("trap: out of bounds");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
 
         // The dependents first. The crashed instance is not called.
         assert_eq!(
@@ -3500,12 +3535,45 @@ mod tests {
 
         // A report for an extension without an instance changes nothing.
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("idle"), crash).await.unwrap();
+        f.host
+            .report_crash(&id("idle"), crash, now())
+            .await
+            .unwrap();
         assert_eq!(f.state("idle"), Some(Resolved));
         assert!(f.changes().await.is_empty());
         let crash = Error::internal("trap");
-        let unknown = f.host.report_crash(&id("unknown"), crash).await;
+        let unknown = f.host.report_crash(&id("unknown"), crash, now()).await;
         assert_eq!(unknown.unwrap_err().category(), ErrorCategory::User);
+    }
+
+    // ADR-0021, ADR-0024: a report must not hit a newer instance.
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_report_that_is_older_than_the_instance_is_ignored() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        let old_instance_failed = now();
+        // The report waits behind a reload, which loads a new instance.
+        assert_eq!(f.host.reload(&id("a")).await.unwrap().activated, [id("a")]);
+        f.fake.take_calls();
+        f.changes().await;
+
+        let crash = Error::internal("trap");
+        let a = id("a");
+        let report = f.host.report_crash(&a, crash, old_instance_failed);
+
+        report.await.unwrap();
+        assert_eq!(f.state("a"), Some(Active));
+        assert!(f.fake.take_calls().is_empty());
+        assert!(f.changes().await.is_empty());
+        assert!(f.all_scheduled().await.is_empty());
+
+        // A report of the instance that the host has now counts.
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
+        assert_eq!(f.state("a"), Some(Failed));
+        assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3520,7 +3588,7 @@ mod tests {
 
         // The process of the inactive extension ended.
         let crash = Error::internal("the process has ended");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
 
         assert_eq!(f.fake.take_calls(), ["unload a"]);
         // No state change, no failure, no restart.
@@ -3536,7 +3604,7 @@ mod tests {
         f.host.deactivate(&id("a")).await.unwrap();
         for _ in 0..2 {
             let crash = Error::internal("the process has ended");
-            f.host.report_crash(&id("a"), crash).await.unwrap();
+            f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         }
         assert_eq!(f.fake.take_calls(), ["deactivate a", "unload a"]);
     }
@@ -3549,7 +3617,7 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("b").await;
         f.host
-            .report_crash(&id("a"), Error::internal("trap"))
+            .report_crash(&id("a"), Error::internal("trap"), now())
             .await
             .unwrap();
         f.fake.take_calls();
@@ -3580,7 +3648,7 @@ mod tests {
         f.changes().await;
 
         f.host
-            .report_crash(&id("a"), Error::internal("trap"))
+            .report_crash(&id("a"), Error::internal("trap"), now())
             .await
             .unwrap();
         pass(HOUR).await;
@@ -3605,7 +3673,7 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("b").await;
         f.host
-            .report_crash(&id("b"), Error::internal("trap"))
+            .report_crash(&id("b"), Error::internal("trap"), now())
             .await
             .unwrap();
         assert_eq!(f.scheduled().await.attempt, 1);
@@ -3661,7 +3729,7 @@ mod tests {
             // By a user request, and as a dependent of a crashed extension.
             f.host.deactivate(&id("b")).await.unwrap_err();
             let crash = Error::internal("trap");
-            f.host.report_crash(&id("a"), crash).await.unwrap();
+            f.host.report_crash(&id("a"), crash, now()).await.unwrap();
             f.host.disable(&id("a")).await.unwrap();
             pass(HOUR).await;
 
@@ -3705,7 +3773,7 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("a").await;
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
         f.fake.take_calls();
 
@@ -3742,7 +3810,7 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("a").await;
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
         f.fake.take_calls();
 
@@ -3769,7 +3837,7 @@ mod tests {
         f.host.discover().await.unwrap();
         f.go("b").await;
         f.host
-            .report_crash(&id("b"), Error::internal("trap"))
+            .report_crash(&id("b"), Error::internal("trap"), now())
             .await
             .unwrap();
         assert_eq!(f.all_scheduled().await, [("b".to_owned(), 1)]);
@@ -4272,7 +4340,10 @@ mod tests {
 
         f.host.deactivate(&id("deactivated")).await.unwrap();
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("crashed"), crash).await.unwrap();
+        f.host
+            .report_crash(&id("crashed"), crash, now())
+            .await
+            .unwrap();
         f.services.events.publish(Ping);
 
         let mut open = subscription("stays").unwrap();
@@ -4316,7 +4387,7 @@ mod tests {
 
         // Unload from `Failed`. Discovery finds the extension again.
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         f.fake.take_calls();
         f.host.unload(&id("a")).await.unwrap();
         assert_eq!(f.state("a"), None);
@@ -4328,7 +4399,7 @@ mod tests {
 
         // Reload from `Disabled`: the same as from `Failed`.
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         f.host.disable(&id("a")).await.unwrap();
         f.write(USER, "a", &manifest("a", "2.0.0", &[], ""));
         f.changes().await;
@@ -4352,7 +4423,7 @@ mod tests {
 
         // Unload from `Disabled`. Discovery finds the extension again.
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         f.host.disable(&id("a")).await.unwrap();
         f.host.unload(&id("a")).await.unwrap();
         assert_eq!(f.state("a"), None);
@@ -4529,7 +4600,7 @@ mod tests {
         let f = with_backend(true, HostConfig::default()).await;
 
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
 
         assert_eq!(f.state("a"), Some(Failed));
         f.assert_no_backend("a").await;
@@ -4596,7 +4667,7 @@ mod tests {
         f.fake.set("activate a", Some(Mode::Fail));
 
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         f.until("a", Disabled).await;
 
         f.assert_no_backend("a").await;
@@ -4617,7 +4688,7 @@ mod tests {
         let mut f = with_backend(true, HostConfig::default()).await;
 
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
         f.assert_no_backend("a").await;
         f.until("a", Active).await;
 
@@ -4883,7 +4954,7 @@ mod tests {
         f.fake.set("deactivate b", Some(Mode::Fail));
 
         let crash = Error::internal("trap");
-        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.host.report_crash(&id("a"), crash, now()).await.unwrap();
 
         assert_eq!(f.state("b"), Some(Failed));
         f.fake.set("deactivate b", None);
