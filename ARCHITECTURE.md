@@ -507,3 +507,4 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 19 | Publisher identity and trust store (Proposed) | Publisher = first segment of the extension id; `trust.toml` in the user configuration directory | [0019](docs/adr/0019-publisher-identity-and-trust-store.md) |
 | 20 | Permission matching rules (Proposed) | Exact matches, deny in case of doubt | [0020](docs/adr/0020-permission-matching-rules.md) |
 | 21 | Extension supervision (Proposed) | Restart with backoff from 100 ms, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
+| 22 | Short secrets in logs (Proposed) | Values shorter than 4 bytes are not redacted; a warning is logged | [0022](docs/adr/0022-short-secrets-not-redacted.md) |

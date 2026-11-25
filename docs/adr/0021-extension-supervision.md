@@ -20,6 +20,9 @@ Settings and defaults:
 | `extensions.restart.limit` | 5 | Failed restarts in a row before `Disabled` |
 | `extensions.restart.reset_after_ms` | 300000 | Time in `Active` after which the failure count is 0 |
 | `jobs.max_per_extension` | 8 | Queued plus running jobs of one extension |
+| `jobs.max_concurrent` | 4 | Jobs that run at the same time |
+| `jobs.retain_finished` | 100 | Finished jobs that stay readable |
+| `jobs.cancel_grace_ms` | 5000 | Time between a cancel request and the abort of an async job |
 
 Behaviour:
 
@@ -30,6 +33,9 @@ Behaviour:
 - The automatic restart applies to a failed activation, a call timeout of load or activate, and a reported crash. A failure in a `deactivate` call starts no automatic restart: the extension stays `Failed` until a manual restart or disable, because the caller asked to stop it.
 - A failed restart keeps the state `Failed`. It is no state change (see ADR-0017 b).
 - The host publishes an event when it schedules a restart, with the attempt number, the delay and the reason.
+- The `jobs.*` settings are owned by the job scheduler. The `extensions.*` settings are owned by the extension host.
+- A cancel request of a running async job starts the grace period. After it the scheduler aborts the task and the job ends `Cancelled`.
+- A job keeps its slot until its code has really stopped. A blocking job and an async job that never yields cannot be aborted; each keeps its slot.
 - Unload, disable, a manual restart and shutdown cancel the pending restarts that they make useless.
 
 ## Consequences
