@@ -30,8 +30,15 @@
 //! - The code that builds the runtime and the host makes the limits with
 //!   [`Limits::for_host`] from the [`HostConfig`] that it gives to the host.
 //!   Then the time limit of the host and [`Limits::call_timeout`] are one
-//!   value: guest code stops not later than the overshoot of "Limits" after
-//!   the host gave up a call. With a longer limit in the runtime, the guest
+//!   value. For `activate` and `deactivate`, guest code stops not later
+//!   than the overshoot of "Limits" after the host gave up the call. For a
+//!   `load` the two limits do not start together (ADR-0018): the host counts
+//!   from the start of the load, before the file read and the compilation.
+//!   The runtime counts from the instantiation, when guest code starts. So
+//!   after the host gave up a load, the start function of a component can
+//!   run for the full limit of the runtime plus the overshoot, counted from
+//!   the end of the compilation. Only the size limit of the file bounds the
+//!   time of the compilation. With a longer limit in the runtime, the guest
 //!   code of a failed call runs on a blocking thread until that limit.
 //!
 //! # Sandbox
@@ -387,14 +394,17 @@ pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
 }
 
 /// Makes a path safe for an error message: the rules of [`guest_text`], and a
-/// cut to [`MAX_PATH_TEXT_BYTES`]. The name of a directory is untrusted.
+/// cut to the last [`MAX_PATH_TEXT_BYTES`]: the end of a path names the file.
+/// The name of a directory is untrusted.
 fn path_text(redactor: &Redactor, path: &Path) -> String {
-    let mut text = guest_text(redactor, &path.display().to_string());
-    if text.len() > MAX_PATH_TEXT_BYTES {
-        text.truncate(text.floor_char_boundary(MAX_PATH_TEXT_BYTES));
-        text.push('…');
+    // shortcut: `guest_text` keeps the first 8 KiB, so a longer path still
+    // loses its end; cut here before `guest_text` cuts when a caller can
+    // give such a path (the path limit of Linux is 4096 bytes).
+    let text = guest_text(redactor, &path.display().to_string());
+    match text.len().checked_sub(MAX_PATH_TEXT_BYTES) {
+        None | Some(0) => text,
+        Some(cut) => format!("…{}", &text[text.ceil_char_boundary(cut)..]),
     }
-    text
 }
 
 /// The format characters of Unicode 16.0 (general category Cf), the line
@@ -1524,6 +1534,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_time_limit_of_a_start_function_starts_at_the_instantiation() {
+        // R-102a, ADR-0018: the limit of the runtime does not include the
+        // compilation. The start function gets the full limit after it,
+        // also when the host gave up the load in the meantime.
+        let runtime = runtime_with(HURRIED, &Redactor::new());
+        let bytes = guest("(func $s (loop $l (br $l))) (start $s)", "(i32.const 0)");
+        let component = runtime.load(bytes).await.unwrap();
+        let compiled = std::time::Instant::now();
+        let error = runtime
+            .instantiate(&component, id("acme.spin"))
+            .await
+            .err()
+            .unwrap();
+        let elapsed = compiled.elapsed();
+        assert!(elapsed >= HURRIED.call_timeout, "{elapsed:?}");
+        assert!(elapsed.as_secs() < 5, "{elapsed:?}");
+        assert!(
+            error
+                .message()
+                .contains("instantiate failed: the call time limit was exceeded"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_call_that_the_caller_drops_ends_at_the_time_limit() {
         let runtime = runtime_with(HURRIED, &Redactor::new());
         let body = "(loop $l (br $l)) unreachable";
@@ -1946,6 +1981,42 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn with_equal_limits_the_runtime_limit_ends_a_call_without_the_host_limit() {
+        // The Tokio clock is paused and does not advance while a call runs
+        // on the blocking pool: the time limit of the host cannot end the
+        // call. The runtime limit counts real time.
+        let config = HostConfig {
+            call_timeout: Duration::from_millis(200),
+            backoff_initial: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        let limits = Limits {
+            fuel_per_call: u64::MAX,
+            ..Limits::for_host(&config)
+        };
+        let runtime = Arc::new(runtime_with(limits, &Redactor::new()));
+        let hosted = hosted_with(runtime, config);
+        let endless = guest("", "(loop $l (br $l)) unreachable");
+        hosted.install("acme.spin", "1.0.0", &endless);
+
+        let start = tokio::time::Instant::now();
+        let real = std::time::Instant::now();
+        let report = hosted.start("acme.spin").await;
+        assert!(start.elapsed() < limits.call_timeout);
+        assert!(real.elapsed() >= limits.call_timeout);
+        assert!(real.elapsed().as_secs() < 5, "{:?}", real.elapsed());
+        let error = &report.not_activated[&id("acme.spin")];
+        assert!(
+            error
+                .message()
+                .contains("activate failed: the call time limit was exceeded"),
+            "{error}"
+        );
+        assert_eq!(hosted.state("acme.spin"), Some(ExtensionState::Failed));
+    }
+
     #[tokio::test]
     async fn the_number_of_memories_tables_and_core_instances_has_a_limit() {
         // R-81: an object of size zero costs no memory budget. The guest of
@@ -1980,10 +2051,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_default_component_size_limit_is_4_mib() {
+    #[tokio::test]
+    async fn the_default_limits_refuse_a_component_of_one_byte_more_than_4_mib() {
         // R-82: the compilation has no time limit; the size bounds it.
-        assert_eq!(DEFAULT_COMPONENT_BYTES, 4 << 20);
+        let runtime = runtime_with(Limits::default(), &Redactor::new());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("extension.wasm");
+        let mut bytes = vec![0; 4 << 20];
+        std::fs::write(&path, &bytes).unwrap();
+        // 4 MiB of zeros pass the size check: the content is refused.
+        for result in [
+            runtime.load(bytes.clone()).await,
+            runtime.load_file(&path).await,
+        ] {
+            let error = result.err().unwrap();
+            assert!(error.message().contains("not a valid"), "{error}");
+        }
+
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        for result in [runtime.load(bytes).await, runtime.load_file(&path).await] {
+            let error = result.err().unwrap();
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+            assert!(error.message().contains("larger than the limit"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -2087,10 +2178,21 @@ mod tests {
             assert!(!text.chars().any(char::is_control), "{text:?}");
         }
 
-        // The path is cut.
-        let long = root.path().join("b".repeat(200)).join("c".repeat(200));
+        // A long path is cut at the front: the file name stays.
+        let name = format!("{}/extension.wasm", "c".repeat(200));
+        let long = root.path().join("b".repeat(200)).join(&name);
         let error = runtime.load_file(&long).await.err().unwrap();
-        assert!(error.message().len() < 300, "{}", error.message().len());
+        let text = error.message();
+        assert!(text.len() < 300, "{}", text.len());
+        assert!(text.contains("component …b"), "{text}");
+        assert!(text.ends_with(&format!("b/{name}")), "{text}");
+
+        // The cut is not inside a character, and the escaping stays.
+        let path = format!("{}\n\"/x.wasm", "é".repeat(200));
+        let text = path_text(&Redactor::new(), Path::new(&path));
+        assert_eq!(text, format!("…{} '/x.wasm", "é".repeat(123)));
+        let short = "a/b.wasm";
+        assert_eq!(path_text(&Redactor::new(), Path::new(short)), short);
     }
 
     #[tokio::test]
