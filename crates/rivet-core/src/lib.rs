@@ -3,6 +3,7 @@
 
 pub mod bus;
 pub mod host;
+pub mod install;
 pub mod jobs;
 pub mod logging;
 pub mod package;
