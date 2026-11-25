@@ -330,7 +330,7 @@ Shutdown order:
 | Audit record | Who, where (profile, host), what (statement or prompt), when, outcome |
 
 - Canonical models live in `rivet-sdk`. Dialect-specific details are carried as typed extension fields, not as new core fields.
-- The job model (`JobId`, `JobState`, `Progress`, `JobStatus`, `JobSnapshot`) is in the module `rivet_sdk::job`. The scheduler and its handles stay in `rivet-core`, because a contract crate has no I/O ([§3.3](#33-rules)). This is in PR #128, which is not on `main` on this date; until then the types are in `rivet-core`.
+- The job model (`JobId`, `JobState`, `Progress`, `JobStatus`, `JobSnapshot`) is in the module `rivet_sdk::job`. The scheduler and its handles stay in `rivet-core`, because a contract crate has no I/O ([§3.3](#33-rules)).
 
 ### 6.2 State Ownership and Persistence
 
