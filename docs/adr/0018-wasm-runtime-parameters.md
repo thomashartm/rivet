@@ -13,6 +13,9 @@ ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no vers
 | --- | --- |
 | WASI | None for now. The host gives no `wasi:*` interface. A component that imports one does not load; the error names the import. |
 | CPU limit | Fuel, set again before each call. Default 1 000 000 000 units per call, not measured. The value is a setting. |
+| Time limit | Epoch interruption, in addition to fuel. One ticker for the engine; each call has its own deadline. Default 30 s, the value of `extensions.call_timeout_ms` (ADR-0021). The host owns the setting and gives it to the runtime. |
+| Component size | A component file larger than the limit does not load. Default 16 MiB. |
+| Guest log output | Limited per call (64 KiB, 100 lines); the rest is dropped and counted. The guest text is logged as a separate field, so it cannot imitate a field of the host. |
 | Memory limit | One budget per instance for linear memories and tables together. Default 64 MiB. Growth past the budget traps the instance. |
 | WIT package | `rivet:extension`, in `crates/rivet-sdk/wit/`. World `extension` with `activate` and `deactivate`. Interfaces of extension points go into the same package (ADR-0013). |
 | WIT version | Equal to the SDK crate version. A test checks it. |
@@ -23,5 +26,6 @@ ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no vers
 
 - No WASI: an extension gets no clock, random, file or network access without a grant (§7.3). A guest built with Rust std for a WASI target does not load.
 - The first extension that needs WASI proposes the exact version. ADR-0002 is amended then.
-- Fuel does not limit the time inside a blocking host import. Wall-clock timeouts come with #11.
+- Fuel does not limit the time inside a blocking host import. The time limit ends a call when guest code runs again; a host import that blocks must have its own timeout.
+- The compile time of a component is limited only through the size limit.
 - A memory limit violation puts the extension in `Failed` (§4.4) with a clear cause.
