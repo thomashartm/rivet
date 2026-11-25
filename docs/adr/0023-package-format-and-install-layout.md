@@ -5,7 +5,7 @@
 
 ## Context
 
-ARCHITECTURE.md §4.8 lists what an extension package contains and requires versioned packages with rollback. It does not define the file format or the directories. ADR-0019 verifies one signed file. Part 2 of the registry ticket (#12) needs the format and the layout. No code for it is on `main` on this date. No archive crate is in `Cargo.lock`.
+ARCHITECTURE.md §4.8 lists what an extension package contains and requires versioned packages with rollback. It does not define the file format or the directories. ADR-0019 verifies one signed file. Part 2 of the registry ticket (#12) needs the format and the layout. The installer is on `main` since PR #134 (`crates/rivet-core/src/install.rs`). The behaviour below was not compared with that code line by line.
 
 ## Decision
 
