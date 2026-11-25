@@ -322,6 +322,26 @@ fn has_empty_component(path: &str) -> bool {
     }
 }
 
+/// The rule of [`LIST_MAX_ENTRIES`] for the list `field`. The error is the
+/// reason.
+fn within_list_limit(field: &str, entries: usize) -> std::result::Result<(), String> {
+    if entries > LIST_MAX_ENTRIES {
+        return Err(format!(
+            "field `{field}` has {entries} entries; the maximum is {LIST_MAX_ENTRIES}"
+        ));
+    }
+    Ok(())
+}
+
+/// The rule that the text of `field` has a character that is not
+/// whitespace. The error is the reason.
+fn not_blank(field: &str, value: &str) -> std::result::Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("field `{field}` must not be empty"));
+    }
+    Ok(())
+}
+
 impl FromStr for ExtensionId {
     type Err = Error;
 
@@ -453,7 +473,9 @@ impl NetworkScope {
     /// Creates a scope for `ports` on `host`.
     ///
     /// The values are not validated here. [`Manifest::parse`] validates the
-    /// scopes of a manifest.
+    /// scopes of a manifest; [`Capabilities::validate`] validates all other
+    /// scopes, and the permission service of the core calls it when the
+    /// scope is granted.
     ///
     /// ```
     /// use rivet_sdk::manifest::NetworkScope;
@@ -497,7 +519,9 @@ impl FilesystemScope {
     /// Creates a scope for `path` with `access`.
     ///
     /// The values are not validated here. [`Manifest::parse`] validates the
-    /// scopes of a manifest.
+    /// scopes of a manifest; [`Capabilities::validate`] validates all other
+    /// scopes, and the permission service of the core calls it when the
+    /// scope is granted.
     ///
     /// ```
     /// use rivet_sdk::manifest::{FilesystemAccess, FilesystemScope};
@@ -547,7 +571,9 @@ impl Capabilities {
     /// `with_*` methods.
     ///
     /// The values are not validated here. [`Manifest::parse`] validates the
-    /// capabilities of a manifest.
+    /// capabilities of a manifest; [`validate`](Self::validate) validates
+    /// all others, and the permission service of the core calls it when the
+    /// capabilities are granted.
     ///
     /// ```
     /// use rivet_sdk::manifest::{Capabilities, ClipboardAccess, NetworkScope};
@@ -556,9 +582,10 @@ impl Capabilities {
     ///
     /// let capabilities = Capabilities::new()
     ///     .with_network([NetworkScope::new("db.example.com", [5432])])
-    ///     .with_secrets(["keychain://prod".to_owned()])
+    ///     .with_secrets(["acme-postgres/prod".to_owned()])
     ///     .with_clipboard([ClipboardAccess::Write]);
     /// assert!(!capabilities.is_empty());
+    /// assert!(capabilities.validate().is_ok());
     /// assert_eq!(capabilities.network[0].host, "db.example.com");
     /// ```
     pub fn new() -> Self {
@@ -607,6 +634,191 @@ impl Capabilities {
             clipboard,
         } = self;
         network.is_empty() && filesystem.is_empty() && secrets.is_empty() && clipboard.is_empty()
+    }
+
+    /// Checks the capabilities against the
+    /// [capability scope rules](self#capability-scope-rules). These are the
+    /// rules, and the code, that [`Manifest::parse`] uses for the
+    /// `[capabilities]` table.
+    ///
+    /// The constructors do not validate, and the fields are public. Thus
+    /// code that gets capabilities from a source that is not
+    /// [`Manifest::parse`] calls this function before it uses them. The
+    /// permission service of the core calls it for each grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of the category `user` that names the field and the
+    /// reason when:
+    ///
+    /// - a network `host`, a filesystem `path` or a secret namespace is
+    ///   empty, has only whitespace or breaks the scope rules;
+    /// - a network scope has an empty `ports` list, contains port 0 or
+    ///   contains a port more than once;
+    /// - a network host, a filesystem path, a secret namespace or a
+    ///   clipboard access is in its list more than once;
+    /// - `network`, `filesystem` or `secrets` has more than
+    ///   [`LIST_MAX_ENTRIES`] entries.
+    ///
+    /// ```
+    /// use rivet_sdk::manifest::{Capabilities, NetworkScope};
+    ///
+    /// let valid = Capabilities::new().with_network([NetworkScope::new("db.example.com", [5432])]);
+    /// assert!(valid.validate().is_ok());
+    ///
+    /// let invalid = Capabilities::new().with_network([NetworkScope::new("evil host/..", [0])]);
+    /// assert!(invalid.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        self.rules()
+            .map_err(|reason| Error::user(format!("invalid capabilities: {reason}")))
+    }
+
+    /// The one implementation of the capability rules. The error is the
+    /// reason, with the field.
+    fn rules(&self) -> std::result::Result<(), String> {
+        // The text of a value in a message.
+        let shown = |value: &str| shown(value, ERROR_VALUE_MAX_CHARS);
+        for (field, entries) in [
+            ("capabilities.network", self.network.len()),
+            ("capabilities.filesystem", self.filesystem.len()),
+            ("capabilities.secrets", self.secrets.len()),
+        ] {
+            within_list_limit(field, entries)?;
+        }
+        let mut seen = HashMap::new();
+        for (index, scope) in self.network.iter().enumerate() {
+            not_blank(&format!("capabilities.network[{index}].host"), &scope.host)?;
+            if scope.host.strip_suffix('.').is_some_and(is_network_host) {
+                return Err(format!(
+                    "field `capabilities.network[{index}].host` (`{}`) must not end with `.`; \
+                     remove the `.` at the end",
+                    shown(&scope.host)
+                ));
+            }
+            if !is_network_host(&scope.host) {
+                return Err(format!(
+                    "field `capabilities.network[{index}].host` (`{}`) must be a DNS name or an \
+                     IP address. A DNS name has labels of ASCII letters, digits, `-` and `_`, \
+                     separated by `.`; a label does not start or end with `-` and the last \
+                     label is not a number. A port, a scheme, a path, a wildcard and \
+                     whitespace are not permitted",
+                    shown(&scope.host)
+                ));
+            }
+            // The key of `same_host`.
+            if let Some(first) = seen.insert(host_key(&scope.host), index) {
+                return Err(format!(
+                    "field `capabilities.network[{index}].host` (`{}`) is the same host as \
+                     `capabilities.network[{first}].host`; put all ports of a host in one table",
+                    shown(&scope.host)
+                ));
+            }
+            if scope.ports.is_empty() {
+                return Err(format!(
+                    "field `capabilities.network[{index}].ports` must list at least one port"
+                ));
+            }
+            if scope.ports.contains(&0) {
+                return Err(format!(
+                    "field `capabilities.network[{index}].ports` must not contain port 0"
+                ));
+            }
+            let mut ports = HashSet::new();
+            if let Some(port) = scope.ports.iter().find(|&port| !ports.insert(port)) {
+                return Err(format!(
+                    "field `capabilities.network[{index}].ports` contains port {port} more than \
+                     once"
+                ));
+            }
+        }
+        let mut seen = HashMap::new();
+        for (index, scope) in self.filesystem.iter().enumerate() {
+            not_blank(
+                &format!("capabilities.filesystem[{index}].path"),
+                &scope.path,
+            )?;
+            if scope.path != scope.path.trim() {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not start or end \
+                     with whitespace",
+                    shown(&scope.path)
+                ));
+            }
+            if !is_scope_path_start(&scope.path) {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must be an absolute \
+                     path, `~` or a path that starts with `~/`",
+                    shown(&scope.path)
+                ));
+            }
+            if scope.path.split(['/', '\\']).any(|part| part == "..") {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
+                     `..` component",
+                    shown(&scope.path)
+                ));
+            }
+            if scope.path.contains(char::is_control) {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
+                     control character",
+                    shown(&scope.path)
+                ));
+            }
+            if scope.path.split(['/', '\\']).any(|part| part == ".") {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
+                     `.` component",
+                    shown(&scope.path)
+                ));
+            }
+            if has_empty_component(&scope.path) {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain an \
+                     empty component or end with a separator",
+                    shown(&scope.path)
+                ));
+            }
+            // Exact text, as the update review compares paths (ADR-0020).
+            if let Some(first) = seen.insert(&scope.path, index) {
+                return Err(format!(
+                    "field `capabilities.filesystem[{index}].path` (`{}`) is the same path as \
+                     `capabilities.filesystem[{first}].path`; declare a path one time, with \
+                     the access it needs",
+                    shown(&scope.path)
+                ));
+            }
+        }
+        let mut seen = HashMap::new();
+        for (index, namespace) in self.secrets.iter().enumerate() {
+            not_blank(&format!("capabilities.secrets[{index}]"), namespace)?;
+            if !is_secret_namespace(namespace) {
+                return Err(format!(
+                    "field `capabilities.secrets[{index}]` (`{}`) must be segments \
+                     separated by `/`; a segment has one or more ASCII letters, digits, `.`, \
+                     `_` or `-` and is not `.` or `..`",
+                    shown(namespace)
+                ));
+            }
+            if let Some(first) = seen.insert(namespace, index) {
+                return Err(format!(
+                    "field `capabilities.secrets[{index}]` (`{}`) is the same as \
+                     `capabilities.secrets[{first}]`",
+                    shown(namespace)
+                ));
+            }
+        }
+        let mut seen = HashMap::new();
+        for (index, access) in self.clipboard.iter().enumerate() {
+            if let Some(first) = seen.insert(access, index) {
+                return Err(format!(
+                    "field `capabilities.clipboard[{index}]` is the same as \
+                     `capabilities.clipboard[{first}]`"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -705,12 +917,7 @@ impl Manifest {
             |reason: String| Err(Error::user(format!("invalid extension manifest: {reason}")));
         // The text of a value in a message.
         let shown = |value: &str| shown(value, ERROR_VALUE_MAX_CHARS);
-        let not_blank = |field: String, value: &str| {
-            if value.trim().is_empty() {
-                return invalid(format!("field `{field}` must not be empty"));
-            }
-            Ok(())
-        };
+        let not_blank = |field: String, value: &str| not_blank(&field, value).or_else(invalid);
         // After `not_blank`, for a text with the extension id rules.
         let valid_id = |field: String, value: &str| match id_rule_violation(value) {
             Some(reason) => invalid(format!(
@@ -719,19 +926,11 @@ impl Manifest {
             )),
             None => Ok(()),
         };
-        let capabilities = &self.capabilities;
         for (field, entries) in [
             ("contributes", self.contributes.len()),
             ("activation", self.activation.len()),
-            ("capabilities.network", capabilities.network.len()),
-            ("capabilities.filesystem", capabilities.filesystem.len()),
-            ("capabilities.secrets", capabilities.secrets.len()),
         ] {
-            if entries > LIST_MAX_ENTRIES {
-                return invalid(format!(
-                    "field `{field}` has {entries} entries; the maximum is {LIST_MAX_ENTRIES}"
-                ));
-            }
+            within_list_limit(field, entries).or_else(invalid)?;
         }
 
         if self.dependencies.contains_key(&self.id) {
@@ -787,139 +986,7 @@ impl Manifest {
                 ));
             }
         }
-        let mut seen = HashMap::new();
-        for (index, scope) in capabilities.network.iter().enumerate() {
-            not_blank(format!("capabilities.network[{index}].host"), &scope.host)?;
-            if scope.host.strip_suffix('.').is_some_and(is_network_host) {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].host` (`{}`) must not end with `.`; \
-                     remove the `.` at the end",
-                    shown(&scope.host)
-                ));
-            }
-            if !is_network_host(&scope.host) {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].host` (`{}`) must be a DNS name or an \
-                     IP address. A DNS name has labels of ASCII letters, digits, `-` and `_`, \
-                     separated by `.`; a label does not start or end with `-` and the last \
-                     label is not a number. A port, a scheme, a path, a wildcard and \
-                     whitespace are not permitted",
-                    shown(&scope.host)
-                ));
-            }
-            // The key of `same_host`.
-            if let Some(first) = seen.insert(host_key(&scope.host), index) {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].host` (`{}`) is the same host as \
-                     `capabilities.network[{first}].host`; put all ports of a host in one table",
-                    shown(&scope.host)
-                ));
-            }
-            if scope.ports.is_empty() {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].ports` must list at least one port"
-                ));
-            }
-            if scope.ports.contains(&0) {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].ports` must not contain port 0"
-                ));
-            }
-            let mut ports = HashSet::new();
-            if let Some(port) = scope.ports.iter().find(|&port| !ports.insert(port)) {
-                return invalid(format!(
-                    "field `capabilities.network[{index}].ports` contains port {port} more than \
-                     once"
-                ));
-            }
-        }
-        let mut seen = HashMap::new();
-        for (index, scope) in capabilities.filesystem.iter().enumerate() {
-            not_blank(
-                format!("capabilities.filesystem[{index}].path"),
-                &scope.path,
-            )?;
-            if scope.path != scope.path.trim() {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must not start or end \
-                     with whitespace",
-                    shown(&scope.path)
-                ));
-            }
-            if !is_scope_path_start(&scope.path) {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must be an absolute \
-                     path, `~` or a path that starts with `~/`",
-                    shown(&scope.path)
-                ));
-            }
-            if scope.path.split(['/', '\\']).any(|part| part == "..") {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
-                     `..` component",
-                    shown(&scope.path)
-                ));
-            }
-            if scope.path.contains(char::is_control) {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
-                     control character",
-                    shown(&scope.path)
-                ));
-            }
-            if scope.path.split(['/', '\\']).any(|part| part == ".") {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain a \
-                     `.` component",
-                    shown(&scope.path)
-                ));
-            }
-            if has_empty_component(&scope.path) {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) must not contain an \
-                     empty component or end with a separator",
-                    shown(&scope.path)
-                ));
-            }
-            // Exact text, as the update review compares paths (ADR-0020).
-            if let Some(first) = seen.insert(&scope.path, index) {
-                return invalid(format!(
-                    "field `capabilities.filesystem[{index}].path` (`{}`) is the same path as \
-                     `capabilities.filesystem[{first}].path`; declare a path one time, with \
-                     the access it needs",
-                    shown(&scope.path)
-                ));
-            }
-        }
-        let mut seen = HashMap::new();
-        for (index, namespace) in capabilities.secrets.iter().enumerate() {
-            not_blank(format!("capabilities.secrets[{index}]"), namespace)?;
-            if !is_secret_namespace(namespace) {
-                return invalid(format!(
-                    "field `capabilities.secrets[{index}]` (`{}`) must be segments \
-                     separated by `/`; a segment has one or more ASCII letters, digits, `.`, \
-                     `_` or `-` and is not `.` or `..`",
-                    shown(namespace)
-                ));
-            }
-            if let Some(first) = seen.insert(namespace, index) {
-                return invalid(format!(
-                    "field `capabilities.secrets[{index}]` (`{}`) is the same as \
-                     `capabilities.secrets[{first}]`",
-                    shown(namespace)
-                ));
-            }
-        }
-        let mut seen = HashMap::new();
-        for (index, access) in capabilities.clipboard.iter().enumerate() {
-            if let Some(first) = seen.insert(access, index) {
-                return invalid(format!(
-                    "field `capabilities.clipboard[{index}]` is the same as \
-                     `capabilities.clipboard[{first}]`"
-                ));
-            }
-        }
-        Ok(())
+        self.capabilities.rules().or_else(invalid)
     }
 }
 
@@ -942,6 +1009,93 @@ mod tests {
                 error.message()
             );
         }
+    }
+
+    // R-85: the constructors do not validate; `Capabilities::validate` does,
+    // with the rules of the manifest.
+    #[test]
+    fn validate_refuses_invalid_values_from_each_constructor() {
+        let read = FilesystemAccess::Read;
+        let cases = [
+            // The two values of the review finding.
+            (
+                Capabilities::new().with_network([NetworkScope::new("evil host/..", [5432])]),
+                "field `capabilities.network[0].host` (`evil host/..`) must be a DNS name",
+            ),
+            (
+                Capabilities::new().with_network([NetworkScope::new("db.example.com", [0])]),
+                "field `capabilities.network[0].ports` must not contain port 0",
+            ),
+            (
+                Capabilities::new().with_network([NetworkScope::new("db.example.com", [])]),
+                "field `capabilities.network[0].ports` must list at least one port",
+            ),
+            (
+                Capabilities::new().with_filesystem([FilesystemScope::new("/data/../etc", read)]),
+                "field `capabilities.filesystem[0].path` (`/data/../etc`) must not contain a `..`",
+            ),
+            (
+                Capabilities::new().with_filesystem([FilesystemScope::new("data", read)]),
+                "field `capabilities.filesystem[0].path` (`data`) must be an absolute path",
+            ),
+            (
+                Capabilities::new().with_secrets(["keychain://prod".to_owned()]),
+                "field `capabilities.secrets[0]` (`keychain://prod`) must be segments",
+            ),
+            (
+                Capabilities::new().with_clipboard([ClipboardAccess::Read, ClipboardAccess::Read]),
+                "field `capabilities.clipboard[1]` is the same as `capabilities.clipboard[0]`",
+            ),
+            (
+                Capabilities::new().with_secrets((0..=LIST_MAX_ENTRIES).map(|n| format!("s{n}"))),
+                "field `capabilities.secrets` has 257 entries; the maximum is 256",
+            ),
+        ];
+        for (capabilities, part) in cases {
+            let error = capabilities.validate().expect_err(part);
+            assert_eq!(error.category(), ErrorCategory::User);
+            assert!(
+                error.message().starts_with("invalid capabilities: ")
+                    && error.message().contains(part),
+                "`{part}` is not in the message:\n{}",
+                error.message()
+            );
+        }
+    }
+
+    // R-85: one rule set. A manifest and `validate` give the same reason.
+    #[test]
+    fn validate_gives_the_reason_of_the_manifest_validation() {
+        let text = format!("{MINIMAL}{}", network("evil host/..", "[0]"));
+        let manifest = Manifest::parse(&text).unwrap_err();
+        let direct = Capabilities::new()
+            .with_network([NetworkScope::new("evil host/..", [0])])
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            manifest
+                .message()
+                .strip_prefix("invalid extension manifest: "),
+            direct.message().strip_prefix("invalid capabilities: ")
+        );
+        assert!(direct.message().contains("capabilities.network[0].host"));
+    }
+
+    #[test]
+    fn validate_accepts_valid_values_from_each_constructor() {
+        assert!(Capabilities::new().validate().is_ok());
+        let capabilities = Capabilities::new()
+            .with_network([
+                NetworkScope::new("db.example.com", [5432, 5433]),
+                NetworkScope::new("[::1]", [1]),
+            ])
+            .with_filesystem([
+                FilesystemScope::new("~/.postgresql", FilesystemAccess::Read),
+                FilesystemScope::new("/var/lib/data", FilesystemAccess::ReadWrite),
+            ])
+            .with_secrets(["acme-postgres/prod".to_owned()])
+            .with_clipboard([ClipboardAccess::Read, ClipboardAccess::Write]);
+        capabilities.validate().unwrap();
     }
 
     #[test]
