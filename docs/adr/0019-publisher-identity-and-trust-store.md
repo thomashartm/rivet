@@ -22,6 +22,12 @@ ADR-0006 pins publisher keys on first install. It does not say what identifies a
 - A trust store file with an invalid entry does not load. No entry is skipped.
 - Failed verification, a key that differs from the pin, and a publisher without a pin give a `policy` error. Malformed or unreadable input gives a `user` error.
 
+Weak keys (review fix, not on `main` on this date):
+
+- A public key that is a point of small order, or that is not in the canonical encoding (y not less than p), is refused when it is parsed, with a `user` error. This applies to the project key, a pinned key, a key file and each entry of the trust store.
+- Reason: with a key of small order, a signature that nobody signed can verify.
+- The check is a fixed list of encodings in `package.rs`. No new crate. The list was not checked for this ADR; the tests of the fix must show that each listed encoding is refused and that the forged signature of the review finding does not verify.
+
 ## Consequences
 
 - A package cannot name another publisher to replace that publisher's extension.
