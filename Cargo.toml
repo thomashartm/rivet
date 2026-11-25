@@ -14,3 +14,14 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# A dev build without this compiles a WASM component of 4 MiB for longer than
+# the call time limit (ADR-0018). Only the compiler crates are optimised.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
