@@ -15,7 +15,7 @@ Grammar of a secret URI (as built, PR #108):
 
 - Form: `<scheme>://<path>`.
 - Scheme: one lowercase letter, then lowercase letters, digits, `+`, `-` or `.`. Uppercase is not accepted, so a scheme has one spelling.
-- Path: not empty.
+- Path: not empty and not only white space (`path.trim().is_empty()` in `secret.rs` is refused).
 - Any well-formed scheme parses. The three schemes above are the built-in names; they are not a closed list.
 - A scheme without a registered backend fails when the secret is resolved, not when the URI is parsed.
 
