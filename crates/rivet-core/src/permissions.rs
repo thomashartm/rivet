@@ -463,7 +463,7 @@ fn cut_to(granted: &mut Capabilities, requested: &Capabilities) {
 /// A longer requested resource is cut to this length in the log and in the
 /// error. It is the maximum length of a path on macOS; a DNS name has a
 /// maximum of 255 bytes.
-const MAX_RESOURCE_BYTES: usize = 1024;
+pub(crate) const MAX_RESOURCE_BYTES: usize = 1024;
 
 /// Turns a decision into a result. `None` (no grant) is a denial.
 fn allow(
