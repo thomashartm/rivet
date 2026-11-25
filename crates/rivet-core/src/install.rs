@@ -359,7 +359,9 @@ impl Installer {
     ///   or by other users (Unix), or the extension is installed already
     ///   (use [`update`](Self::update)), or the package or the signature is not
     ///   in the registry or cannot be read, or the package is not a tar
-    ///   archive, or its manifest is invalid.
+    ///   archive, or its manifest is invalid, or the active directory with
+    ///   a manifest that cannot be read cannot be moved because its owner
+    ///   has no write permission (Unix).
     /// - `policy`: the signature does not verify, the publisher has no
     ///   pinned key, or the package breaks a rule of the
     ///   [package format](self#hostile-content).
@@ -695,8 +697,29 @@ impl Installer {
         // the staging directory and is deleted with it.
         let discarded = staging.path().join("broken");
         let retired = if broken {
-            fs::rename(self.active(id), &discarded)
-                .map_err(|error| io_error(&discarded, "cannot move the broken version", error))
+            let active = self.active(id);
+            fs::rename(&active, &discarded).map_err(|error| {
+                // Mode 000 or another mode without the write of the owner:
+                // the installer does not change a mode that it finds
+                // (ADR-0023, R-118).
+                #[cfg(unix)]
+                let owner_cannot_write = {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::symlink_metadata(&active)
+                        .is_ok_and(|meta| meta.permissions().mode() & 0o200 == 0)
+                };
+                #[cfg(not(unix))]
+                let owner_cannot_write = false;
+                if error.kind() == ErrorKind::PermissionDenied && owner_cannot_write {
+                    return io_error(
+                        &active,
+                        "the directory cannot be moved; permit the write for the owner \
+                         (`chmod 700`) or remove the directory, then install again",
+                        error,
+                    );
+                }
+                io_error(&discarded, "cannot move the broken version", error)
+            })
         } else {
             self.retire(id, old.as_ref())
         };
@@ -2636,6 +2659,54 @@ mod tests {
 
         fs::write(&previous, "1.0.0\n").unwrap();
         assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+    }
+
+    /// `true` if the tests run as root: root ignores the mode of a directory.
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        let output = std::process::Command::new("id").arg("-u").output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim() == "0"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_active_directory_that_cannot_be_moved_is_not_repaired() {
+        if is_root() {
+            return;
+        }
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let active = f.installer.active(&id());
+        set_mode(&active, 0o000);
+
+        let result = f.installer.install(&id(), &v("1.2.0"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&active).unwrap().permissions().mode() & 0o777;
+        set_mode(&active, 0o700);
+        assert_eq!(mode, 0o000, "the installer must not change the mode");
+        let part = format!(
+            "{}: the directory cannot be moved; permit the write for the owner \
+             (`chmod 700`) or remove the directory, then install again",
+            active.display()
+        );
+        assert_error(result, ErrorCategory::User, &part);
+        // Nothing is pending and the old version stays.
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+        assert!(!f.store().join(PENDING_FILE).exists());
+
+        // Another cause of the same system error keeps its error: here the
+        // parent directory cannot be written.
+        fs::remove_file(active.join(MANIFEST_FILE)).unwrap();
+        let extensions = f.installer.extensions_dir();
+        set_mode(&extensions, 0o500);
+        let result = f.installer.install(&id(), &v("1.2.0"));
+        set_mode(&extensions, 0o700);
+        assert_error(
+            result,
+            ErrorCategory::User,
+            "cannot move the broken version",
+        );
     }
 
     // R-110: symbolic links, the lock file, temporary files, a journal
