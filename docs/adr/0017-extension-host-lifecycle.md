@@ -34,4 +34,5 @@ As built (read in the code on 2026-11-25):
 - e: today a workspace directory can replace a bundled extension, for example a driver, with unsigned code. This is the same gap as the missing signature check of §7.7. The project MUST NOT ship a release before #12 closes both (to enforce in the release ticket #62; no check exists).
 - e: the precedence bundled < user < workspace itself stays. A user can still override a bundled extension with a package from the same publisher.
 - e: a package with an invalid manifest never replaces a valid package with the same id from an earlier directory. It is listed as invalid. As built in PR #109 it does replace it; this is a defect.
+- b: since PR #121 the code follows this position: `transition` in `host.rs` has `Resolved`, `Inactive` and `Active` → `Failed`. The table "As built" above shows the state of PR #109.
 - The diagram in §4.4 is not changed until the maintainer accepts this ADR.

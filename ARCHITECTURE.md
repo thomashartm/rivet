@@ -212,7 +212,7 @@ stateDiagram-v2
 ```
 
 - As built, the extension host differs from this diagram in two points ([ADR-0017](docs/adr/0017-extension-host-lifecycle.md), Proposed):
-  - a failed activation is published as two changes, start state → `Active` → `Failed`;
+  - a failed activation goes from `Resolved` or `Inactive` directly to `Failed` (since PR #121);
   - an extension in `Resolved` or `Rejected` can be removed and discovered again.
 - As built, if two discovery directories contain the same extension id, the later directory wins: bundled < user < workspace. ADR-0017 proposes to limit this when signature checks exist.
 - Hot reload = deactivate, unload, load new version, activate. Open handles of the old version MUST be closed or migrated before unload.
