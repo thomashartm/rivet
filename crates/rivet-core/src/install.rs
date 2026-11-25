@@ -426,7 +426,8 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// - `user`: there is no previous version.
+    /// - `user`: there is no previous version, or the file `previous` is a
+    ///   symbolic link, is not a regular file or is larger than 16 KiB.
     /// - See [`install`](Self::install).
     ///
     /// Each error before the second rename leaves the active version as it
@@ -438,11 +439,12 @@ impl Installer {
         self.repair(id)?;
         let path = self.store(id).join(PREVIOUS_FILE);
         let none = || Error::user(format!("extension `{id}` has no previous version"));
-        let previous = match fs::read_to_string(&path) {
-            Ok(text) => text.trim().parse::<Version>().map_err(|_| none())?,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Err(none()),
-            Err(error) => return Err(io_error(&path, "cannot read the file", error)),
-        };
+        if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == ErrorKind::NotFound) {
+            return Err(none());
+        }
+        // A version is shorter than a journal, which holds two.
+        let text = read_text_file(&path, "previous version", JOURNAL_MAX_BYTES)?;
+        let previous = text.trim().parse::<Version>().map_err(|_| none())?;
         self.activate(id, &previous, Source::Store, true, false)
     }
 
@@ -2607,6 +2609,33 @@ mod tests {
         let install = within_10_seconds(&f, |installer| installer.install(&id(), &v("1.2.0")));
         assert_eq!(install.unwrap(), Outcome::Activated);
         assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_previous_file_that_is_a_fifo_or_too_large_is_refused() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        let previous = f.store().join(PREVIOUS_FILE);
+        fs::remove_file(&previous).unwrap();
+        mkfifo(&previous);
+        let rollback = within_10_seconds(&f, |installer| installer.rollback(&id()));
+        assert_error(rollback, ErrorCategory::User, "is not a regular file");
+
+        fs::remove_file(&previous).unwrap();
+        let mut text = "1.0.0\n".to_owned();
+        text.push_str(&" ".repeat(JOURNAL_MAX_BYTES as usize));
+        fs::write(&previous, text).unwrap();
+        assert_error(
+            f.installer.rollback(&id()),
+            ErrorCategory::User,
+            "too large",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+
+        fs::write(&previous, "1.0.0\n").unwrap();
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
     }
 
     // R-110: symbolic links, the lock file, temporary files, a journal
