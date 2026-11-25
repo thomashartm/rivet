@@ -15,7 +15,7 @@ As built (read in the code on 2026-11-25):
 | b | Failed activation | In PR #109 the host published two changes: start state → `Active`, then `Active` → `Failed`. Since PR #121 it does what the decision below says: one change, directly to `Failed`. |
 | c | Forget | The host can remove an extension in `Resolved` or `Rejected` and discover it again. These states have no loaded code. |
 | d | Concurrency | One host-wide lock. Lifecycle operations run one after the other. |
-| e | Same id in two directories | The later discovery directory wins: bundled < user < workspace. The workspace wins, with the shadowing warning (decided by the maintainer on 2026-11-25; review finding R-20, placed in this row by the reading of the architect). |
+| e | Same id in two directories | The later discovery directory wins: bundled < user < workspace. The workspace wins, with the shadowing warning (decided by the maintainer on 2026-11-25; review finding R-20, the signature condition of the proposal column stays an open point, ticket #138). |
 
 ## Decision
 

@@ -383,7 +383,7 @@ Shutdown order:
 | --- | --- |
 | In-process, Rust | Native Rust types and Arrow arrays in memory |
 | Host ↔ WASM extension | WIT records; bulk data as Arrow IPC buffers |
-| Host ↔ out-of-process native host | Arrow IPC over a local socket; control messages in a typed schema |
+| Host ↔ out-of-process native host | Arrow IPC over a local socket; control messages in a typed schema (amended by [ADR-0024](docs/adr/0024-native-process-runtime.md): JSON lines with a fixed set of messages) |
 | Engine ↔ remote client (daemon) | Control API over gRPC; result data over Arrow Flight ([ADR-0004](docs/adr/0004-control-api-protocol.md)) |
 | Engine ↔ external tools | CSV, JSON, Parquet, Excel, SQL, Markdown via exporters |
 

@@ -7,7 +7,7 @@
 
 ADR-0003 says native plugins run in a separate extension host process. ARCHITECTURE.md §6.6 says control messages use a typed schema and bulk data uses Arrow IPC over a local socket. Neither fixes the process model, the message form or the limits. Part 1 of the native runtime ticket (#95) needs them. Part 1 is on `main` since PR #142 (`crates/rivet-core/src/native.rs`). Compared with that file at commit 12255a3: the environment list, the three limits (64 KiB, 5 s, 2 s), the refusal of a relative program path and the level `info` of the error output are equal to the table below. The other rows were not compared with the code. None of the values below is measured.
 
-This ADR changes two accepted texts. The maintainer accepted this ADR on 2026-11-25. No "Amends" line is in the two texts yet: the architect waits for the word that the acceptance covers these two changes.
+This ADR changes two accepted texts. The maintainer accepted this ADR on 2026-11-25. Both texts have a line "Amended by ADR-0024" since that date.
 
 | Text | It says | This ADR says |
 | --- | --- | --- |
@@ -68,4 +68,4 @@ This ADR changes two accepted texts. The maintainer accepted this ADR on 2026-11
 - A plugin that writes to its standard output breaks the control channel and is failed. The extension host program of part 3 must keep plugin output away from it.
 - An extension cannot read the other variables of the engine environment. A credential source that needs it (for example the AWS default chain) cannot work yet. The first extension that needs it asks for a rule.
 - The call timeout of the host (ADR-0021) also limits a native call, and it really stops the work, because the process is killed.
-- The Windows allow list and the behaviour of pipes and process kill on Windows are not tested.
+- Supported: Linux and macOS. Windows: not tested (decided by the maintainer on 2026-11-25; review finding R-105). macOS is checked only on a local machine; CI runs on Linux. The Windows allow list and the behaviour of pipes and process kill on Windows are not tested.
