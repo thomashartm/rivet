@@ -26,6 +26,7 @@ As built (read in the code on 2026-11-25):
 | c | Keep. Add the edges `Resolved → [*]` and `Rejected → [*]` with the label "forgotten for new discovery" to §4.4. Without them, a corrected manifest needs a process restart. | Diagram in §4.4 only. |
 | d | Keep for now. Timeouts for calls into extensions come with #11. Use finer locks only when a delay is measured. | None. |
 | e | Accept only as long as no release exists. With the signature check (#12): a package MAY replace a package with the same id from an earlier directory only if its signature verifies against the key of the publisher of that id (ADR-0019: the project key for a bundled extension, else the key pinned for the publisher), or in developer mode. Otherwise the earlier package stays and the later package is reported with a reason. | Rule in #12; text in §4.4. |
+| f | New, not in PR #109: an extension in `Failed` or `Disabled` has no loaded code. An explicit unload removes it. An explicit reload reads its package again and gives `Resolved` or `Rejected`; it is not activated at once. Discovery alone does not replace it. Without this, a failed extension can be replaced only by a process restart. | Edges `Failed → [*]` and `Disabled → [*]` in §4.4; `transition` in `host.rs` (review fix R-23, not on `main` on this date). |
 
 ## Consequences
 
@@ -33,4 +34,5 @@ As built (read in the code on 2026-11-25):
 - e: today a workspace directory can replace a bundled extension, for example a driver, with unsigned code. This is the same gap as the missing signature check of §7.7. The project MUST NOT ship a release before #12 closes both (to enforce in the release ticket #62; no check exists).
 - e: the precedence bundled < user < workspace itself stays. A user can still override a bundled extension with a package from the same publisher.
 - e: a package with an invalid manifest never replaces a valid package with the same id from an earlier directory. It is listed as invalid. As built in PR #109 it does replace it; this is a defect.
+- b: since PR #121 the code follows this position: `transition` in `host.rs` has `Resolved`, `Inactive` and `Active` → `Failed`. The table "As built" above shows the state of PR #109.
 - The diagram in §4.4 is not changed until the maintainer accepts this ADR.

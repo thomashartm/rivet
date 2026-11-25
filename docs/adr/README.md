@@ -24,6 +24,7 @@
 | [0020](0020-permission-matching-rules.md) | Permission matching rules | Proposed |
 | [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Proposed |
 | [0022](0022-short-secrets-not-redacted.md) | Secrets shorter than 4 bytes are not redacted in logs | Proposed |
+| [0023](0023-package-format-and-install-layout.md) | Package format and install layout | Proposed |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
