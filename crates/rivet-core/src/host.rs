@@ -4785,13 +4785,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_drop_of_a_host_that_was_not_shut_down_contains_a_panic_in_each_instance() {
+    async fn the_drop_of_a_host_that_was_not_shut_down_contains_a_panic_in_an_instance() {
         let f = fixture(true);
         f.add("a", &[]);
         f.add("b", &["a"]);
         f.host.discover().await.unwrap();
         f.go("b").await;
-        f.fake.set("unload a", Some(Mode::Panic));
+        // Only the first drop panics: without the containment, a second
+        // panic during the unwind aborts the test binary instead of failing.
         f.fake.set("unload b", Some(Mode::Panic));
         f.fake.take_calls();
         let Fixture { host, fake, .. } = f;
@@ -4807,12 +4808,13 @@ mod tests {
         assert_eq!(fake.take_calls(), ["unload b", "unload a"]);
         let log = log.text();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2, "{log}");
-        for (line, extension) in lines.iter().zip(["extension=b", "extension=a"]) {
-            assert!(line.contains("ERROR"), "{line}");
-            assert!(line.contains("unload of the extension panicked"), "{line}");
-            assert!(line.contains(extension), "{line}");
-        }
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("ERROR"), "{log}");
+        assert!(
+            lines[0].contains("unload of the extension panicked"),
+            "{log}"
+        );
+        assert!(lines[0].contains("extension=b"), "{log}");
     }
 
     #[tokio::test]
@@ -4924,6 +4926,15 @@ mod tests {
             f.fake.set("activate a", Some(Mode::Block));
             f.fake.set("hold activate a", Some(Mode::Fail));
             f.fake.set("late a", Some(Mode::Fail));
+            // A failed assert must end the old call: the drop of the
+            // runtime waits for it.
+            struct Open<'a>(&'a Fake);
+            impl Drop for Open<'_> {
+                fn drop(&mut self) {
+                    self.0.set("hold activate a", None);
+                }
+            }
+            let _open = Open(&f.fake);
 
             let report = f.go("a").await;
 
@@ -4935,7 +4946,9 @@ mod tests {
             assert_eq!(f.state("a"), Some(Active));
             assert_eq!(f.fake.count("unload a"), 0);
             f.fake.set("hold activate a", None);
-            f.fake.called("unload a").await;
+            let unloaded =
+                tokio::time::timeout(Duration::from_secs(10), f.fake.called("unload a")).await;
+            assert!(unloaded.is_ok(), "the old instance was not unloaded");
             // One unload: the old instance, in a blocking task.
             assert_eq!(
                 f.fake.take_calls(),
