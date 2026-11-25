@@ -52,12 +52,22 @@
 //!   `access_key_id` do not mark a secret.
 //! - A key that marks a secret cannot hold other text: `password_hint = "pet"`
 //!   is refused. Use a key name that does not mark a secret.
-//! - A key with a segment of [`ABOUT_A_SECRET`] is a setting about a secret.
-//!   It does not mark a secret and can hold each type of value:
-//!   `max_tokens = 4096`, `token_ttl = "5m"`, `db_password_file = "/run/x"`.
-//!   The same applies to a key in a table under a secret key
-//!   (`[credentials] retries = 3`) and to the name of a parameter in a
-//!   string (`password_encryption=scram-sha-256`).
+//! - A key is a setting about a secret if its last segment is in
+//!   [`ABOUT_A_SECRET`], or if its first segment is in
+//!   [`ABOUT_A_SECRET_FIRST`] (`max`, `min`), or if it has the segment
+//!   [`ABOUT_A_SECRET_ANYWHERE`] (`per`). It does not mark a secret and
+//!   can hold each type of value: `max_tokens = 4096`, `token_ttl = "5m"`,
+//!   `db_password_file = "/run/x"`, `tokens_per_page = 50`. The same applies
+//!   to the name of a parameter in a string
+//!   (`password_encryption=scram-sha-256`).
+//! - A segment of [`ABOUT_A_SECRET`] at another position does not count:
+//!   `file_password = "hunter2"` is refused. It is the password of a file.
+//! - In a table under a secret key, a key about a secret that does not name
+//!   a secret can hold a number: `[credentials] retries = 3`. A string
+//!   there must be a secret URI: `[password] file = "hunter2"` and
+//!   `password = { size = "hunter2" }` are refused. A key that names its
+//!   secret can hold each type of value there:
+//!   `[credentials] password_file = "/run/x"`.
 //!
 //! What the check does not find (examples, not a complete list):
 //!
@@ -162,8 +172,10 @@ const BUILT_IN_SECRET_SCHEMES: [&str; 3] = {
 };
 
 /// Key-name segments that make a key a setting about a secret, not a
-/// secret: `max_tokens`, `token_ttl`, `db_password_file`. Such a key, and
-/// each key in a table under it, can hold each type of value.
+/// secret, when one of them is the last segment of the key name:
+/// `token_ttl`, `db_password_file`. Such a key, and each key in a table
+/// under it, can hold each type of value. See [`ABOUT_A_SECRET_FIRST`] for
+/// `max_tokens`.
 pub const ABOUT_A_SECRET: &[&str] = &[
     "max",
     "min",
@@ -180,6 +192,15 @@ pub const ABOUT_A_SECRET: &[&str] = &[
     "path",
     "encryption",
 ];
+
+/// The segments of [`ABOUT_A_SECRET`] that make a key a setting about a
+/// secret also when one of them is the first segment of the key name:
+/// `max_tokens`, `min_password_length`.
+pub const ABOUT_A_SECRET_FIRST: &[&str] = &["max", "min"];
+
+/// The segment of [`ABOUT_A_SECRET`] that makes a key a setting about a
+/// secret at each position of the key name: `tokens_per_page`.
+pub const ABOUT_A_SECRET_ANYWHERE: &str = "per";
 
 /// The segments that mark a secret when `key` or `keys` follows.
 /// `secret key` is not here: `secret` alone marks a secret.
@@ -546,15 +567,31 @@ fn key_words(key: &str) -> Vec<String> {
     words
 }
 
-/// `true` if the key name has a word of [`ABOUT_A_SECRET`].
+/// `true` if the key name is about a secret: its last word is in
+/// [`ABOUT_A_SECRET`] (`token_ttl`), or its first word is in
+/// [`ABOUT_A_SECRET_FIRST`] (`max_tokens`), or it has the word
+/// [`ABOUT_A_SECRET_ANYWHERE`] (`tokens_per_page`). A word at another
+/// position does not count: `file_password` is the password of a file.
 fn is_about_a_secret(key: &str) -> bool {
     let words = key_words(key);
-    words.iter().any(|word| ABOUT_A_SECRET.contains(&&**word))
+    let is_in = |list: &[&str], word: Option<&String>| {
+        word.is_some_and(|word| list.contains(&word.as_str()))
+    };
+    is_in(ABOUT_A_SECRET, words.last())
+        || is_in(ABOUT_A_SECRET_FIRST, words.first())
+        || words.iter().any(|word| word == ABOUT_A_SECRET_ANYWHERE)
 }
 
 /// `true` if the key name marks a secret. See [`SECRET_KEY_NAMES`]. A key
-/// name with a word of [`ABOUT_A_SECRET`] does not mark a secret.
+/// name that is about a secret ([`is_about_a_secret`]) does not mark a
+/// secret.
 fn is_secret_key(key: &str) -> bool {
+    !is_about_a_secret(key) && names_a_secret(key)
+}
+
+/// `true` if the key name has the name of a secret. See
+/// [`SECRET_KEY_NAMES`].
+fn names_a_secret(key: &str) -> bool {
     let words = key_words(key);
     let segments: Vec<&str> = words.iter().map(String::as_str).collect();
     let is_key_pair = |index: usize| {
@@ -563,13 +600,10 @@ fn is_secret_key(key: &str) -> bool {
             // `access_key_id` is the public name of a key, not the key.
             && segments.get(index + 2) != Some(&"id")
     };
-    !segments
+    segments
         .iter()
-        .any(|segment| ABOUT_A_SECRET.contains(segment))
-        && (segments
-            .iter()
-            .any(|segment| SECRET_KEY_NAMES.contains(segment))
-            || (0..segments.len()).any(is_key_pair))
+        .any(|segment| SECRET_KEY_NAMES.contains(segment))
+        || (0..segments.len()).any(is_key_pair)
 }
 
 /// `true` if `text` contains a URL with a password:
@@ -632,12 +666,15 @@ fn reject_secret_values(source: &str, path: &str, table: &Table) -> Result<()> {
     reject_in_table(source, path, table, None)
 }
 
-/// `secret_key` is the nearest key on the path whose name marks a secret.
+/// The nearest key on the path whose name marks a secret, and `true` if a
+/// key about that secret is below it on the path (`[credentials] retries`).
+type SecretKey<'a> = Option<(&'a str, bool)>;
+
 fn reject_in_table(
     source: &str,
     path: &str,
     table: &Table,
-    secret_key: Option<&str>,
+    secret_key: SecretKey<'_>,
 ) -> Result<()> {
     table.iter().try_for_each(|(key, value)| {
         let path = if path.is_empty() {
@@ -645,13 +682,14 @@ fn reject_in_table(
         } else {
             format!("{path}.{key}")
         };
-        let secret_key = if is_secret_key(key) {
-            Some(key.as_str())
-        } else if is_about_a_secret(key) {
-            // `[credentials] retries = 3`: a setting about the secret.
-            None
-        } else {
-            secret_key
+        let secret_key = match (names_a_secret(key), is_about_a_secret(key)) {
+            (true, false) => Some((key.as_str(), false)),
+            // `db_password_file`: the key names its secret and is about it.
+            (true, true) => None,
+            // `[credentials] retries = 3`: a number about the secret is
+            // accepted. A string can still be the secret value.
+            (false, true) => secret_key.map(|(name, _)| (name, true)),
+            (false, false) => secret_key,
         };
         reject_in_value(source, &path, value, secret_key)
     })
@@ -662,7 +700,7 @@ fn reject_in_value(
     source: &str,
     path: &str,
     value: &Value,
-    secret_key: Option<&str>,
+    secret_key: SecretKey<'_>,
 ) -> Result<()> {
     let text = match value {
         Value::Table(table) => return reject_in_table(source, path, table, secret_key),
@@ -676,7 +714,10 @@ fn reject_in_value(
         Value::Boolean(_) => return Ok(()),
         // A number or a date can: a numeric password, a PIN. Its text
         // cannot be a secret URI, so the checks of a string apply to "".
-        Value::Integer(_) | Value::Float(_) | Value::Datetime(_) => "",
+        Value::Integer(_) | Value::Float(_) | Value::Datetime(_) => match secret_key {
+            Some((_, true)) => return Ok(()),
+            _ => "",
+        },
     };
     // A built-in secret URI can contain `:`, `@` and `=` in its path. A
     // second `://`, a `;` or whitespace shows that the text is more than
@@ -700,7 +741,7 @@ fn reject_in_value(
             "holds text with a secret parameter (for example `password=`); put the value in a \
              secret store and use a secret URI (for example keychain://)",
         )
-    } else if let Some(name) = secret_key.filter(|_| text.parse::<SecretUri>().is_err()) {
+    } else if let Some((name, _)) = secret_key.filter(|_| text.parse::<SecretUri>().is_err()) {
         format!(
             "must hold a secret URI (for example keychain://), because the key name `{name}` \
              marks a secret; settings do not accept a secret value. If the value is not a \
@@ -1634,7 +1675,7 @@ mod tests {
             "db_password_file = \"/run/secrets/db\"\n",
             "credentialsPath = \"/etc/creds\"\n",
             "password_encryption = \"scram-sha-256\"\n",
-            "[credentials]\nretries = 3\nfile = \"/etc/creds\"\n",
+            "[credentials]\nretries = 3\nfile = \"keychain://etc/creds\"\n",
             "[tokens]\nttl = 60\n[tokens.limit]\nburst = 5\n",
             "password = true\nshow_password = true\nsave_passwords = false\n",
             "passwords = [true, false]\n",
@@ -1648,6 +1689,43 @@ mod tests {
             "token_path = \"/x?password=hunter2\"\n",
             "[tokens]\nttl = 60\nprod = \"hunter2\"\n",
             "password_hint = \"hunter2\"\n",
+        ]);
+    }
+
+    /// R-93 (b), ADR-0008: a word of [`ABOUT_A_SECRET`] counts only as the
+    /// last word of the key name (`max` and `min`: also as the first word;
+    /// `per`: at each position). In a table
+    /// under a secret key, a key with such a word accepts a number, not a
+    /// secret value.
+    #[test]
+    fn word_about_a_secret_counts_only_at_its_position() {
+        assert_each_is_refused(&[
+            // The cases of the review finding.
+            "file_password = \"hunter2\"\n",
+            "[password]\nfile = \"hunter2\"\n",
+            "password = { size = \"hunter2\" }\n",
+            // The word is not at its position.
+            "path_token = \"hunter2\"\n",
+            "timeout_secret = 5\n",
+            "token_file_prod = \"hunter2\"\n",
+            "opt = \"file_password=hunter2\"\n",
+            "[tokens.limit]\nprod = \"hunter2\"\n",
+            "[credentials]\nfile = \"/etc/creds\"\n",
+        ]);
+        assert_each_is_accepted(&[
+            // Each example of the module documentation.
+            "max_tokens = 4096\n",
+            "token_ttl = \"5m\"\n",
+            "db_password_file = \"/run/x\"\n",
+            "tokens_per_page = 50\n",
+            "[credentials]\nretries = 3\n",
+            "[credentials]\npassword_file = \"/run/x\"\n",
+            "opt = \"password_encryption=scram-sha-256\"\n",
+            "show_password = true\n",
+            // A table under a secret key.
+            "min_password_length = 12\nmaxTokens = 5\npassword_max = 64\n",
+            "[password]\nsize = 12\nfile = \"keychain://db/prod\"\n",
+            "password = { max = 64, show = true }\n",
         ]);
     }
 

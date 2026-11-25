@@ -135,6 +135,10 @@ fn cut(range: &str) -> String {
 ///      reason and in reasons 3 and 4.
 ///    - At most [`MAX_CONFLICT_PARTIES`] extensions are named. The reason
 ///      gives the number of the others.
+///    - Cost: for each extension with this reason, one range comparison
+///      with each other extension that depends on the same extension. For
+///      `n` such dependents of one extension, that is `n * n` comparisons.
+///      Only the named extensions are written as text.
 /// 6. A dependency is rejected.
 ///
 /// Reasons 4 to 6 are checked for one dependency after the other, sorted by
@@ -268,7 +272,7 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
         let Some(range) = manifest.dependencies.get(dependency) else {
             continue;
         };
-        let others: Vec<String> = unique
+        let mut parties = unique
             .values()
             .filter(|other| other.id != *id)
             .filter_map(|other| {
@@ -277,26 +281,32 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
                     count_step();
                     mismatches.contains(&(&other.id, dependency))
                 };
-                (takes_part && ranges_conflict(range, other_range)).then(|| {
-                    format!(
-                        "extension `{}`, which depends on `{dependency}` `{}`",
-                        other.id,
-                        cut(&other_range.to_string())
-                    )
-                })
+                (takes_part && ranges_conflict(range, other_range)).then_some((other, other_range))
+            });
+        // Only the named parties become text. The others are counted.
+        let named: Vec<String> = parties
+            .by_ref()
+            .take(MAX_CONFLICT_PARTIES)
+            .map(|(other, other_range)| {
+                count_text();
+                format!(
+                    "extension `{}`, which depends on `{dependency}` `{}`",
+                    other.id,
+                    cut(&other_range.to_string())
+                )
             })
             .collect();
-        if others.is_empty() {
+        if named.is_empty() {
             continue;
         }
-        let named = others.len().min(MAX_CONFLICT_PARTIES);
+        let more = parties.count();
         let mut message = format!(
             "{}; this is a conflict with {}",
             reason.message(),
-            others[..named].join(" and ")
+            named.join(" and ")
         );
-        if others.len() > named {
-            message += &format!(" and {} more extensions", others.len() - named);
+        if more > 0 {
+            message += &format!(" and {more} more extensions");
         }
         outcomes.insert(id.clone(), reject(message));
     }
@@ -314,6 +324,20 @@ thread_local! {
 fn count_step() {
     #[cfg(test)]
     CONFLICT_STEPS.set(CONFLICT_STEPS.get() + 1);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of conflict parties that the conflict pass of [`resolve`]
+    /// wrote as text on this thread.
+    static CONFLICT_TEXTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one conflict party that is written as text. Does nothing outside
+/// tests.
+fn count_text() {
+    #[cfg(test)]
+    CONFLICT_TEXTS.set(CONFLICT_TEXTS.get() + 1);
 }
 
 /// `true` if no release version satisfies both ranges.
@@ -1052,6 +1076,39 @@ mod tests {
         assert!(
             steps <= DEPENDENTS * (DEPENDENTS + 1),
             "{steps} lookups for {DEPENDENTS} dependents"
+        );
+    }
+
+    /// R-93 (a): the conflict pass writes at most [`MAX_CONFLICT_PARTIES`]
+    /// parties as text for each rejected dependent. It counts the others.
+    #[test]
+    fn conflict_pass_writes_only_the_named_parties_as_text() {
+        const DEPENDENTS: usize = 60;
+        let mut manifests = vec![ext("lib", "9.0.0", &[])];
+        for index in 0..DEPENDENTS {
+            // Each range excludes the present version: 8 groups of ranges.
+            let range = format!("^{}", index % 8 + 1);
+            manifests.push(ext(&format!("e{index:02}"), "1.0.0", &[("lib", &range)]));
+        }
+        CONFLICT_TEXTS.set(0);
+        let resolution = resolve_all(&manifests);
+        let texts = CONFLICT_TEXTS.get();
+        assert!(
+            texts <= DEPENDENTS * MAX_CONFLICT_PARTIES,
+            "{texts} texts for {DEPENDENTS} dependents"
+        );
+        // The message is the same: the first 5 parties by id, then the number
+        // of the others. `e00` has the range `^1`; 52 dependents have another
+        // range.
+        let message = rejected(&resolution, "e00", &[]);
+        assert!(
+            message.ends_with(
+                "; this is a conflict with extension `e01`, which depends on `lib` `^2` and \
+                 extension `e02`, which depends on `lib` `^3` and extension `e03`, which \
+                 depends on `lib` `^4` and extension `e04`, which depends on `lib` `^5` and \
+                 extension `e05`, which depends on `lib` `^6` and 47 more extensions"
+            ),
+            "{message}"
         );
     }
 
