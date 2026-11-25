@@ -186,6 +186,7 @@
 use crate::Owner;
 use crate::bus::{CommandBus, EventBus};
 use crate::jobs::JobScheduler;
+use crate::package::read_text_file;
 use crate::registry::ServiceRegistry;
 use crate::resolve::{
     ActivationIndex, ActivationPlan, ActivationTrigger, Outcome, Resolution, resolve,
@@ -196,8 +197,9 @@ use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::BoxFuture;
 use rivet_sdk::manifest::{ExtensionId, Manifest, Version};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as _;
 use std::future::Future;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -586,36 +588,28 @@ impl Scan {
 
 /// Reads the manifest file of the extension directory `directory`.
 /// `Ok(None)` means that the directory has none. Blocking.
+///
+/// The read has the rules of each file that the core reads from a package
+/// ([`read_text_file`]): no symbolic link, a regular file only, and the size
+/// limit [`MAX_MANIFEST_BYTES`].
 fn read_manifest(directory: &Path) -> Result<Option<String>, String> {
     let path = directory.join(MANIFEST_FILE);
-    // A link is not followed. A FIFO or a device is not opened: its read
-    // can wait for ever.
     match std::fs::symlink_metadata(&path) {
-        Ok(found) if found.is_file() => {}
-        Ok(_) => return Err(format!("`{MANIFEST_FILE}` is not a regular file")),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+        _ => {}
     }
-    // shortcut: a file that changes to a link or a FIFO between the check
-    // and the open is followed or blocks this read (and each later discovery
-    // and reload, but no other operation); open with `O_NOFOLLOW` and
-    // `O_NONBLOCK` when the workspace has a crate for these flags.
-    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-    let mut limited = file.take(MAX_MANIFEST_BYTES + 1);
-    let mut text = String::new();
-    let read = limited.read_to_string(&mut text);
-    read.map_err(|error| error.to_string())?;
-    if limited.limit() == 0 {
-        return Err(format!(
-            "`{MANIFEST_FILE}` is larger than {MAX_MANIFEST_BYTES} bytes"
-        ));
-    }
-    Ok(Some(text))
+    let text = read_text_file(&path, "extension manifest", MAX_MANIFEST_BYTES);
+    // The reason of the system (for example "permission denied") is the source.
+    text.map(Some).map_err(|error| match error.source() {
+        Some(source) => format!("{}: {source}", error.message()),
+        None => error.message().to_owned(),
+    })
 }
 
 /// Reads the extension directories. Blocking.
 ///
-/// An extension directory is a real directory: a symbolic link is refused.
+/// An extension directory is a real directory: a symbolic link to a
+/// directory is refused and listed as invalid.
 /// For one id, a later discovery directory wins, but an invalid package
 /// never replaces a valid one (ADR-0017). If two folders of one discovery
 /// directory have the same id, the folder with the name of the id wins, also
@@ -643,8 +637,13 @@ fn scan(directories: &[PathBuf]) -> Scan {
         let mut in_root: BTreeMap<ExtensionId, Vec<Package>> = BTreeMap::new();
         for (directory, kind) in entries {
             if kind.is_symlink() {
-                let reason = "a symbolic link is not read as an extension directory";
-                scan.invalid.push((directory, reason.to_owned()));
+                // `metadata` follows the link, only to learn what it names.
+                // Nothing behind the link is read. A link to a file and a
+                // link without a target are ignored, like a file (ADR-0017).
+                if std::fs::metadata(&directory).is_ok_and(|target| target.is_dir()) {
+                    let reason = "a symbolic link is not read as an extension directory";
+                    scan.invalid.push((directory, reason.to_owned()));
+                }
                 continue;
             }
             if !kind.is_dir() {
@@ -3947,7 +3946,11 @@ mod tests {
         symlink(&package, user.join("link")).unwrap();
         std::fs::create_dir(user.join("file-link")).unwrap();
         let target = package.join(MANIFEST_FILE);
-        symlink(target, user.join("file-link").join(MANIFEST_FILE)).unwrap();
+        symlink(&target, user.join("file-link").join(MANIFEST_FILE)).unwrap();
+        // A link to a file and a link without a target are not packages:
+        // they are ignored, like a file.
+        symlink(&target, user.join("to-a-file")).unwrap();
+        symlink(outside.path().join("missing"), user.join("dangling")).unwrap();
 
         f.host.discover().await.unwrap();
 
@@ -3955,7 +3958,8 @@ mod tests {
         let invalid = f.host.invalid_packages();
         assert_eq!(invalid.len(), 2, "{invalid:?}");
         assert_eq!(invalid[0].0, user.join("file-link"));
-        assert!(invalid[0].1.contains("not a regular file"), "{invalid:?}");
+        let reason = "manifest file must not be a symbolic link";
+        assert!(invalid[0].1.contains(reason), "{invalid:?}");
         assert_eq!(invalid[1].0, user.join("link"));
         assert!(invalid[1].1.contains("symbolic link"), "{invalid:?}");
     }
@@ -3970,15 +3974,25 @@ mod tests {
         let text = manifest("above", "1.0.0", &[], "");
         let padding = "#".repeat(limit + 1 - text.len());
         f.write(USER, "above", &format!("{text}{padding}"));
+        // The limit is in the middle of a character of two bytes.
+        let text = manifest("wide", "1.0.0", &[], "");
+        let odd = "#".repeat(1 + (limit - text.len()) % 2);
+        let padding = "\u{e9}".repeat(limit);
+        f.write(USER, "wide", &format!("{text}{odd}{padding}"));
 
         f.host.discover().await.unwrap();
 
         assert_eq!(f.state("at-limit"), Some(Resolved));
         assert_eq!(f.state("above"), None);
+        assert_eq!(f.state("wide"), None);
         let invalid = f.host.invalid_packages();
-        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid.len(), 2);
         assert!(invalid[0].0.ends_with("above"));
-        assert!(invalid[0].1.contains("larger than"), "{invalid:?}");
+        assert!(invalid[1].0.ends_with("wide"));
+        for (_, reason) in invalid {
+            assert!(reason.contains("too large"), "{reason}");
+            assert!(reason.contains("the limit is 1048576 bytes"), "{reason}");
+        }
     }
 
     #[tokio::test]

@@ -902,7 +902,7 @@ fn reserved_publisher() -> Error {
 
 /// Reads a text file of at most `max_bytes`: a key, a signature or the trust
 /// store. `what` names the kind of file in the error.
-fn read_text_file(path: &Path, what: &str, max_bytes: u64) -> Result<String> {
+pub(crate) fn read_text_file(path: &Path, what: &str, max_bytes: u64) -> Result<String> {
     read_text(open_regular(path, what, max_bytes)?, path, what, max_bytes)
 }
 
