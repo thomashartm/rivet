@@ -9,7 +9,8 @@
 //! `-` is a filter on the test name.
 //!
 //! Only on Unix do the tests check that a process is gone (`kill -0`). On
-//! other systems these checks pass without a look at the process.
+//! other systems the tests that only make this check do not run, the other
+//! tests skip it, and the runner says so.
 
 use rivet_core::bus::{CommandBus, EventBus, Received};
 use rivet_core::host::{
@@ -80,6 +81,7 @@ fn child(directory: &Path) -> ! {
                 std::process::abort();
             });
         }
+        "gone" => std::process::exit(1),
         _ => {}
     }
 
@@ -111,10 +113,24 @@ fn child(directory: &Path) -> ! {
             ("hello", _) => reply(json!({"type": "hello", "protocol": PROTOCOL_VERSION})),
             ("activate", "abort") => std::process::abort(),
             ("activate", "exit") => std::process::exit(3),
-            ("activate", "malformed") => println!("{{\"type\":"),
+            ("activate", "exit-held") => {
+                second(directory, true);
+                std::process::exit(3);
+            }
+            ("activate", "answer-exit" | "answer-exit-held") => {
+                if behaviour == "answer-exit-held" {
+                    second(directory, true);
+                }
+                reply(json!({"type": "ok"}));
+                std::process::exit(0);
+            }
+            ("activate", "malformed") => println!("{{\"token\":\"{SECRET}\",\"type\":"),
             ("activate", "not-an-answer") => reply(json!({"type": "hello", "protocol": 1})),
             ("activate", "unknown-category") => {
                 reply(json!({"type": "error", "category": "fatal", "message": "x"}));
+            }
+            ("activate", "message-number") => {
+                reply(json!({"type": "error", "category": "user", "message": 5}));
             }
             ("activate", "largest" | "too-large") => {
                 // `{"type":"ok","pad":""}` has 22 bytes.
@@ -122,9 +138,19 @@ fn child(directory: &Path) -> ! {
                 let pad = "x".repeat(DEFAULT_MAX_MESSAGE_BYTES - 22 + extra);
                 reply(json!({"type": "ok", "pad": pad}));
             }
-            ("activate", "flood") => {
+            ("activate", "flood" | "flood-held") => {
+                if behaviour == "flood-held" {
+                    second(directory, false);
+                }
                 for number in 0..300 {
                     eprintln!("flood {number}");
+                }
+                reply(json!({"type": "ok"}));
+            }
+            ("activate", "flood-bytes") => {
+                // With the line end, 16 of these lines are the byte budget.
+                for _ in 0..20 {
+                    eprintln!("{}", "b".repeat(4095));
                 }
                 reply(json!({"type": "ok"}));
             }
@@ -135,6 +161,11 @@ fn child(directory: &Path) -> ! {
             ("activate", "talk") => {
                 reply(json!({"type": "ok"}));
                 reply(json!({"type": "ok"}));
+            }
+            ("activate", "talk-no-line-end") => {
+                reply(json!({"type": "ok"}));
+                print!("x");
+                std::io::stdout().flush().unwrap();
             }
             ("activate", other) if other.starts_with("error:") => reply(json!({
                 "type": "error",
@@ -149,6 +180,30 @@ fn child(directory: &Path) -> ! {
         forever();
     }
     std::process::exit(0)
+}
+
+/// Starts a second process that lives 30 s. It has the output of the child
+/// (`output`) or its error output, and it does not end with the child. The
+/// file `second` gets its process id: [`Package`] ends it.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the second process must live longer than the child"
+)]
+fn second(directory: &Path, output: bool) {
+    use std::process::Stdio;
+    let (stdout, stderr) = if output {
+        (Stdio::inherit(), Stdio::null())
+    } else {
+        (Stdio::null(), Stdio::inherit())
+    };
+    let second = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    std::fs::write(directory.join("second"), second.id().to_string()).unwrap();
 }
 
 // ------------------------------------------------------------- fixtures
@@ -175,6 +230,15 @@ fn package(behaviour: &str) -> Package {
         root,
         directory,
         manifest: Manifest::parse(&text).unwrap(),
+    }
+}
+
+impl Drop for Package {
+    /// Ends the process that the child started with `second`.
+    fn drop(&mut self) {
+        if let Ok(pid) = std::fs::read_to_string(self.directory.join("second")) {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
     }
 }
 
@@ -305,6 +369,26 @@ fn alive(_pid: u32) -> bool {
     false
 }
 
+/// `true` if the process has ended and nobody has read its exit status.
+#[cfg(unix)]
+fn defunct(pid: u32) -> bool {
+    let state = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    state.stdout.trim_ascii_start().starts_with(b"Z")
+}
+
+/// Blocks the thread until `done` is true, with [`PATIENCE`] as the limit.
+#[cfg(unix)]
+fn block_until(mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(start.elapsed() < PATIENCE, "the test waited too long");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn internal(error: &Error) {
     assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
     assert!(error.message().contains(ID), "{error}");
@@ -370,6 +454,29 @@ async fn a_program_that_cannot_start_is_an_error() {
     assert!(package.pids().is_empty());
 }
 
+/// A limit of 0 lets no handshake and no message pass.
+async fn a_limit_of_zero_is_refused() {
+    let on_crash: CrashCallback = Arc::new(|_, _| {});
+    let mut no_time = config();
+    no_time.handshake_timeout = Duration::ZERO;
+    let mut no_bytes = config();
+    no_bytes.max_message_bytes = 0;
+    for (config, name) in [
+        (no_time, "handshake_timeout"),
+        (no_bytes, "max_message_bytes"),
+    ] {
+        let error = NativeRuntime::new(config, redactor(), Arc::clone(&on_crash))
+            .err()
+            .expect(name);
+        assert_eq!(error.category(), ErrorCategory::User);
+        assert!(error.message().contains(name), "{error}");
+    }
+    // A grace time of 0 is valid: the process is killed at once.
+    let mut no_grace = config();
+    no_grace.grace = Duration::ZERO;
+    assert!(NativeRuntime::new(no_grace, redactor(), on_crash).is_ok());
+}
+
 /// Criterion 2 (ADR-0024): no search in `PATH`.
 async fn a_relative_program_path_is_refused() {
     let on_crash: CrashCallback = Arc::new(|_, _| {});
@@ -429,6 +536,7 @@ async fn a_failure_of_the_process_during_a_call_is_an_internal_error() {
         ("malformed", "malformed message"),
         ("not-an-answer", "malformed message"),
         ("unknown-category", "malformed message"),
+        ("message-number", "malformed message"),
         ("too-large", "too large"),
     ] {
         let package = package(behaviour);
@@ -442,13 +550,48 @@ async fn a_failure_of_the_process_during_a_call_is_an_internal_error() {
         // The instance cannot be used again, and the failure of a call is
         // not reported a second time as a crash.
         let error = within(instance.deactivate()).await.unwrap_err();
-        assert_eq!(error.category(), ErrorCategory::Internal, "{behaviour}");
+        internal(&error);
+        assert!(
+            error.message().contains("has ended"),
+            "{behaviour}: {error}"
+        );
         assert!(crashes.try_recv().is_err(), "{behaviour}");
     }
     // The engine continues: the next extension works.
     let package = package("largest");
     let instance = loaded(&package).await;
     within(instance.activate(context())).await.unwrap();
+}
+
+/// Criterion 4 (§5.6): the error keeps its cause, and the cause has no text
+/// of the process.
+async fn a_malformed_message_keeps_its_cause_without_text_of_the_process() {
+    let package = package("malformed");
+    let instance = loaded(&package).await;
+    let error = within(instance.activate(context())).await.unwrap_err();
+    internal(&error);
+    let cause = std::error::Error::source(&error).expect("the cause");
+    assert!(cause.is::<serde_json::Error>(), "{cause}");
+    assert!(std::error::Error::source(cause).is_none());
+    assert!(!cause.to_string().contains(SECRET), "{cause}");
+
+    // The cause of each kind of malformed text is a kind and a position.
+    for text in [
+        SECRET.to_owned(),
+        format!("\"{SECRET}"),
+        format!("\"{SECRET}\\q\""),
+        format!("{{\"{SECRET}\" {SECRET}}}"),
+        format!("{{{SECRET}:1}}"),
+        format!("[1,{SECRET}]"),
+        format!("1{SECRET}"),
+        format!("1 {SECRET}"),
+        format!("nul{SECRET}"),
+        format!("\"\\u{SECRET}\""),
+        format!("\"{SECRET}\u{1}\""),
+    ] {
+        let cause = serde_json::from_slice::<Value>(text.as_bytes()).unwrap_err();
+        assert!(!cause.to_string().contains("hunter"), "{cause}");
+    }
 }
 
 /// Criterion 4: the process lives, but its output is closed.
@@ -467,6 +610,74 @@ async fn a_closed_output_during_a_call_is_an_internal_error() {
     internal(&error);
     assert!(error.message().contains("closed its output"), "{error}");
     assert!(!alive(package.pid()));
+}
+
+/// Criterion 4 (R-88): another process holds the output of a process that
+/// exits during a call.
+#[cfg(unix)]
+async fn an_exit_during_a_call_ends_the_call_while_the_output_stays_open() {
+    let package = package("exit-held");
+    let instance = loaded(&package).await;
+    let error = within(instance.activate(context())).await.unwrap_err();
+    internal(&error);
+    let reason = "ended or closed its output during the call";
+    assert!(error.message().contains(reason), "{error}");
+    assert!(!alive(package.pid()));
+}
+
+/// Criterion 4 (R-88): the answer of a process that exits directly after
+/// it is not lost. The exit is then a crash while no call runs.
+#[cfg(unix)]
+async fn an_answer_before_an_exit_is_kept() {
+    for behaviour in ["answer-exit", "answer-exit-held"] {
+        let package = package(behaviour);
+        let (runtime, mut crashes) = runtime(config());
+        let instance = load(&runtime, &package).await.unwrap();
+        within(instance.activate(context())).await.expect(behaviour);
+        let (_, error) = within(crashes.recv()).await.unwrap();
+        assert!(error.message().contains("the process ended"), "{error}");
+    }
+}
+
+/// Criterion 2 (ADR-0024): the runtime reports no crash before the
+/// handshake.
+///
+/// Each load has the worst order: the process has ended before the
+/// supervisor task runs for the first time. The runtime of this test has
+/// one thread, so the supervisor task cannot run while the test blocks the
+/// thread. This is not an `async fn`, as
+/// [`a_process_that_is_killed_after_the_grace_time_is_not_left_defunct`].
+#[cfg(unix)]
+fn an_exit_before_the_handshake_is_an_error_of_the_load_and_no_crash() -> std::future::Ready<()> {
+    let package = package("gone");
+    let single = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    single.block_on(async {
+        let (runtime, mut crashes) = runtime(config());
+        for number in 0..50 {
+            let mut loading = std::pin::pin!(load(&runtime, &package));
+            let mut started = false;
+            let result = std::future::poll_fn(|context| {
+                let result = loading.as_mut().poll(context);
+                if !std::mem::replace(&mut started, true) {
+                    block_until(|| package.pids().get(number).is_some_and(|pid| defunct(*pid)));
+                }
+                result
+            })
+            .await;
+            let error = result.err().unwrap();
+            internal(&error);
+            assert!(error.message().contains("before the handshake"), "{error}");
+            assert!(crashes.try_recv().is_err(), "load {number}");
+        }
+        assert!(package.pids().iter().all(|pid| !alive(*pid)));
+        // All supervisor tasks have ended, and none made a report.
+        drop(runtime);
+        assert!(within(crashes.recv()).await.is_none());
+    });
+    std::future::ready(())
 }
 
 /// Criterion 5.
@@ -532,6 +743,19 @@ async fn a_message_that_answers_no_request_is_reported_as_a_crash() {
     assert_eq!(error.category(), ErrorCategory::Internal);
 }
 
+/// Criterion 5: bytes without a line end break the protocol also.
+async fn bytes_without_a_line_end_while_no_call_runs_are_reported_as_a_crash() {
+    let package = package("talk-no-line-end");
+    let (runtime, mut crashes) = runtime(config());
+    let instance = load(&runtime, &package).await.unwrap();
+    within(instance.activate(context())).await.unwrap();
+
+    let (_, error) = within(crashes.recv()).await.unwrap();
+    internal(&error);
+    assert!(error.message().contains("answers no request"), "{error}");
+    assert!(!alive(package.pid()));
+}
+
 /// Criterion 6.
 async fn to_drop_the_instance_ends_the_process() {
     let package = package("ok");
@@ -551,6 +775,7 @@ async fn to_drop_the_instance_ends_the_process() {
 }
 
 /// Criterion 6.
+#[cfg(unix)]
 async fn a_process_that_ignores_its_closed_input_is_killed_after_the_grace_time() {
     let package = package("stubborn");
     let mut config = config();
@@ -561,6 +786,54 @@ async fn a_process_that_ignores_its_closed_input_is_killed_after_the_grace_time(
 
     drop(instance);
     until(|| !alive(pid)).await;
+}
+
+/// Criterion 6 (ADR-0024): one extension has one process at a time. The
+/// drop of the instance does not wait, so the next load does.
+#[cfg(unix)]
+async fn a_load_waits_for_the_end_of_the_old_process_of_the_extension() {
+    let package = package("stubborn");
+    let mut config = config();
+    config.grace = Duration::from_millis(500);
+    let (runtime, _crashes) = runtime(config);
+    let instance = load(&runtime, &package).await.unwrap();
+    let old = package.pid();
+
+    // The old process ignores its closed input: it lives for the grace
+    // time.
+    drop(instance);
+    let _instance = load(&runtime, &package).await.unwrap();
+    assert!(!alive(old), "two processes for one extension");
+    assert_eq!(package.pids().len(), 2);
+}
+
+/// Criterion 6: the supervisor reads the exit status of the process that it
+/// kills. `kill_on_drop` kills also, but it leaves the exit status to a
+/// later turn of a Tokio runtime.
+///
+/// This is not an `async fn`: the runner calls it before it starts its
+/// runtime. The runtime of this test stops when `block_on` returns, so
+/// after that nothing can read an exit status.
+#[cfg(unix)]
+fn a_process_that_is_killed_after_the_grace_time_is_not_left_defunct() -> std::future::Ready<()> {
+    let package = package("stubborn");
+    let mut config = config();
+    config.grace = Duration::from_millis(100);
+    let single = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    single.block_on(async {
+        let (runtime, mut crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        drop(instance);
+        // The supervisor task has the last copy of the callback, so the
+        // channel ends when the task ends.
+        drop(runtime);
+        assert!(within(crashes.recv()).await.is_none());
+    });
+    assert!(!alive(package.pid()));
+    std::future::ready(())
 }
 
 /// Criterion 6: the host drops a call that exceeds its time limit.
@@ -681,6 +954,49 @@ async fn error_output_past_the_budget_is_dropped_and_counted() {
     assert!(last.contains(&format!("extension=\"{ID}\"")), "{last}");
 }
 
+/// Criterion 7 (ADR-0024): the byte part of the budget.
+async fn error_output_past_the_byte_budget_is_dropped_and_counted() {
+    let (capture, _guard) = capture_log();
+    let package = package("flood-bytes");
+    let instance = loaded(&package).await;
+    // The process writes 20 lines of 4 KiB before its answer.
+    within(instance.activate(context())).await.unwrap();
+    drop(instance);
+    until(|| capture.text().contains("log lines dropped")).await;
+
+    let text = capture.text();
+    assert_eq!(text.matches("guest_message=\"bbb").count(), 16, "{text}");
+    let last = text.lines().last().unwrap();
+    assert!(last.contains("4 log lines dropped"), "{last}");
+}
+
+/// Criterion 6 (ADR-0024): another process holds the error output of a
+/// process that has ended. The task that reads the error output ends, and
+/// it writes the number of dropped lines.
+#[cfg(unix)]
+async fn to_drop_the_instance_ends_the_error_output_task_while_the_pipe_stays_open() {
+    let (capture, _guard) = capture_log();
+    let tasks = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let package = package("flood-held");
+    let mut config = config();
+    config.grace = Duration::from_millis(100);
+    let (runtime, _crashes) = runtime(config);
+    assert_eq!(tasks(), 0);
+    let instance = load(&runtime, &package).await.unwrap();
+    within(instance.activate(context())).await.unwrap();
+    assert_eq!(tasks(), 2, "the supervisor and the error output");
+
+    drop(instance);
+    until(|| tasks() == 0).await;
+    let text = capture.text();
+    let last = text.lines().last().unwrap();
+    assert!(last.contains("200 log lines dropped"), "{text}");
+}
+
 // --------------------------------------------------------------- runner
 
 type Test = (&'static str, fn() -> BoxFuture<'static, ()>);
@@ -696,19 +1012,36 @@ const TESTS: &[Test] = tests![
     a_failed_handshake_is_an_error_and_leaves_no_process,
     a_program_that_cannot_start_is_an_error,
     a_relative_program_path_is_refused,
+    a_limit_of_zero_is_refused,
     an_error_answer_to_the_handshake_is_kept_and_leaves_no_process,
     an_error_answer_keeps_its_category_and_its_message,
     a_failure_of_the_process_during_a_call_is_an_internal_error,
+    a_malformed_message_keeps_its_cause_without_text_of_the_process,
     #[cfg(unix)]
     a_closed_output_during_a_call_is_an_internal_error,
+    #[cfg(unix)]
+    an_exit_during_a_call_ends_the_call_while_the_output_stays_open,
+    #[cfg(unix)]
+    an_answer_before_an_exit_is_kept,
+    #[cfg(unix)]
+    an_exit_before_the_handshake_is_an_error_of_the_load_and_no_crash,
     a_crash_while_no_call_runs_restarts_the_extension_in_a_new_process,
     a_message_that_answers_no_request_is_reported_as_a_crash,
+    bytes_without_a_line_end_while_no_call_runs_are_reported_as_a_crash,
     to_drop_the_instance_ends_the_process,
+    #[cfg(unix)]
     a_process_that_ignores_its_closed_input_is_killed_after_the_grace_time,
+    #[cfg(unix)]
+    a_load_waits_for_the_end_of_the_old_process_of_the_extension,
+    #[cfg(unix)]
+    a_process_that_is_killed_after_the_grace_time_is_not_left_defunct,
     a_dropped_call_kills_the_process,
     the_process_gets_only_the_allowed_environment,
     error_output_goes_to_the_log_as_untrusted_text,
     error_output_past_the_budget_is_dropped_and_counted,
+    error_output_past_the_byte_budget_is_dropped_and_counted,
+    #[cfg(unix)]
+    to_drop_the_instance_ends_the_error_output_task_while_the_pipe_stays_open,
 ];
 
 fn main() -> ExitCode {
@@ -724,13 +1057,18 @@ fn main() -> ExitCode {
     let mut failed = 0;
     let mut passed = 0;
     for (name, test) in TESTS.iter().filter(|(name, _)| selected(name)) {
-        // The engine has a multi-threaded runtime (ARCHITECTURE.md §5.1).
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let run = std::panic::AssertUnwindSafe(|| runtime.block_on(test()));
+        let run = std::panic::AssertUnwindSafe(|| {
+            // Before the runtime starts: a test that is not an `async fn`
+            // runs here, with no runtime of the runner.
+            let test = test();
+            // The engine has a multi-threaded runtime (ARCHITECTURE.md §5.1).
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(test);
+        });
         let result = std::panic::catch_unwind(run);
         if result.is_ok() {
             passed += 1;
@@ -741,6 +1079,8 @@ fn main() -> ExitCode {
         }
     }
     println!("\ntest result: {passed} passed; {failed} failed");
+    #[cfg(not(unix))]
+    println!("warning: not Unix, so no test checked that a process is gone");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {

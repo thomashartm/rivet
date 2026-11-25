@@ -22,6 +22,21 @@
 //! runtime always waits for the exit status, so no defunct process stays.
 //! The drop does not block: a task does this work.
 //!
+//! The task that reads the error output ends with the process. If another
+//! process holds the error output open, the runtime waits
+//! [`NativeConfig::grace`] after the end of the process and then ends the
+//! task.
+//!
+//! One extension has one process at a time (ADR-0024). The drop does not
+//! wait for the end of the process, so a load of the same extension waits
+//! for it: two times [`NativeConfig::grace`] at most after the drop. A load
+//! while an instance of the same extension exists waits until that instance
+//! is dropped.
+//!
+//! A limit: if the Tokio runtime ends while an instance exists, the process
+//! is killed, but nothing reads its exit status. It stays defunct until the
+//! engine exits.
+//!
 //! # Protocol
 //!
 //! Control messages go over the standard input and output of the process.
@@ -52,10 +67,11 @@
 //! | --- | --- |
 //! | The program does not start | `internal` error of `load`, no process |
 //! | Wrong protocol version, or no answer in time | `internal` error of `load`, no process |
+//! | The process exits or closes a pipe before the handshake | `internal` error of `load`, no crash callback |
 //! | The process exits or closes its output during a call | `internal` error of the call |
 //! | A malformed or too large answer | `internal` error of the call |
 //! | The caller drops a call that runs | the process is killed |
-//! | The process exits, closes its output or sends a message while no call runs | the crash callback |
+//! | After the handshake, the process exits, closes its output or sends a byte while no call runs | the crash callback |
 //!
 //! After each of these failures the process is killed, and each later call
 //! of the instance gives an `internal` error. The engine continues.
@@ -87,6 +103,9 @@
 //!   protocol has no message for a registration.
 //! - Bulk data (Arrow IPC over a local socket, §6.6).
 //! - Memory and CPU limits of the process, and OS sandboxing (§4.3).
+//! - A process that the process of the extension starts itself. The runtime
+//!   does not end it, and it does not wait for it: a pipe that such a
+//!   process holds open delays no call (ADR-0024).
 
 use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
 use crate::logging::Redactor;
@@ -95,6 +114,7 @@ use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::BoxFuture;
 use rivet_sdk::manifest::{ExtensionId, Manifest};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,7 +122,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::instrument::WithSubscriber;
 
 /// The version of the protocol between the engine and the process. The
@@ -141,7 +162,8 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const ERROR_OUTPUT_LINE_BYTES: usize = 8 * 1024;
 
 /// What the runtime calls when a process ends, closes its output or sends a
-/// message while no call runs. The arguments are the extension and the
+/// message while no call runs. The runtime calls it only for a process whose
+/// handshake was successful. The arguments are the extension and the
 /// reason. The reason contains no text from the process.
 ///
 /// The runtime calls it from a task of the Tokio runtime. It must not
@@ -156,12 +178,15 @@ pub struct NativeConfig {
     /// The arguments before the package directory.
     pub arguments: Vec<OsString>,
     /// The longest time between the start of the process and its answer to
-    /// `hello`.
+    /// `hello`. Not 0.
     pub handshake_timeout: Duration,
     /// The time that the process has to exit after its input was closed.
-    /// Then the runtime kills it.
+    /// Then the runtime kills it. Also the time that the error output has
+    /// to end after the process has ended. 0 is valid: the runtime kills
+    /// the process at once.
     pub grace: Duration,
     /// The most bytes of one message of the process, without the line end.
+    /// Not 0.
     pub max_message_bytes: usize,
 }
 
@@ -185,6 +210,10 @@ pub struct NativeRuntime {
     config: NativeConfig,
     redactor: Redactor,
     on_crash: CrashCallback,
+    /// One permit for each extension: the supervisor task of its process
+    /// has it. An entry stays after the unload: the map has one entry for
+    /// each extension that was loaded.
+    slots: Mutex<HashMap<ExtensionId, Arc<Semaphore>>>,
 }
 
 impl NativeRuntime {
@@ -198,7 +227,8 @@ impl NativeRuntime {
     /// # Errors
     ///
     /// Returns a `user` error if [`NativeConfig::program`] is not an
-    /// absolute path.
+    /// absolute path, or if [`NativeConfig::handshake_timeout`] or
+    /// [`NativeConfig::max_message_bytes`] is 0.
     pub fn new(config: NativeConfig, redactor: Redactor, on_crash: CrashCallback) -> Result<Self> {
         if !config.program.is_absolute() {
             return Err(Error::user(format!(
@@ -206,11 +236,36 @@ impl NativeRuntime {
                 config.program.display()
             )));
         }
+        // With 0 no handshake and no message can pass.
+        if config.handshake_timeout.is_zero() {
+            return Err(Error::user("`handshake_timeout` must not be 0"));
+        }
+        if config.max_message_bytes == 0 {
+            return Err(Error::user("`max_message_bytes` must not be 0"));
+        }
         Ok(Self {
             config,
             redactor,
             on_crash,
+            slots: Mutex::default(),
         })
+    }
+
+    /// Waits until no process of `id` runs. The result lets one process
+    /// run: the supervisor task keeps it to its end.
+    async fn slot(&self, id: &ExtensionId) -> Result<OwnedSemaphorePermit> {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                slots
+                    .entry(id.clone())
+                    .or_insert_with(|| Arc::new(Semaphore::new(1))),
+            )
+        };
+        // Nothing closes the semaphore.
+        slot.acquire_owned()
+            .await
+            .map_err(|error| failure(id, "the process slot is closed").with_source(error))
     }
 }
 
@@ -227,6 +282,7 @@ impl ExtensionRuntime for NativeRuntime {
     ) -> BoxFuture<'a, Result<Box<dyn ExtensionInstance>>> {
         Box::pin(async move {
             let id = manifest.id.clone();
+            let slot = self.slot(&id).await?;
             let environment = ENVIRONMENT
                 .iter()
                 .filter_map(|name| std::env::var_os(name).map(|value| (name, value)));
@@ -252,13 +308,14 @@ impl ExtensionRuntime for NativeRuntime {
                 return Err(failure(&id, "the process has no pipes"));
             };
             let log = Arc::new(LogBudget::new(id.clone()));
-            tokio::spawn(
+            let error_output = tokio::spawn(
                 log_error_output(errors, Arc::clone(&log), self.redactor.clone())
                     .with_current_subscriber(),
             );
             let process = Process {
-                id,
+                id: id.clone(),
                 log,
+                error_output,
                 child,
                 input,
                 output: BufReader::new(output),
@@ -267,16 +324,17 @@ impl ExtensionRuntime for NativeRuntime {
             };
             let (calls, requests) = mpsc::channel(1);
             let supervisor = tokio::spawn(
-                supervise(process, requests, Arc::clone(&self.on_crash)).with_current_subscriber(),
+                supervise(process, requests, Arc::clone(&self.on_crash), slot)
+                    .with_current_subscriber(),
             );
-            if let Err(error) = call(&calls, "hello").await {
+            if let Err(error) = call(&id, &calls, "hello").await {
                 // The supervisor ends the process. Wait for it, so no
                 // process is left when `load` returns.
                 drop(calls);
                 let _ = supervisor.await;
                 return Err(error);
             }
-            Ok(Box::new(NativeInstance { calls }) as Box<dyn ExtensionInstance>)
+            Ok(Box::new(NativeInstance { id, calls }) as Box<dyn ExtensionInstance>)
         })
     }
 }
@@ -286,6 +344,7 @@ type Call = (&'static str, oneshot::Sender<Result<()>>);
 
 /// One extension in its process. To drop it ends the process.
 struct NativeInstance {
+    id: ExtensionId,
     /// The requests for the supervisor task. The supervisor ends the
     /// process when this sender is dropped.
     calls: mpsc::Sender<Call>,
@@ -295,18 +354,18 @@ impl ExtensionInstance for NativeInstance {
     /// Sends `activate`. `context` stays in the engine (see the module
     /// documentation).
     fn activate(&self, _context: ExtensionContext) -> BoxFuture<'_, Result<()>> {
-        Box::pin(call(&self.calls, "activate"))
+        Box::pin(call(&self.id, &self.calls, "activate"))
     }
 
     fn deactivate(&self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(call(&self.calls, "deactivate"))
+        Box::pin(call(&self.id, &self.calls, "deactivate"))
     }
 }
 
 /// Sends one request to the supervisor and waits for the answer. If the
 /// caller drops this future, the supervisor kills the process.
-async fn call(calls: &mpsc::Sender<Call>, request: &'static str) -> Result<()> {
-    let ended = || Error::internal("the process of the extension has ended");
+async fn call(id: &ExtensionId, calls: &mpsc::Sender<Call>, request: &'static str) -> Result<()> {
+    let ended = || failure(id, "the process has ended");
     let (answer, result) = oneshot::channel();
     calls.send((request, answer)).await.map_err(|_| ended())?;
     result.await.map_err(|_| ended())?
@@ -322,6 +381,8 @@ fn failure(id: &ExtensionId, reason: &str) -> Error {
 struct Process {
     id: ExtensionId,
     log: Arc<LogBudget>,
+    /// The task [`log_error_output`].
+    error_output: JoinHandle<()>,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -334,7 +395,13 @@ async fn supervise(
     mut process: Process,
     mut requests: mpsc::Receiver<Call>,
     on_crash: CrashCallback,
+    // Free at the end of this task: then the next process of the extension
+    // can start.
+    _slot: OwnedSemaphorePermit,
 ) {
+    // An end of the process is a crash only after the handshake. Before
+    // it, the answer to `hello` gives the error (ADR-0024).
+    let mut handshake_done = false;
     loop {
         tokio::select! {
             request = requests.recv() => {
@@ -348,38 +415,54 @@ async fn supervise(
                 };
                 match result {
                     Ok(result) => {
+                        // `hello` is the first request.
+                        handshake_done |= result.is_ok();
                         let _ = answer.send(result);
                     }
                     Err(error) => {
                         // The state of the process is not known.
                         let _ = process.child.kill().await;
                         let _ = answer.send(Err(error));
-                        return;
+                        break;
                     }
                 }
             }
-            error = process.unexpected() => {
+            error = process.unexpected(), if handshake_done => {
                 let _ = process.child.kill().await;
-                on_crash(process.id, error);
-                return;
+                on_crash(process.id.clone(), error);
+                break;
             }
         }
     }
     let Process {
+        log,
+        mut error_output,
         mut child,
         input,
         config,
         ..
     } = process;
-    // The closed input tells the process to exit.
+    // The closed input tells the process to exit. A process that was killed
+    // above has its exit status already.
     drop(input);
     if tokio::time::timeout(config.grace, child.wait())
         .await
         .is_err()
     {
-        // Kills and reads the exit status. Not isolated by a test:
-        // without this line `kill_on_drop` kills, but does not wait.
+        // Kills and reads the exit status. `kill_on_drop` kills also, but it
+        // does not wait.
         let _ = child.kill().await;
+    }
+    // The error output ends with the process, and the task with it. The
+    // wait ends only if another process holds the error output open.
+    if tokio::time::timeout(config.grace, &mut error_output)
+        .await
+        .is_err()
+    {
+        error_output.abort();
+        // After this the task counts no line.
+        let _ = error_output.await;
+        log.renew();
     }
 }
 
@@ -408,27 +491,51 @@ impl Process {
             self.input.write_all(line.as_bytes()).await?;
             self.input.flush().await
         };
+        let when = if request == "hello" {
+            "before the handshake"
+        } else {
+            "during the call"
+        };
         sent.await.map_err(|error| {
-            failure(&self.id, "the process closed its input").with_source(error)
+            let reason = format!("the process ended or closed its input {when}");
+            failure(&self.id, &reason).with_source(error)
         })?;
 
         let limit = self.config.max_message_bytes;
-        // One byte more than the limit, for the line end.
-        let answer = read_chunk(&mut self.output, limit.saturating_add(1))
-            .await
-            .map_err(|error| {
-                failure(&self.id, "the output of the process cannot be read").with_source(error)
-            })?;
+        let answer = {
+            // One byte more than the limit, for the line end.
+            let read = read_chunk(&mut self.output, limit.saturating_add(1));
+            tokio::pin!(read);
+            tokio::select! {
+                // An answer that is in the pipe counts, also if the process
+                // has ended after it.
+                biased;
+                answer = &mut read => answer,
+                _ = self.child.wait() => {
+                    // Another process can hold the output open, so the end
+                    // of the output can stay away. Take only what the pipe
+                    // has now.
+                    tokio::select! {
+                        biased;
+                        answer = &mut read => answer,
+                        () = std::future::ready(()) => Ok(Vec::new()),
+                    }
+                }
+            }
+        }
+        .map_err(|error| {
+            failure(&self.id, "the output of the process cannot be read").with_source(error)
+        })?;
         let Some(answer) = answer.strip_suffix(b"\n").or_else(|| {
             // The last line of the output can have no line end.
             (!answer.is_empty() && answer.len() <= limit).then_some(&answer[..])
         }) else {
             return Err(failure(
                 &self.id,
-                if answer.is_empty() {
-                    "the process ended or closed its output during the call"
+                &if answer.is_empty() {
+                    format!("the process ended or closed its output {when}")
                 } else {
-                    "the process sent a message that is too large"
+                    "the process sent a message that is too large".to_owned()
                 },
             ));
         };
@@ -438,7 +545,11 @@ impl Process {
     /// Reads the answer `line` to `request`.
     fn answer(&self, request: &str, line: &[u8]) -> Result<Result<()>> {
         let malformed = || failure(&self.id, "the process sent a malformed message");
-        let message: Value = serde_json::from_slice(line).map_err(|_| malformed())?;
+        // The cause is a kind and a position. It has no text of the line,
+        // because the target type is `Value`: only a typed target gives
+        // errors that quote the input.
+        let message: Value =
+            serde_json::from_slice(line).map_err(|error| malformed().with_source(error))?;
         match (message["type"].as_str(), request) {
             (Some("hello"), "hello") if message["protocol"] == PROTOCOL_VERSION => Ok(Ok(())),
             (Some("hello"), "hello") => Err(failure(
@@ -469,19 +580,24 @@ impl Process {
     /// Completes when the process does something that is a crash while no
     /// call runs. Returns the reason.
     async fn unexpected(&mut self) -> Error {
-        let reason = tokio::select! {
+        let id = &self.id;
+        tokio::select! {
             status = self.child.wait() => match status {
-                Ok(status) => format!("the process ended ({status})"),
-                Err(_) => "the state of the process cannot be read".to_owned(),
-            },
-            chunk = read_chunk(&mut self.output, self.config.max_message_bytes) => match chunk {
-                Ok(chunk) if !chunk.is_empty() => {
-                    "the process sent a message that answers no request".to_owned()
+                Ok(status) => failure(id, &format!("the process ended ({status})")),
+                Err(error) => {
+                    failure(id, "the state of the process cannot be read").with_source(error)
                 }
-                _ => "the process ended or closed its output".to_owned(),
             },
-        };
-        failure(&self.id, &reason)
+            // Does not take the bytes, so each byte counts, also without a
+            // line end.
+            bytes = self.output.fill_buf() => match bytes {
+                Ok([]) => failure(id, "the process ended or closed its output"),
+                Ok(_) => failure(id, "the process sent a message that answers no request"),
+                Err(error) => {
+                    failure(id, "the output of the process cannot be read").with_source(error)
+                }
+            },
+        }
     }
 }
 
@@ -544,7 +660,8 @@ impl LogBudget {
 }
 
 /// Writes the error output of the process to the log, as untrusted text.
-/// Ends when the process closes its error output.
+/// Ends when the error output ends. The supervisor ends this task if another
+/// process holds the error output open.
 async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Redactor) {
     let mut errors = BufReader::new(errors);
     let extension = log.id.as_str();
