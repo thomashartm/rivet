@@ -317,6 +317,10 @@ impl JobScheduler {
     /// - `max_concurrent`: how many jobs run at the same time.
     /// - `retain_finished`: how many finished jobs [`jobs`](Self::jobs)
     ///   still lists. Older finished jobs are forgotten.
+    ///
+    /// The limit per extension is thus the default: one owner can have at
+    /// most 8 queued and running jobs. Use [`with_config`](Self::with_config)
+    /// for another limit or for no limit.
     pub fn new(max_concurrent: NonZeroUsize, retain_finished: usize) -> Self {
         Self::with_config(JobConfig {
             max_concurrent,
@@ -346,6 +350,10 @@ impl JobScheduler {
     /// `work` receives the [`JobContext`]. It runs on the async worker
     /// threads, so it MUST NOT block; use
     /// [`spawn_blocking`](Self::spawn_blocking) for blocking work.
+    ///
+    /// The scheduler does not prove `owner`: the caller (the binding layer)
+    /// MUST give the id of the extension that starts the job, or the limit
+    /// per extension has no effect.
     ///
     /// The final state follows from what `work` does:
     ///
