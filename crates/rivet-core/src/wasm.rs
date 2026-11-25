@@ -927,9 +927,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_component_file_is_loaded_and_its_lifecycle_is_called() {
+        let capture = Capture::default();
+        let _guard =
+            capture_logs(&capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new()));
+        // Each lifecycle function logs its own word of 7 bytes.
+        let log = |address| {
+            format!("(call $log (i32.const 2) (i32.const {address}) (i32.const 7)) (i32.const 0)")
+        };
+        let bytes = component(
+            "",
+            r#"(data (i32.const 256) "startedstopped")"#,
+            &log(256),
+            &log(263),
+        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("extension.wasm");
-        std::fs::write(&path, logging_guest("hello")).unwrap();
+        std::fs::write(&path, bytes).unwrap();
 
         let runtime = runtime_with(Limits::default(), &Redactor::new());
         let component = runtime.load_file(&path).await.unwrap();
@@ -937,8 +950,15 @@ mod tests {
             .instantiate(&component, id("acme.hello"))
             .await
             .unwrap();
+        assert_eq!(capture.text(), "");
         instance.activate().await.unwrap();
+        let text = capture.text();
+        assert_eq!(text.matches("started").count(), 1, "{text}");
+        assert!(!text.contains("stopped"), "{text}");
         instance.deactivate().await.unwrap();
+        let text = capture.text();
+        assert_eq!(text.matches("started").count(), 1, "{text}");
+        assert_eq!(text.matches("stopped").count(), 1, "{text}");
     }
 
     #[tokio::test]
@@ -1043,6 +1063,29 @@ mod tests {
         assert!(manifest.contains("version.workspace = true"));
         let package = format!("package rivet:extension@{};", env!("CARGO_PKG_VERSION"));
         assert!(WIT.contains(&package), "{package}");
+    }
+
+    #[test]
+    fn the_wasmtime_version_is_exact_and_no_wasi_crate_is_a_dependency() {
+        // ADR-0018: the pinned WASI version is "none". A WASI host
+        // implementation would be a dependency of this crate.
+        let manifest = include_str!("../Cargo.toml");
+        let names: Vec<&str> = manifest
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&"wasmtime") && names.contains(&"wat"));
+        assert!(!names.iter().any(|name| name.contains("wasi")), "{names:?}");
+        // `wat` builds the test components: it is exact too.
+        for name in ["wasmtime", "wat"] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} = ")))
+                .unwrap();
+            let version = line.split('"').nth(1).unwrap();
+            assert!(version.starts_with('='), "{line}");
+        }
     }
 
     #[tokio::test]
