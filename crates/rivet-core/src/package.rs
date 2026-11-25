@@ -128,6 +128,19 @@ const PUBLISHERS_KEY: &str = "publishers";
 /// trusted comment of 8192 bytes; a valid file is always smaller than this.
 const TEXT_FILE_MAX_BYTES: u64 = 16 * 1024;
 
+/// A longer key of the trust store file is cut to this length in an error.
+/// A valid publisher name is shorter.
+const MAX_SHOWN_KEY_BYTES: usize = 128;
+
+/// Returns a key of the trust store file for an error message: cut to
+/// [`MAX_SHOWN_KEY_BYTES`], and with its control characters escaped. The
+/// file can come from another program, so a key has no safe form.
+fn shown_key(key: &str) -> String {
+    let start = &key[..key.floor_char_boundary(MAX_SHOWN_KEY_BYTES)];
+    let mark = if start.len() < key.len() { "…" } else { "" };
+    format!("{}{mark}", start.escape_debug())
+}
+
 /// The largest trust store file that is read. One pinned key needs about 80
 /// bytes, so this is room for more than 10 000 publishers.
 const TRUST_FILE_MAX_BYTES: u64 = 1024 * 1024;
@@ -259,9 +272,12 @@ fn decode_key(base64: &str) -> Option<[u8; 42]> {
 /// the Ed25519 curve, little-endian, in canonical form: 0, 1, p - 1 and the
 /// two y of the points of order 8, with p = 2^255 - 19.
 ///
-/// Source: the list in `ge25519_has_small_order` of libsodium
-/// (`crypto_core/ed25519/ref10/ed25519_ref10.c`). Its entries for y = p and
-/// y = p + 1 are not here: [`is_weak_key`] refuses each y that is not below p.
+/// Source: the list `blacklist` in `ge25519_has_small_order` of libsodium,
+/// tag `1.0.18`, file
+/// `src/libsodium/crypto_core/ed25519/ref10/ed25519_ref10.c`. A later
+/// libsodium has no list: its function calculates the check from the point.
+/// The entries of the list for y = p and y = p + 1 are not here:
+/// [`is_weak_key`] refuses each y that is not below p.
 const SMALL_ORDER_Y: [[u8; 32]; 5] = [
     [0; 32],
     {
@@ -794,7 +810,7 @@ impl TrustStore {
             Some(_) => return Err(invalid(format!("key `{PUBLISHERS_KEY}` must be a table"))),
         };
         if let Some(key) = table.keys().next() {
-            return Err(invalid(format!("unknown key `{key}`")));
+            return Err(invalid(format!("unknown key `{}`", shown_key(key))));
         }
         for (publisher, value) in publishers {
             let key = value
@@ -802,7 +818,11 @@ impl TrustStore {
                 .ok_or_else(|| Error::user("the value must be a public key string"))
                 .and_then(str::parse)
                 .map_err(|error| {
-                    invalid(format!("publisher `{publisher}`: {}", error.message()))
+                    invalid(format!(
+                        "publisher `{}`: {}",
+                        shown_key(&publisher),
+                        error.message()
+                    ))
                 })?;
             store
                 .pin(&publisher, key)
@@ -1655,6 +1675,31 @@ mod tests {
             assert!(!message.contains("SECRET-LOOKING"), "leaked: {message}");
         }
 
+        // R-95 (b): a key of the file is cut and its control characters are
+        // escaped in the message.
+        let long = "k".repeat(100_000);
+        for text in [
+            format!("schema_version = 1\n{long} = 1\n"),
+            format!("schema_version = 1\n[publishers]\n{long} = 5\n"),
+            String::from("schema_version = 1\n\"a\\nb\\u001b[2J\" = 1\n"),
+            String::from("schema_version = 1\n[publishers]\n\"a\\nb\\u001b[2J\" = 5\n"),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let message = assert_error(
+                TrustStore::load(key.clone(), &path),
+                ErrorCategory::User,
+                &[&shown(&path)],
+            );
+            let limit = shown(&path).len() + MAX_SHOWN_KEY_BYTES + 200;
+            assert!(message.len() <= limit, "{} bytes", message.len());
+            assert!(!message.contains(['\n', '\u{1b}']), "{message:?}");
+            let start = "k".repeat(MAX_SHOWN_KEY_BYTES);
+            assert!(
+                message.contains(&format!("`{start}…`")) || message.contains("`a\\nb\\u{1b}[2J`"),
+                "{message:?}"
+            );
+        }
+
         // A directory cannot be read as a file.
         assert_error(
             TrustStore::load(key, dir.path()),
@@ -2119,7 +2164,7 @@ mod tests {
 
     // --- review finding: weak signature keys --------------------------------
 
-    /// The encodings that libsodium `ge25519_has_small_order` refuses: its 7
+    /// The encodings that libsodium 1.0.18 `ge25519_has_small_order` refuses: its 7
     /// list entries, each without and with the sign bit of x. Each entry is
     /// (order of the point, hex of the 32 bytes).
     const WEAK_KEYS: [(u8, &str); 14] = [

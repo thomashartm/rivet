@@ -731,8 +731,13 @@ mod tests {
     fn no_check_is_allowed_after_revoke_returns() {
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
         const CHECKERS: usize = 8;
         const ROUNDS_AFTER: usize = 200;
+        // The number of allowed rounds that the revoke waits for, and the
+        // longest time that it waits.
+        const ALLOWED_BEFORE: usize = CHECKERS * 10;
+        const ALLOWED_WAIT: Duration = Duration::from_secs(30);
         let (permissions, id) = granted(ALL);
         let dir = tempfile::tempdir().unwrap();
         let secret = uri("keychain://acme-postgres/prod");
@@ -770,13 +775,26 @@ mod tests {
                 });
             }
             start.wait();
-            // The revoke must run against checks that are allowed.
-            while allowed_rounds.load(Ordering::SeqCst) < CHECKERS * 10 {
+            // The revoke must run against checks that are allowed. The wait
+            // has a time limit: without it, a check that is never allowed
+            // makes the test wait with no end.
+            let deadline = Instant::now() + ALLOWED_WAIT;
+            while allowed_rounds.load(Ordering::SeqCst) < ALLOWED_BEFORE
+                && Instant::now() < deadline
+            {
                 std::thread::yield_now();
             }
-            assert!(permissions.revoke(&id));
+            let revoked = permissions.revoke(&id);
+            // Stored before each assertion: the checkers stop only after it.
             revoke_returned.store(true, Ordering::SeqCst);
+            assert!(revoked);
         });
+        let allowed = allowed_rounds.load(Ordering::SeqCst);
+        assert!(
+            allowed >= ALLOWED_BEFORE,
+            "only {allowed} of {ALLOWED_BEFORE} rounds of checks were allowed in \
+             {ALLOWED_WAIT:?} before the revoke"
+        );
         assert_no_access(&permissions, &id);
     }
 
