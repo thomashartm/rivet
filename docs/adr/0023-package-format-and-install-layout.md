@@ -16,7 +16,7 @@ Package file:
 - The archive has exactly three entries: `extension.toml`, `extension.wasm`, `LICENSE`. Each is a regular file. Every other entry name or entry type is refused.
 - The "SDK docs reference" of §4.8 is the `sdk` version range in the manifest. The package has no separate file for it.
 - Entries for native libraries are not defined. They come with the native runtime (#95).
-- The installer writes each file itself. It ignores the modes, owners and times of the archive. It counts the bytes while it copies. One entry has at most 128 MiB; the manifest and the licence have at most 1 MiB each.
+- The installer writes each file itself. It ignores the modes, owners and times of the archive. It counts the bytes while it copies. The entry `extension.wasm` has at most the component size limit of the WASM runtime (ADR-0018; one constant, so a package that installs can load). As merged with PR #134 the limit is 128 MiB; the change is not on `main` on this date. Also: the manifest and the licence have at most 1 MiB each.
 - After extraction, the id and the version of the manifest must equal the id and the version in the signature.
 
 Directories:
@@ -44,6 +44,8 @@ Directories:
 - Limits of the first version (`install.rs`, on `main` since PR #134):
   - The caller gives `<data>`. The installer does not check that it is private or outside a workspace. No function for the platform data directory exists.
   - As merged with PR #134 there is no lock, and two operations on one id at the same time can lose the active version (review finding R-69). Decision for the fix (not on `main` on this date): each operation on an id, the recovery step included, holds one exclusive lock file for this id for its whole time (`File::try_lock` of the standard library; it also works between processes). A second operation on the same id does not wait: it fails at once with a `retryable` error. The lock file is never deleted.
+  - A review that waits is kept on disk (review finding R-84, not on `main` on this date): when the installer returns that a review is needed, it writes a record with the id, the version and the added capabilities. The call that activates after the review works only for a record that matches, and it removes the record. Without a record it is refused.
+  - Two versions that differ only in build metadata are the same version (semver precedence). Such a package is not an update.
   - After the second move the change is done (review finding R-70). If the clean-up after it fails, the failure is logged, the operation returns success, and the next recovery step completes the clean-up. Before the second move, each error leaves the old version active.
   - Files are synced; the parent directory is not synced after a move. A power loss can undo the last move. The recovery step repairs the states that the journal describes.
 - The caller MUST activate a reviewed update only after the user review and the grant (to enforce in #51; no check exists).

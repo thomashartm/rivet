@@ -21,12 +21,17 @@ ADR-0003 says native plugins run in a separate extension host process. ARCHITECT
 | Environment | The environment of the engine is removed. Only these variables are copied if they are set: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ`; on Windows also `SystemRoot`, `TEMP`, `TMP`. The list is fixed in code. |
 | Error output | The standard error of the child goes to the engine log line by line at level `info`, as untrusted text with the rules of the WASM guest log (ADR-0018): own field, control characters replaced, redacted. The budget is 100 lines and 64 KiB for one request (`hello`, `activate`, `deactivate`); each request starts a new budget; the time until the next request uses the budget of the last request. Lines past the budget are read, dropped and counted; the count is written when the next budget starts and when the error output ends. |
 | Failure | A child that exits, closes its output, or sends a malformed or too large message gives an `internal` error. Outside a call, the runtime reports it through a callback, which the wiring code connects to the crash report of the host (ADR-0021). The callback is not called after an orderly drop of the instance. |
-| Cancelled call | If the caller drops a running call, the child is killed. |
+| Cancelled call | If the caller drops a running call, the child is killed. When the runtime ends a child itself (dropped call, drop of the instance), it does not call the crash callback; the host already handles that case (ADR-0021). |
 
 ## Consequences
 
 - A child lives as long as its instance. The host must drop the instance to end the process; see ADR-0021 for the shutdown.
 - A native extension that is idle for a long time and writes to its error output gets no new budget until the next request. With only lifecycle requests this means: about 100 lines for the whole time in `Active`. The first native extension point brings more requests.
+- Limits of this part, not resolved here:
+  - A native process has no memory limit and no CPU limit (§4.3 requires limits per extension). No ticket has it.
+  - The process is not sandboxed by the OS. §4.7 then requires that the install review says "runs with full user privileges"; that text is for #51 and does not exist.
+  - Nothing says yet which files of a native package the signature covers; the package format has no entry for native libraries (ADR-0023). A native extension MUST NOT ship before that is defined.
+  - The capability checks of ADR-0020 do not apply to a native process: it can open files and connections itself.
 - A crash of a native extension stops one process and one extension. Each native extension costs one process.
 - No new crate and no `unsafe` for this part.
 - A plugin that writes to its standard output breaks the control channel and is failed. The extension host program of part 3 must keep plugin output away from it.
