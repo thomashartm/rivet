@@ -146,10 +146,7 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// The name of the WASM component in a package.
-// shortcut: a second constant for this name until pull request #130 merges;
-// `wasm::COMPONENT_FILE` is then the single source, re-export it here.
-pub const COMPONENT_FILE: &str = "extension.wasm";
+pub use crate::wasm::COMPONENT_FILE;
 
 /// The name of the licence text in a package.
 pub const LICENCE_FILE: &str = "LICENSE";
