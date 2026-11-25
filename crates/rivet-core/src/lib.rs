@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod host;
 pub mod jobs;
 pub mod logging;
 pub mod registry;
