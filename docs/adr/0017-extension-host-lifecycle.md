@@ -12,7 +12,7 @@ As built (read in the code on 2026-11-25):
 | # | Topic | Behaviour |
 | --- | --- | --- |
 | a | Runtime contract | One contract: `ExtensionRuntime::load` gives an `ExtensionInstance` with `activate` and `deactivate`. To drop the instance unloads it. There is no `unload` call that can fail. |
-| b | Failed activation | The host publishes two changes: start state → `Active`, then `Active` → `Failed`. |
+| b | Failed activation | In PR #109 the host published two changes: start state → `Active`, then `Active` → `Failed`. Since PR #121 it does what the decision below says: one change, directly to `Failed`. |
 | c | Forget | The host can remove an extension in `Resolved` or `Rejected` and discover it again. These states have no loaded code. |
 | d | Concurrency | One host-wide lock. Lifecycle operations run one after the other. |
 | e | Same id in two directories | The later discovery directory wins: bundled < user < workspace. |
