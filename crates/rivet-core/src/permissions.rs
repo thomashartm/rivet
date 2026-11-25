@@ -133,11 +133,12 @@
 //! ```
 
 use rivet_sdk::error::{Error, Result};
-use rivet_sdk::manifest::{Capabilities, ClipboardAccess, ExtensionId, FilesystemAccess, Manifest};
+use rivet_sdk::manifest::{
+    Capabilities, ClipboardAccess, ExtensionId, FilesystemAccess, Manifest, same_host,
+};
 use rivet_sdk::secret::SecretUri;
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 use tracing::warn;
@@ -205,9 +206,13 @@ impl Permissions {
     ///
     /// # Errors
     ///
-    /// Returns a `policy` error if `capabilities` contains more than the
-    /// manifest requests. The grant of the extension does not change.
+    /// Returns a `user` error if `capabilities` breaks the rules of
+    /// [`Capabilities::validate`]: the constructors of the capability types
+    /// do not validate. Returns a `policy` error if `capabilities` contains
+    /// more than the manifest requests. In both cases the grant of the
+    /// extension does not change.
     pub fn grant(&self, manifest: &Manifest, capabilities: Capabilities) -> Result<()> {
+        capabilities.validate()?;
         if !added_capabilities(&manifest.capabilities, &capabilities).is_empty() {
             return Err(Error::policy(format!(
                 "the grant for the extension `{}` contains a capability that its manifest \
@@ -505,26 +510,6 @@ fn allows_network(granted: &Capabilities, host: &str, port: u16) -> bool {
         .any(|scope| same_host(&scope.host, host) && scope.ports.contains(&port))
 }
 
-fn same_host(granted: &str, requested: &str) -> bool {
-    match (ip_address(granted), ip_address(requested)) {
-        (Some(granted), Some(requested)) => granted == requested,
-        (None, None) => granted.eq_ignore_ascii_case(requested),
-        _ => false,
-    }
-}
-
-/// Parses an IP address literal. An IPv6 address can have the `[]` of a
-/// URL; an IPv4 address in brackets is not an address.
-fn ip_address(host: &str) -> Option<IpAddr> {
-    match host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    {
-        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
-        None => host.parse().ok(),
-    }
-}
-
 /// `true` if a scope with the access `have` permits the access `want`.
 fn covers(have: FilesystemAccess, want: FilesystemAccess) -> bool {
     have == FilesystemAccess::ReadWrite || want == FilesystemAccess::Read
@@ -622,6 +607,20 @@ mod tests {
         (permissions, manifest.id)
     }
 
+    /// Stores all capabilities of `manifest` as its grant without the
+    /// validation of [`Permissions::grant`]. For the tests of the checks
+    /// with a scope that `grant` refuses (defence in depth).
+    fn store_unvalidated(permissions: &Permissions, manifest: &Manifest) {
+        permissions
+            .grant(manifest, manifest.capabilities.clone())
+            .expect_err("`grant` must refuse the scope");
+        let grant = Grant {
+            requested: manifest.capabilities.clone(),
+            granted: manifest.capabilities.clone(),
+        };
+        permissions.write().insert(manifest.id.clone(), grant);
+    }
+
     fn filesystem(scopes: &[(&Path, &str)]) -> String {
         scopes
             .iter()
@@ -685,6 +684,97 @@ mod tests {
             permissions.check_clipboard(extension, ClipboardAccess::Write),
             &[id, "clipboard", "write"],
         );
+    }
+
+    // R-85: the constructors of the capability types do not validate, so
+    // the grant is the check.
+    #[test]
+    fn grant_refuses_a_capability_that_the_manifest_validation_refuses() {
+        let cases = [
+            (
+                Capabilities::new().with_network([NetworkScope::new("evil host/..", [5432])]),
+                "capabilities.network[0].host",
+            ),
+            (
+                Capabilities::new().with_network([NetworkScope::new("db.example.com", [0])]),
+                "must not contain port 0",
+            ),
+            (
+                Capabilities::new().with_filesystem([FilesystemScope::new(
+                    "/data/../etc",
+                    FilesystemAccess::Read,
+                )]),
+                "capabilities.filesystem[0].path",
+            ),
+            (
+                Capabilities::new().with_secrets(["keychain://prod".to_owned()]),
+                "capabilities.secrets[0]",
+            ),
+            (
+                Capabilities::new().with_clipboard([ClipboardAccess::Read, ClipboardAccess::Read]),
+                "capabilities.clipboard[1]",
+            ),
+        ];
+        for (capabilities, part) in cases {
+            // The fields of a parsed manifest are public: this manifest
+            // requests the invalid capabilities.
+            let mut manifest = manifest("");
+            manifest.capabilities = capabilities.clone();
+            let permissions = Permissions::new();
+            let error = permissions.grant(&manifest, capabilities).unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+            assert!(error.message().contains(part), "no {part} in: {error}");
+            assert_no_access(&permissions, &manifest.id);
+        }
+    }
+
+    // R-85: the two values of the review finding give no access.
+    #[test]
+    fn an_invalid_host_and_port_0_are_not_granted() {
+        let capabilities =
+            Capabilities::new().with_network([NetworkScope::new("evil host/..", [0])]);
+        let mut manifest = manifest("");
+        manifest.capabilities = capabilities.clone();
+        let permissions = Permissions::new();
+        assert!(permissions.grant(&manifest, capabilities).is_err());
+        assert_denied(
+            permissions.check_network(&manifest.id, "evil host/..", 0),
+            &["network"],
+        );
+    }
+
+    // R-85: a refused grant does not change the grant that the extension has.
+    #[test]
+    fn a_refused_invalid_grant_keeps_the_current_grant() {
+        let (permissions, extension) = granted(ALL);
+        let mut manifest = manifest(ALL);
+        manifest.capabilities.network[0].ports.push(0);
+        let error = permissions
+            .grant(&manifest, manifest.capabilities.clone())
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        permissions
+            .check_network(&extension, "db.example.com", 5432)
+            .unwrap();
+    }
+
+    // R-85: valid values from the constructors are granted.
+    #[test]
+    fn grant_accepts_valid_capabilities_from_the_constructors() {
+        let capabilities = Capabilities::new()
+            .with_network([NetworkScope::new("db.example.com", [5432])])
+            .with_filesystem([FilesystemScope::new("/", FilesystemAccess::ReadWrite)])
+            .with_secrets(["acme-postgres".to_owned()])
+            .with_clipboard([ClipboardAccess::Read, ClipboardAccess::Write]);
+        let manifest = manifest(ALL);
+        let permissions = Permissions::new();
+        permissions.grant(&manifest, capabilities).unwrap();
+        permissions
+            .check_network(&manifest.id, "db.example.com", 5432)
+            .unwrap();
+        permissions
+            .check_clipboard(&manifest.id, ClipboardAccess::Write)
+            .unwrap();
     }
 
     #[test]
@@ -1037,8 +1127,8 @@ mod tests {
         assert_eq!(root(dir.path().to_str().unwrap()).unwrap(), dir.path());
     }
 
-    /// Defence in depth: `Manifest::parse` can reject these scope paths, so
-    /// they are set after the parse.
+    /// Defence in depth: `Manifest::parse` and `grant` reject these scope
+    /// paths, so they are set after the parse and stored without `grant`.
     #[test]
     fn a_relative_scope_path_or_one_with_a_parent_component_grants_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1052,9 +1142,7 @@ mod tests {
             let mut manifest = manifest(&filesystem(&[(Path::new("/"), "read")]));
             manifest.capabilities.filesystem[0].path.clone_from(&scope);
             let permissions = Permissions::with_home(Some(home.clone()));
-            permissions
-                .grant(&manifest, manifest.capabilities.clone())
-                .unwrap();
+            store_unvalidated(&permissions, &manifest);
             for path in [dir.path().join("relative"), home.join("file")] {
                 assert_denied(
                     permissions.check_filesystem(&manifest.id, &path, FilesystemAccess::Read),
@@ -1254,8 +1342,9 @@ mod tests {
     }
 
     /// ADR-0020: the form `scheme://...` is reserved for a later per-scheme
-    /// namespace. Until then it grants nothing. `Manifest::parse` rejects
-    /// such a namespace, so it is set after the parse (defence in depth).
+    /// namespace. Until then it grants nothing. `Manifest::parse` and
+    /// `grant` reject such a namespace, so it is set after the parse and
+    /// stored without `grant` (defence in depth).
     #[test]
     fn a_secret_namespace_with_a_scheme_grants_nothing() {
         let mut manifest = manifest("[capabilities]\nsecrets = [\"other\"]\n");
@@ -1263,9 +1352,7 @@ mod tests {
             .map(str::to_owned)
             .into();
         let permissions = Permissions::new();
-        permissions
-            .grant(&manifest, manifest.capabilities.clone())
-            .unwrap();
+        store_unvalidated(&permissions, &manifest);
         let id = manifest.id;
         for denied in [
             "aws-sm://prod/password",
@@ -1358,21 +1445,30 @@ mod tests {
         );
     }
 
-    /// R-28a: a host without ports gives no access now, but it is not in
-    /// the manifest.
+    /// R-28a: a host without ports gives no access, but a host that is not
+    /// in the manifest is an addition. R-85: `grant` refuses a host without
+    /// ports as invalid, also a host of the manifest.
     #[test]
     fn a_grant_cannot_contain_a_host_that_the_manifest_does_not_request() {
         let requested = manifest(REQUESTED);
         let permissions = Permissions::new();
         let host_without_ports =
             |host: &str| Capabilities::new().with_network([NetworkScope::new(host, [])]);
+        let other = host_without_ports("other.example.com");
+        assert_eq!(added_capabilities(&requested.capabilities, &other), other);
+        let same = host_without_ports("DB.example.com");
+        assert!(added_capabilities(&requested.capabilities, &same).is_empty());
+        for capabilities in [other, same] {
+            let error = permissions.grant(&requested, capabilities).unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        }
         let error = permissions
-            .grant(&requested, host_without_ports("other.example.com"))
+            .grant(
+                &requested,
+                Capabilities::new().with_network([NetworkScope::new("other.example.com", [5432])]),
+            )
             .unwrap_err();
-        assert_eq!(error.category(), ErrorCategory::Policy);
-        permissions
-            .grant(&requested, host_without_ports("DB.example.com"))
-            .unwrap();
+        assert_eq!(error.category(), ErrorCategory::Policy, "{error}");
         assert_no_access(&permissions, &requested.id);
     }
 
