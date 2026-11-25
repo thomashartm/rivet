@@ -174,7 +174,7 @@ impl Permissions {
     /// Returns a `policy` error if `capabilities` contains more than the
     /// manifest requests. The grant of the extension does not change.
     pub fn grant(&self, manifest: &Manifest, capabilities: Capabilities) -> Result<()> {
-        if added_capabilities(&manifest.capabilities, &capabilities) != Capabilities::default() {
+        if !added_capabilities(&manifest.capabilities, &capabilities).is_empty() {
             return Err(Error::policy(format!(
                 "the grant for the extension `{}` contains a capability that its manifest \
                  does not request",
@@ -215,7 +215,7 @@ impl Permissions {
             return manifest.capabilities.clone();
         };
         let added = added_capabilities(&grant.requested, &manifest.capabilities);
-        if added == Capabilities::default() {
+        if added.is_empty() {
             grant.requested = manifest.capabilities.clone();
             cut_to(&mut grant.granted, &manifest.capabilities);
         } else {
@@ -341,8 +341,8 @@ impl Permissions {
 }
 
 /// Returns the capabilities in `requested` that `granted` does not cover.
-/// The result is empty (equal to `Capabilities::default()`) if `requested`
-/// adds nothing.
+/// The result is empty ([`Capabilities::is_empty`]) if `requested` adds
+/// nothing.
 ///
 /// Use it for the update review (§4.7): `granted` is the grant or the
 /// capabilities of the installed version, `requested` is the capabilities of
@@ -562,6 +562,7 @@ mod tests {
     use super::*;
     use crate::logging::{Capture, Level, LogFormat, Redactor};
     use rivet_sdk::error::ErrorCategory;
+    use rivet_sdk::manifest::{FilesystemScope, NetworkScope};
     use std::fs;
     use tracing::dispatcher::with_default;
 
@@ -1096,18 +1097,22 @@ mod tests {
     fn a_grant_cannot_contain_more_than_the_manifest_requests() {
         let requested = manifest(REQUESTED);
         let permissions = Permissions::new();
+        let network = |host: &str, ports: Vec<u16>| {
+            Capabilities::new().with_network([NetworkScope::new(host, ports)])
+        };
+        let filesystem = |path: &str, access| {
+            Capabilities::new().with_filesystem([FilesystemScope::new(path, access)])
+        };
         for more in [
-            "[capabilities]\nsecrets = [\"aws\"]\n",
-            "[capabilities]\nclipboard = [\"write\"]\n",
-            "[[capabilities.network]]\nhost = \"db.example.com\"\nports = [5432, 22]\n",
-            "[[capabilities.network]]\nhost = \"other.example.com\"\nports = [5432]\n",
-            "[[capabilities.filesystem]]\npath = \"~/.postgresql\"\naccess = \"read-write\"\n",
-            "[[capabilities.filesystem]]\npath = \"~\"\naccess = \"read\"\n",
+            Capabilities::new().with_secrets(["aws".to_owned()]),
+            Capabilities::new().with_clipboard([ClipboardAccess::Write]),
+            network("db.example.com", vec![5432, 22]),
+            network("other.example.com", vec![5432]),
+            filesystem("~/.postgresql", FilesystemAccess::ReadWrite),
+            filesystem("~", FilesystemAccess::Read),
         ] {
-            let error = permissions
-                .grant(&requested, manifest(more).capabilities)
-                .unwrap_err();
-            assert_eq!(error.category(), ErrorCategory::Policy, "{more}");
+            let error = permissions.grant(&requested, more.clone()).unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::Policy, "{more:?}");
             assert!(error.message().contains("acme.postgres"), "{error}");
         }
         assert_no_access(&permissions, &requested.id);
@@ -1116,7 +1121,7 @@ mod tests {
         permissions
             .grant(
                 &requested,
-                manifest("[capabilities]\nclipboard = [\"read\"]\n").capabilities,
+                Capabilities::new().with_clipboard([ClipboardAccess::Read]),
             )
             .unwrap();
         permissions
@@ -1138,14 +1143,8 @@ mod tests {
     fn a_grant_cannot_contain_a_host_that_the_manifest_does_not_request() {
         let requested = manifest(REQUESTED);
         let permissions = Permissions::new();
-        let host_without_ports = |host: &str| {
-            let mut capabilities = manifest(&format!(
-                "[[capabilities.network]]\nhost = \"{host}\"\nports = [1]\n"
-            ))
-            .capabilities;
-            capabilities.network[0].ports.clear();
-            capabilities
-        };
+        let host_without_ports =
+            |host: &str| Capabilities::new().with_network([NetworkScope::new(host, [])]);
         let error = permissions
             .grant(&requested, host_without_ports("other.example.com"))
             .unwrap_err();
@@ -1159,12 +1158,9 @@ mod tests {
     #[test]
     fn added_capabilities_lists_what_the_grant_does_not_cover() {
         let old = manifest(REQUESTED).capabilities;
-        assert_eq!(added_capabilities(&old, &old), Capabilities::default());
-        assert_eq!(
-            added_capabilities(&old, &Capabilities::default()),
-            Capabilities::default()
-        );
-        assert_eq!(added_capabilities(&Capabilities::default(), &old), old);
+        assert!(added_capabilities(&old, &old).is_empty());
+        assert!(added_capabilities(&old, &Capabilities::new()).is_empty());
+        assert_eq!(added_capabilities(&Capabilities::new(), &old), old);
 
         let new = manifest(
             r#"
@@ -1208,7 +1204,7 @@ mod tests {
         .capabilities;
         assert_eq!(added_capabilities(&old, &new), expected);
         // The new version requests less: nothing is added.
-        assert_eq!(added_capabilities(&new, &old), Capabilities::default());
+        assert!(added_capabilities(&new, &old).is_empty());
     }
 
     #[test]
@@ -1222,7 +1218,7 @@ mod tests {
         assert_eq!(added.network[0].host, "replica.example.com");
         let mut rest = added.clone();
         rest.network.clear();
-        assert_eq!(rest, Capabilities::default());
+        assert!(rest.is_empty());
         assert_no_access(&permissions, &id);
 
         // Without a grant, the review lists all capabilities.
@@ -1233,17 +1229,14 @@ mod tests {
     #[test]
     fn an_update_that_adds_nothing_keeps_the_grant() {
         let (permissions, id) = granted(REQUESTED);
-        assert_eq!(
-            permissions.review_update(&manifest(REQUESTED)),
-            Capabilities::default()
-        );
+        assert!(permissions.review_update(&manifest(REQUESTED)).is_empty());
         permissions
             .check_network(&id, "db.example.com", 5432)
             .unwrap();
 
         // The new version requests less: the grant follows.
         let less = manifest("[capabilities]\nclipboard = [\"read\"]\n");
-        assert_eq!(permissions.review_update(&less), Capabilities::default());
+        assert!(permissions.review_update(&less).is_empty());
         permissions
             .check_clipboard(&id, ClipboardAccess::Read)
             .unwrap();
@@ -1261,15 +1254,12 @@ mod tests {
             "[capabilities]\nsecrets = [\"acme-postgres\"]\nclipboard = [\"read\", \"write\"]\n";
         let requested = manifest(REQUEST);
         let id = &requested.id;
-        let partial = || manifest("[capabilities]\nsecrets = [\"acme-postgres\"]\n").capabilities;
+        let partial = || Capabilities::new().with_secrets(["acme-postgres".to_owned()]);
         let secret = uri("keychain://acme-postgres/prod");
         let permissions = Permissions::new();
         permissions.grant(&requested, partial()).unwrap();
 
-        assert_eq!(
-            permissions.review_update(&requested),
-            Capabilities::default()
-        );
+        assert!(permissions.review_update(&requested).is_empty());
         permissions.check_secret(id, &secret).unwrap();
         // The review does not grant what the user did not grant.
         assert_denied(
@@ -1282,14 +1272,14 @@ mod tests {
             manifest(&REQUEST.replace("[\"acme-postgres\"]", "[\"acme-postgres\", \"aws\"]"));
         assert_eq!(
             permissions.review_update(&more),
-            manifest("[capabilities]\nsecrets = [\"aws\"]\n").capabilities
+            Capabilities::new().with_secrets(["aws".to_owned()])
         );
         assert_no_access(&permissions, id);
 
         // The new version requests less: the partial grant is cut.
         permissions.grant(&requested, partial()).unwrap();
         let less = manifest("[capabilities]\nclipboard = [\"read\", \"write\"]\n");
-        assert_eq!(permissions.review_update(&less), Capabilities::default());
+        assert!(permissions.review_update(&less).is_empty());
         assert_no_access(&permissions, id);
         // The cut request is the base of the next review.
         assert_eq!(permissions.review_update(&requested), partial());
@@ -1300,10 +1290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (permissions, id) = granted(&filesystem(&[(dir.path(), "read-write")]));
         let read_only = manifest(&filesystem(&[(dir.path(), "read")]));
-        assert_eq!(
-            permissions.review_update(&read_only),
-            Capabilities::default()
-        );
+        assert!(permissions.review_update(&read_only).is_empty());
         permissions
             .check_filesystem(&id, dir.path(), FilesystemAccess::Read)
             .unwrap();

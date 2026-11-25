@@ -151,24 +151,13 @@ impl DatabaseFixture {
         let user = ExtensionValue::Text(TEST_USER.to_owned());
         auth.settings.insert("user".to_owned(), user);
         Self {
-            profile: ConnectionProfile {
-                engine: ProviderRef::new(engine),
-                endpoint: Endpoint {
-                    host: HOST.to_owned(),
-                    port: Some(port),
-                    database: Some(DATABASE.to_owned()),
-                },
+            profile: ConnectionProfile::new(
+                ProviderRef::new(engine),
+                Endpoint::new(HOST).with_port(port).with_database(DATABASE),
                 auth,
-                credential_source: None,
-                tunnels: Vec::new(),
-                tls: TlsSettings {
-                    enabled: false,
-                    ..TlsSettings::default()
-                },
-                read_only: false,
-                confirm_on_write: false,
-                environment: Some("test".to_owned()),
-            },
+            )
+            .with_tls(TlsSettings::new().with_enabled(false))
+            .with_environment("test"),
             user: TEST_USER.to_owned(),
             password: Secret::from(TEST_ONLY_PASSWORD.to_owned()),
         }

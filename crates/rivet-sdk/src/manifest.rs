@@ -254,6 +254,7 @@ impl fmt::Display for ExtensionId {
 /// `auth-provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ExtensionPoint {
     /// Connects to a database and runs statements.
     Driver,
@@ -307,6 +308,26 @@ pub struct Contribution {
     pub id: String,
 }
 
+impl Contribution {
+    /// Creates a contribution.
+    ///
+    /// The id is not validated here. [`Manifest::parse`] validates the
+    /// contributions of a manifest.
+    ///
+    /// ```
+    /// use rivet_sdk::manifest::{Contribution, ExtensionPoint};
+    ///
+    /// let contribution = Contribution::new(ExtensionPoint::Driver, "postgres");
+    /// assert_eq!(contribution.id, "postgres");
+    /// ```
+    pub fn new(kind: ExtensionPoint, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+        }
+    }
+}
+
 /// An event that activates an extension (§4.4): an `[[activation]]` table.
 /// The field `on` selects the event.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -340,7 +361,30 @@ pub struct NetworkScope {
     pub ports: Vec<u16>,
 }
 
+impl NetworkScope {
+    /// Creates a scope for `ports` on `host`.
+    ///
+    /// The values are not validated here. [`Manifest::parse`] validates the
+    /// scopes of a manifest.
+    ///
+    /// ```
+    /// use rivet_sdk::manifest::NetworkScope;
+    ///
+    /// let scope = NetworkScope::new("db.example.com", [5432]);
+    /// assert_eq!(scope.ports, [5432]);
+    /// ```
+    pub fn new(host: impl Into<String>, ports: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            host: host.into(),
+            ports: ports.into_iter().collect(),
+        }
+    }
+}
+
 /// The access an extension has to a filesystem path.
+///
+/// This enum is exhaustive on purpose: it decides a permission. A new variant
+/// is a breaking change of the SDK, so the core cannot ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilesystemAccess {
@@ -361,7 +405,30 @@ pub struct FilesystemScope {
     pub access: FilesystemAccess,
 }
 
+impl FilesystemScope {
+    /// Creates a scope for `path` with `access`.
+    ///
+    /// The values are not validated here. [`Manifest::parse`] validates the
+    /// scopes of a manifest.
+    ///
+    /// ```
+    /// use rivet_sdk::manifest::{FilesystemAccess, FilesystemScope};
+    ///
+    /// let scope = FilesystemScope::new("~/.postgresql", FilesystemAccess::Read);
+    /// assert_eq!(scope.access, FilesystemAccess::Read);
+    /// ```
+    pub fn new(path: impl Into<String>, access: FilesystemAccess) -> Self {
+        Self {
+            path: path.into(),
+            access,
+        }
+    }
+}
+
 /// The access an extension has to the clipboard.
+///
+/// This enum is exhaustive on purpose: it decides a permission. A new variant
+/// is a breaking change of the SDK, so the core cannot ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClipboardAccess {
@@ -385,6 +452,74 @@ pub struct Capabilities {
     pub secrets: Vec<String>,
     /// The clipboard operations the extension may do.
     pub clipboard: Vec<ClipboardAccess>,
+}
+
+impl Capabilities {
+    /// Creates capabilities that require nothing. Add scopes with the
+    /// `with_*` methods.
+    ///
+    /// The values are not validated here. [`Manifest::parse`] validates the
+    /// capabilities of a manifest.
+    ///
+    /// ```
+    /// use rivet_sdk::manifest::{Capabilities, ClipboardAccess, NetworkScope};
+    ///
+    /// assert!(Capabilities::new().is_empty());
+    ///
+    /// let capabilities = Capabilities::new()
+    ///     .with_network([NetworkScope::new("db.example.com", [5432])])
+    ///     .with_secrets(["keychain://prod".to_owned()])
+    ///     .with_clipboard([ClipboardAccess::Write]);
+    /// assert!(!capabilities.is_empty());
+    /// assert_eq!(capabilities.network[0].host, "db.example.com");
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the hosts and ports the extension may connect to.
+    #[must_use]
+    pub fn with_network(mut self, network: impl IntoIterator<Item = NetworkScope>) -> Self {
+        self.network = network.into_iter().collect();
+        self
+    }
+
+    /// Sets the paths the extension may access.
+    #[must_use]
+    pub fn with_filesystem(
+        mut self,
+        filesystem: impl IntoIterator<Item = FilesystemScope>,
+    ) -> Self {
+        self.filesystem = filesystem.into_iter().collect();
+        self
+    }
+
+    /// Sets the secret namespaces the extension may read.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: impl IntoIterator<Item = String>) -> Self {
+        self.secrets = secrets.into_iter().collect();
+        self
+    }
+
+    /// Sets the clipboard operations the extension may do.
+    #[must_use]
+    pub fn with_clipboard(mut self, clipboard: impl IntoIterator<Item = ClipboardAccess>) -> Self {
+        self.clipboard = clipboard.into_iter().collect();
+        self
+    }
+
+    /// Returns `true` if no capability is required: all lists are empty.
+    pub fn is_empty(&self) -> bool {
+        // The pattern has no `..`: a new field does not compile until it is
+        // added here.
+        let Self {
+            network,
+            filesystem,
+            secrets,
+            clipboard,
+        } = self;
+        network.is_empty() && filesystem.is_empty() && secrets.is_empty() && clipboard.is_empty()
+    }
 }
 
 /// A parsed and validated `extension.toml` (§4.4).

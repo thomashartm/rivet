@@ -70,6 +70,7 @@ pub trait ByteStream: Send + Sync {
 
 /// What a [`Driver`] reports about the SQL dialect of its database.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Dialect {
     /// The name of the dialect, for example `postgresql`.
     pub name: String,
@@ -80,7 +81,33 @@ pub struct Dialect {
     pub extensions: ExtensionFields,
 }
 
+impl Dialect {
+    /// Creates a dialect with no extension fields.
+    ///
+    /// ```
+    /// use rivet_sdk::extension::Dialect;
+    ///
+    /// let dialect = Dialect::new("postgresql", '"');
+    /// assert!(dialect.extensions.is_empty());
+    /// ```
+    pub fn new(name: impl Into<String>, identifier_quote: char) -> Self {
+        Self {
+            name: name.into(),
+            identifier_quote,
+            extensions: ExtensionFields::new(),
+        }
+    }
+
+    /// Sets the details that only some clients of the driver understand.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: ExtensionFields) -> Self {
+        self.extensions = extensions;
+        self
+    }
+}
+
 /// The input of [`Driver::connect`].
+#[non_exhaustive]
 pub struct ConnectRequest {
     /// The profile of the database. The driver uses `engine`, `endpoint`
     /// and `tls`.
@@ -90,6 +117,40 @@ pub struct ConnectRequest {
     /// The stream from the last [`TunnelProvider`] of the profile. `None`
     /// means the driver opens the network connection itself.
     pub transport: Option<Box<dyn ByteStream>>,
+}
+
+impl ConnectRequest {
+    /// Creates a request with no transport: the driver opens the network
+    /// connection itself.
+    ///
+    /// ```
+    /// use rivet_sdk::extension::{ConnectRequest, Credential, Credentials};
+    /// use rivet_sdk::model::{ConnectionProfile, Endpoint, ProviderRef};
+    /// use rivet_sdk::secret::Secret;
+    ///
+    /// let profile = ConnectionProfile::new(
+    ///     ProviderRef::new("postgres"),
+    ///     Endpoint::new("db.example.com"),
+    ///     ProviderRef::new("password"),
+    /// );
+    /// let password = Credential::Password(Secret::from("example".to_owned()));
+    /// let request = ConnectRequest::new(profile, Credentials::new(password).with_user("app"));
+    /// assert!(request.transport.is_none());
+    /// ```
+    pub fn new(profile: ConnectionProfile, credentials: Credentials) -> Self {
+        Self {
+            profile,
+            credentials,
+            transport: None,
+        }
+    }
+
+    /// Sets the stream from the last tunnel of the profile.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Box<dyn ByteStream>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
 }
 
 /// The contract of [`ExtensionPoint::Driver`]: connects to a database and
@@ -135,6 +196,7 @@ pub enum Credential {
 
 /// The credentials for one connection attempt.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Credentials {
     /// The database user. `None` if the credential names the user itself.
     pub user: Option<String>,
@@ -145,8 +207,34 @@ pub struct Credentials {
     pub expires_at: Option<SystemTime>,
 }
 
+impl Credentials {
+    /// Creates credentials with no user and no expiry.
+    pub fn new(credential: Credential) -> Self {
+        Self {
+            user: None,
+            credential,
+            expires_at: None,
+        }
+    }
+
+    /// Sets the database user.
+    #[must_use]
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
+    /// Sets the time after which the credentials are not valid.
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: SystemTime) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+}
+
 /// The input of [`AuthProvider::credentials`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct AuthRequest {
     /// The profile of the database. The auth provider uses `auth` and
     /// `endpoint`.
@@ -154,6 +242,23 @@ pub struct AuthRequest {
     /// The identity from the [`CredentialSource`] of the profile, if the
     /// profile has one.
     pub identity: Option<Identity>,
+}
+
+impl AuthRequest {
+    /// Creates a request with no identity.
+    pub fn new(profile: ConnectionProfile) -> Self {
+        Self {
+            profile,
+            identity: None,
+        }
+    }
+
+    /// Sets the identity from the credential source of the profile.
+    #[must_use]
+    pub fn with_identity(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
 }
 
 /// The contract of [`ExtensionPoint::AuthProvider`]: produces the
@@ -167,6 +272,7 @@ pub trait AuthProvider: Send + Sync {
 /// An identity that a [`CredentialSource`] resolved. The SDK does not
 /// interpret the content. The auth provider that uses the identity does.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Identity {
     /// The name of the identity, for example an account or a role.
     pub principal: String,
@@ -179,6 +285,49 @@ pub struct Identity {
     pub expires_at: Option<SystemTime>,
 }
 
+impl Identity {
+    /// Creates an identity with no attributes, no secrets and no expiry.
+    ///
+    /// ```
+    /// use rivet_sdk::extension::Identity;
+    /// use rivet_sdk::secret::Secret;
+    ///
+    /// let secrets = [("token".to_owned(), Secret::from("example".to_owned()))];
+    /// let identity = Identity::new("role/reader").with_secrets(secrets.into());
+    /// assert_eq!(identity.principal, "role/reader");
+    /// assert!(identity.expires_at.is_none());
+    /// ```
+    pub fn new(principal: impl Into<String>) -> Self {
+        Self {
+            principal: principal.into(),
+            attributes: ExtensionFields::new(),
+            secrets: BTreeMap::new(),
+            expires_at: None,
+        }
+    }
+
+    /// Sets the parts of the identity that are not secret.
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: ExtensionFields) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    /// Sets the secret parts of the identity.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: BTreeMap<String, Secret>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// Sets the time after which the identity is not valid.
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: SystemTime) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+}
+
 /// The contract of [`ExtensionPoint::CredentialSource`]: resolves an
 /// identity.
 pub trait CredentialSource: Send + Sync {
@@ -189,6 +338,7 @@ pub trait CredentialSource: Send + Sync {
 }
 
 /// The input of [`TunnelProvider::open`].
+#[non_exhaustive]
 pub struct TunnelRequest {
     /// The tunnel entry of the profile, with its settings.
     pub tunnel: ProviderRef,
@@ -199,6 +349,34 @@ pub struct TunnelRequest {
     /// The stream from the tunnel before this one in the profile. `None`
     /// means this tunnel opens its own network connection.
     pub transport: Option<Box<dyn ByteStream>>,
+}
+
+impl TunnelRequest {
+    /// Creates a request with no transport: the tunnel opens its own network
+    /// connection.
+    ///
+    /// ```
+    /// use rivet_sdk::extension::TunnelRequest;
+    /// use rivet_sdk::model::ProviderRef;
+    ///
+    /// let request = TunnelRequest::new(ProviderRef::new("ssh"), "db.internal", 5432);
+    /// assert!(request.transport.is_none());
+    /// ```
+    pub fn new(tunnel: ProviderRef, target_host: impl Into<String>, target_port: u16) -> Self {
+        Self {
+            tunnel,
+            target_host: target_host.into(),
+            target_port,
+            transport: None,
+        }
+    }
+
+    /// Sets the stream from the tunnel before this one in the profile.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Box<dyn ByteStream>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
 }
 
 /// The contract of [`ExtensionPoint::TunnelProvider`]: opens a byte stream
@@ -289,6 +467,7 @@ pub enum ArgumentType {
 
 /// One argument of a [`Signature`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Argument {
     /// The name of the argument.
     pub name: String,
@@ -300,10 +479,34 @@ pub struct Argument {
     pub required: bool,
 }
 
+impl Argument {
+    /// Creates an argument that the caller can omit.
+    pub fn new(
+        name: impl Into<String>,
+        summary: impl Into<String>,
+        value_type: ArgumentType,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            summary: summary.into(),
+            value_type,
+            required: false,
+        }
+    }
+
+    /// Sets `required`. `true` means the caller must give the argument.
+    #[must_use]
+    pub fn with_required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+}
+
 /// The name and the typed arguments of a [`CliCommand`] or an
 /// [`ApiEndpoint`]. The host uses it to register the contribution and to
 /// validate the arguments before the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Signature {
     /// The name of the subcommand or of the control API method.
     pub name: String,
@@ -311,6 +514,33 @@ pub struct Signature {
     pub summary: String,
     /// The arguments.
     pub arguments: Vec<Argument>,
+}
+
+impl Signature {
+    /// Creates a signature with no arguments.
+    ///
+    /// ```
+    /// use rivet_sdk::extension::{Argument, ArgumentType, Signature};
+    ///
+    /// let signature = Signature::new("export", "Exports a table to a file.").with_arguments([
+    ///     Argument::new("table", "The table to export.", ArgumentType::Text).with_required(true),
+    /// ]);
+    /// assert!(signature.arguments[0].required);
+    /// ```
+    pub fn new(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            summary: summary.into(),
+            arguments: Vec::new(),
+        }
+    }
+
+    /// Sets the arguments.
+    #[must_use]
+    pub fn with_arguments(mut self, arguments: impl IntoIterator<Item = Argument>) -> Self {
+        self.arguments = arguments.into_iter().collect();
+        self
+    }
 }
 
 /// The contract of [`ExtensionPoint::CliCommand`]: a CLI subcommand with
