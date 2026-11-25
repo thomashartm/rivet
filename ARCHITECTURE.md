@@ -2,7 +2,7 @@
 
 This document defines the core architecture of the database client described in [MISSION.md](MISSION.md). Constraints use the keywords MUST, MUST NOT, SHOULD and MAY as defined in RFC 2119 (see [§10](#10-architectural-governance)).
 
-Accepted decisions are recorded as ADRs in [`docs/adr/`](docs/adr/) and listed in [Decisions](#decisions).
+Decisions are recorded as ADRs in [`docs/adr/`](docs/adr/) and listed in [Decisions](#decisions).
 
 ## 1. Architectural Principles
 
@@ -127,9 +127,11 @@ flowchart TB
 | `rivet-cli` / `-daemon` / `-proxy` | yes | yes | no | yes | no¹ | no |
 | `rivet-ui-shell` | yes | yes | yes | no² | no | — |
 | `rivet-ui-ext-*` | yes | yes | yes | no | no | no |
+| `rivet-testkit`³ | yes | yes | no | yes | no | no |
 
 ¹ Binaries bundle built-in extensions as packaged artifacts loaded through the extension host, not as Rust dependencies.
 ² The in-process desktop build links `rivet-core` only in the binary crate that wires the `EngineClient`, never in `rivet-ui-shell` itself.
+³ Proposed, [ADR-0016](docs/adr/0016-testkit-dependency-rule.md). A crate MAY depend on `rivet-testkit` only as a dev-dependency. `rivet-sdk`, `rivet-engine-api` and `rivet-core` MUST NOT depend on it in any kind. For all other pairs, the table applies to normal, build and dev dependencies alike.
 
 ### 3.3 Rules
 
@@ -140,7 +142,7 @@ flowchart TB
 - UI components MUST NOT open database, cloud or network connections. All data comes through the Engine API.
 - Boundaries MUST be enforced in CI:
   - an `xtask check-arch` step validates the table in §3.2 against `cargo metadata` ([ADR-0010](docs/adr/0010-architecture-check.md));
-  - `cargo-deny` checks licences, advisories and banned crates;
+  - `cargo-deny` checks licences, advisories and banned crates. Dependencies MUST have a permissive licence from the allow list in `deny.toml`; the project licence is not decided ([ADR-0012](docs/adr/0012-project-licence-open.md));
   - extension manifests are validated for undeclared dependencies.
 
 ## 4. Extension Architecture
@@ -152,6 +154,7 @@ flowchart TB
 - The SDK ships in two bindings that describe the same contracts:
   - WIT interfaces for WASM components;
   - a stable C ABI header plus a Rust wrapper for native plugins.
+- The WIT interfaces are delivered with the WASM runtime and the C ABI header with the native runtime. The WIT interface of an extension point is added with the first extension that uses it ([ADR-0013](docs/adr/0013-sdk-bindings-delivery.md)). Until then the Rust trait in `rivet-sdk` is the only definition of the contract.
 - SDK documentation and examples are part of the SDK release.
 
 ### 4.2 Extension Points
@@ -208,6 +211,10 @@ stateDiagram-v2
     Inactive --> [*]: unload
 ```
 
+- As built, the extension host differs from this diagram in two points ([ADR-0017](docs/adr/0017-extension-host-lifecycle.md), Proposed):
+  - a failed activation is published as two changes, start state → `Active` → `Failed`;
+  - an extension in `Resolved` or `Rejected` can be removed and discovered again.
+- As built, if two discovery directories contain the same extension id, the later directory wins: bundled < user < workspace. ADR-0017 proposes to limit this when signature checks exist.
 - Hot reload = deactivate, unload, load new version, activate. Open handles of the old version MUST be closed or migrated before unload.
 
 ### 4.5 Dependency Resolution and Compatibility
@@ -343,10 +350,12 @@ Shutdown order:
 - Layers: default → user → workspace → connection. A lower layer overrides a higher one per key.
 - Configuration files MUST carry a `schema_version` and are migrated forward on load.
 - Configuration as code: profiles and policies MUST be plain, diffable files with no secrets. They reference secrets by URI: `keychain://…`, `aws-sm://…`, `gcp-sm://…` ([ADR-0008](docs/adr/0008-manifest-and-secret-uris.md)).
+- A secret URI has the form `<scheme>://<path>`. Any well-formed lowercase scheme parses, because extensions add secret backends. A scheme without a registered backend fails when the secret is resolved.
 
 ### 6.4 Credential and Secret Storage
 
 - Credentials MUST be stored only in the OS keychain or a cloud secret manager. They MUST NOT be stored in configuration, history, logs or caches.
+- The OS keychain backend is built in on macOS and Windows. On Linux it is an optional build feature ([ADR-0014](docs/adr/0014-keychain-optional-on-linux.md)). Without it, resolving a `keychain://` URI on Linux fails with a clear error.
 - In memory, secrets SHOULD be held in zeroizing types and dropped as soon as the connection attempt ends.
 
 ### 6.5 Caching and Invalidation
@@ -450,7 +459,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | Security and isolation | Every extension runs with only its granted capabilities. No secret appears in logs, history or config. Verified by tests. |
 | Portability | Windows, macOS and Linux (X11 and Wayland) on x86_64 and aarch64. |
 | Extensibility and compatibility | An extension built against SDK 1.x runs on every engine with SDK 1.y, y ≥ x. Checked by API compatibility tools. |
-| Maintainability and testability | Each extension is testable with `rivet-testkit` without a real engine. Integration tests run against real PostgreSQL and MySQL containers. |
+| Maintainability and testability | Each extension is testable with `rivet-testkit` without a real engine. Integration tests run against real PostgreSQL and MySQL containers, started locally with Docker Compose ([ADR-0015](docs/adr/0015-integration-test-databases.md)). |
 
 ## 10. Architectural Governance
 
@@ -484,7 +493,13 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 5 | Local persistence | SQLite for history, metadata cache and audit log | [0005](docs/adr/0005-local-persistence.md) |
 | 6 | Extension signing | minisign | [0006](docs/adr/0006-extension-signing.md) |
 | 7 | Scripting | Adapter framework for multiple languages; Rhai first | [0007](docs/adr/0007-scripting-adapters.md) |
-| 8 | Manifest and secret URIs | `extension.toml`; `keychain://`, `aws-sm://`, `gcp-sm://` | [0008](docs/adr/0008-manifest-and-secret-uris.md) |
+| 8 | Manifest and secret URIs | `extension.toml`; `keychain://`, `aws-sm://`, `gcp-sm://`; extensions add schemes | [0008](docs/adr/0008-manifest-and-secret-uris.md) |
 | 9 | Crate layout | `rivet-*` crates as in §3.1 | [0009](docs/adr/0009-crate-layout.md) |
 | 10 | Architecture check tool | `xtask check-arch` reading `cargo metadata` | [0010](docs/adr/0010-architecture-check.md) |
 | 11 | Control API token scopes | `read-only`, `run-queries`, `manage-tunnels` | [0011](docs/adr/0011-control-api-token-scopes.md) |
+| 12 | Project licence | Not decided; dependencies permissive only; `tiny-keccak` (CC0-1.0) accepted | [0012](docs/adr/0012-project-licence-open.md) |
+| 13 | SDK bindings delivery | WIT with the WASM runtime, C ABI with the native runtime; one extension point at a time | [0013](docs/adr/0013-sdk-bindings-delivery.md) |
+| 14 | Keychain on Linux | Optional build feature; built in on macOS and Windows | [0014](docs/adr/0014-keychain-optional-on-linux.md) |
+| 15 | Integration test databases | Local PostgreSQL and MySQL containers with Docker Compose | [0015](docs/adr/0015-integration-test-databases.md) |
+| 16 | `rivet-testkit` dependencies (Proposed) | May use `rivet-sdk`, `rivet-engine-api`, `rivet-core`; others use it as dev-dependency only | [0016](docs/adr/0016-testkit-dependency-rule.md) |
+| 17 | Extension host lifecycle (Proposed) | As-built behaviour recorded; changes to §4.4 proposed | [0017](docs/adr/0017-extension-host-lifecycle.md) |
