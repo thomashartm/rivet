@@ -198,6 +198,7 @@
 use crate::host::MANIFEST_FILE;
 use crate::package::{
     Origin, PACKAGE_MAX_BYTES, PROJECT_PUBLISHER, PublicKey, TrustStore, open_regular,
+    read_text_file,
 };
 use crate::permissions::added_capabilities;
 use crate::settings::user_settings_path;
@@ -1026,13 +1027,7 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 /// read: a symbolic link, a directory, more than [`JOURNAL_MAX_BYTES`], a
 /// text that is not UTF-8 or that [`parse_journal`] refuses.
 fn read_journal(path: &Path) -> Option<(Option<Version>, Version)> {
-    let mut text = String::new();
-    open_regular(path, "journal", JOURNAL_MAX_BYTES)
-        .ok()?
-        .take(JOURNAL_MAX_BYTES)
-        .read_to_string(&mut text)
-        .ok()?;
-    parse_journal(&text)
+    parse_journal(&read_text_file(path, "journal", JOURNAL_MAX_BYTES).ok()?)
 }
 
 /// Returns `true` if `path` is a directory and not a symbolic link to one.
