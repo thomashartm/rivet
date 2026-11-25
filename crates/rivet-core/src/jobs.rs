@@ -362,10 +362,10 @@ impl JobScheduler {
     /// | returns `Ok` | `Succeeded` |
     /// | returns `Err` after a cancel request, or an `Err` of the category `cancelled` | `Cancelled` |
     /// | does not return in [`JobConfig::cancel_grace`] after a cancel request (it is aborted) | `Cancelled` |
+    /// | returns another `Err`, or panics | `Failed` |
     ///
     /// The abort stops `work` at its next `.await`. See the
     /// [module documentation](self) for work that never reaches one.
-    /// | returns another `Err`, or panics | `Failed` |
     ///
     /// # Errors
     ///
@@ -571,7 +571,9 @@ impl Inner {
             token.cancelled().await;
             tokio::time::sleep(grace).await;
             // Work that ends at the same moment as the grace period gets
-            // its turn before the abort.
+            // its turn before the abort. On a runtime with more than one
+            // thread this does not fix the order: there the result is what
+            // happened first.
             tokio::task::yield_now().await;
         };
         let joined = tokio::select! {
