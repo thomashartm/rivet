@@ -194,20 +194,33 @@ impl SecretStore {
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if the scheme already has a backend. The
-    /// first registration stays.
+    /// - Returns a `user` error if `scheme` is not a scheme that a
+    ///   [`SecretUri`] can have, for example `AWS-SM` or the empty text.
+    /// - Returns a `policy` error if the scheme already has a backend. The
+    ///   first registration stays.
     pub fn register(
         &self,
         owner: Owner,
         scheme: &str,
         backend: Arc<dyn SecretBackend>,
     ) -> Result<()> {
+        // `SecretUri` owns the scheme grammar. The comparison refuses a
+        // scheme such as `a://b`, where the parser stops at the first `://`.
+        let well_formed = format!("{scheme}://x")
+            .parse::<SecretUri>()
+            .is_ok_and(|uri| uri.scheme() == scheme);
+        if !well_formed {
+            return Err(Error::user(format!(
+                "{scheme:?} is not a valid secret URI scheme: a scheme is a lowercase letter, \
+                 then lowercase letters, digits, `+`, `-` or `.`"
+            )));
+        }
         let mut backends = self
             .backends
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         match backends.entry(scheme.to_owned()) {
-            Entry::Occupied(_) => Err(Error::internal(format!(
+            Entry::Occupied(_) => Err(Error::policy(format!(
                 "a secret backend for the scheme `{scheme}` is already registered"
             ))),
             Entry::Vacant(free) => {
@@ -384,8 +397,26 @@ mod tests {
             let error = store
                 .register(owner(), scheme, InMemory::with(&[]))
                 .unwrap_err();
-            assert_eq!(error.category(), ErrorCategory::Internal);
+            assert_eq!(error.category(), ErrorCategory::Policy);
             assert!(error.message().contains(scheme), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scheme_that_no_secret_uri_can_have_is_a_user_error() {
+        let store = SecretStore::new();
+        for scheme in ["AWS-SM", "", "has space", "1aws", "aws://sm", "aws:", "äws"] {
+            let error = store
+                .register(owner(), scheme, InMemory::with(&[]))
+                .expect_err(scheme);
+            assert_eq!(error.category(), ErrorCategory::User, "{scheme}");
+        }
+        // Nothing was registered.
+        assert_eq!(store.unregister_owner(&owner()), 0);
+        for scheme in ["aws-sm", "a", "x+y.z-1"] {
+            store
+                .register(owner(), scheme, InMemory::with(&[]))
+                .expect(scheme);
         }
     }
 

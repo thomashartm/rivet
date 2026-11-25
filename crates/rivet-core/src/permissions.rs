@@ -53,8 +53,13 @@
 //!   and `aws-sm://acme-postgres/prod/password`. It does not include
 //!   `keychain://acme-postgres-2/prod`.
 //! - The namespace `prod/db` includes `aws-sm://prod/db/password`.
-//! - The scheme is not part of the namespace: a namespace applies to each
-//!   secret backend.
+//! - The scheme is not part of the namespace. A namespace covers every
+//!   backend scheme: the grant `prod/db` gives access to
+//!   `keychain://prod/db/...`, to `aws-sm://prod/db/...` and to the same
+//!   path in each backend that an extension registers later.
+//! - A namespace that contains `://`, for example `aws-sm://prod`, grants
+//!   nothing. This form is reserved for a later namespace that is limited
+//!   to one scheme (ADR-0020).
 //! - The comparison is exact and case-sensitive. A URI path with a `.` or
 //!   `..` segment is denied.
 //!
@@ -389,7 +394,9 @@ fn covers(have: FilesystemAccess, want: FilesystemAccess) -> bool {
 
 fn in_namespace(namespace: &str, path: &str) -> bool {
     let mut segments = path.split('/');
-    !path.split('/').any(|segment| matches!(segment, "." | ".."))
+    // `://` is reserved for a per-scheme namespace (ADR-0020).
+    !namespace.contains("://")
+        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
         && namespace
             .split('/')
             .all(|part| segments.next() == Some(part))
@@ -785,6 +792,30 @@ mod tests {
                 &["acme.postgres", "secrets", denied],
             );
         }
+    }
+
+    /// ADR-0020: the form `scheme://...` is reserved for a later per-scheme
+    /// namespace. Until then it grants nothing.
+    #[test]
+    fn a_secret_namespace_with_a_scheme_grants_nothing() {
+        let (permissions, id) =
+            granted("[capabilities]\nsecrets = [\"aws-sm://prod\", \"a://b\", \"other\"]\n");
+        for denied in [
+            "aws-sm://prod/password",
+            "aws-sm://prod",
+            "keychain://aws-sm://prod/password",
+            "keychain://aws-sm://prod",
+            "keychain://a://b",
+            "a://b",
+        ] {
+            assert_denied(
+                permissions.check_secret(&id, &uri(denied)),
+                &["acme.postgres", "secrets"],
+            );
+        }
+        permissions
+            .check_secret(&id, &uri("aws-sm://other/password"))
+            .unwrap();
     }
 
     #[test]

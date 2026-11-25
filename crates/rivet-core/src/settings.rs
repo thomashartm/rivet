@@ -15,12 +15,22 @@
 //!
 //! # Secrets
 //!
-//! Settings hold references to secrets, never secret values. A key whose
-//! name is in [`SECRET_KEY_NAMES`] must hold a
-//! [`SecretUri`] string. This check knows key
-//! names only: it cannot find a secret value under a key with another name,
-//! for example `db_password` or `dsn`. The error of a typed lookup can quote
-//! the value of such a key.
+//! Settings hold references to secrets, never secret values.
+//!
+//! - A key whose name marks a secret must hold a [`SecretUri`] string. The
+//!   name is split into segments at `_`, `-`, `.` and camelCase boundaries,
+//!   and ASCII case is ignored. The key marks a secret if a segment is in
+//!   [`SECRET_KEY_NAMES`], or if the name ends with the segments `api key`,
+//!   `private key` or `access key` (also with `keys`). Examples:
+//!   `db_password`, `accessToken`, `aws-access-key`. Whole segments are
+//!   compared, so `public_key`, `keymap` and `tokenizer` are not secret.
+//! - A string that is a URL with a password (`scheme://user:password@host`)
+//!   is refused under each key.
+//! - The error of a typed lookup ([`Settings::get`]) never contains the
+//!   value.
+//!
+//! Limit: the check knows key names and URLs only. It cannot find a secret
+//! value under a key with a neutral name, for example `auth = "hunter2"`.
 //!
 //! # Example
 //!
@@ -66,16 +76,31 @@ const MIGRATIONS: &[Migration] = &[];
 /// The schema version that this host reads and writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
-/// Key names that mark a secret. A key with one of these names (ASCII case
-/// is ignored) must hold a secret URI, not a secret value.
-pub const SECRET_KEY_NAMES: [&str; 6] = [
+/// Key-name segments that mark a secret. A key that has one of these
+/// segments must hold a secret URI, not a secret value: `password`,
+/// `db_password`, `dbPassword` and `DB-PASSWORD` all have the segment
+/// `password`.
+///
+/// A key that ends with the segments `api key`, `private key` or
+/// `access key` (also with `keys`) marks a secret too. See the
+/// [module documentation](self#secrets) for how a key name is split.
+pub const SECRET_KEY_NAMES: &[&str] = &[
     "password",
+    "passwords",
+    "passwd",
+    "pwd",
     "passphrase",
     "secret",
+    "secrets",
     "token",
-    "api_key",
-    "private_key",
+    "tokens",
+    "credential",
+    "credentials",
 ];
+
+/// The segments that mark a secret when `key` or `keys` follows at the end
+/// of the key name. `secret key` is not here: `secret` alone marks a secret.
+const SECRET_KEY_KINDS: [&str; 3] = ["api", "private", "access"];
 
 /// A settings layer. The order of the variants is the override order: a
 /// later layer overrides an earlier one.
@@ -144,8 +169,11 @@ impl Settings {
     /// - [`SCHEMA_VERSION_KEY`] is missing, not a positive integer, or newer
     ///   than [`SCHEMA_VERSION`],
     /// - a migration step fails,
-    /// - a key in [`SECRET_KEY_NAMES`] holds a value that is not a secret
-    ///   URI (the message names the key and never contains the value).
+    /// - a key that marks a secret ([`SECRET_KEY_NAMES`]) holds a value that
+    ///   is not a secret URI,
+    /// - a string value is a URL with a password.
+    ///
+    /// The message names the key and never contains the value.
     ///
     /// The layer does not change when an error is returned.
     pub fn set_layer(&mut self, layer: Layer, source: &str, text: &str) -> Result<()> {
@@ -181,16 +209,22 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a `user` error if the value does not have the type `T`. The
-    /// message names the key and the source of the layer that set it.
+    /// message names the source of the layer that set the key, the key, the
+    /// type `T` and the TOML type of the value. It never contains the value.
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let Some(value) = find(&self.merged, key) else {
             return Ok(None);
         };
-        value.clone().try_into().map(Some).map_err(|error| {
+        // The error of `toml` is dropped: its text quotes the value.
+        value.clone().try_into().map(Some).map_err(|_| {
             let source = self
                 .layer_of(key)
                 .map_or("settings", |layer| &self.layers[layer as usize].name);
-            Error::user(format!("{source}: key `{key}`: {}", error.message()))
+            Error::user(format!(
+                "{source}: key `{key}` cannot be read as `{}`: the value is a TOML {}",
+                std::any::type_name::<T>(),
+                value.type_str()
+            ))
         })
     }
 
@@ -333,7 +367,68 @@ fn parse_layer(source: &str, text: &str, migrations: &[Migration]) -> Result<Tab
     Ok(table)
 }
 
-/// Fails if a key in [`SECRET_KEY_NAMES`] holds anything but a secret URI.
+/// Splits a key name into lowercase segments at `_`, `-`, `.` and camelCase
+/// boundaries: `dbPassword` and `DB_PASSWORD` give `db`, `password`;
+/// `APIKey` gives `api`, `key`.
+fn key_segments(key: &str) -> Vec<String> {
+    let chars: Vec<char> = key.chars().collect();
+    let mut segments = vec![String::new()];
+    for (index, &ch) in chars.iter().enumerate() {
+        if matches!(ch, '_' | '-' | '.') {
+            segments.push(String::new());
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|index| chars[index]);
+        let next_is_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+        // `bP` in `dbPassword`, `2P` in `db2Password`, `IK` in `APIKey`.
+        let boundary = ch.is_ascii_uppercase()
+            && previous.is_some_and(|previous| {
+                previous.is_ascii_lowercase()
+                    || previous.is_ascii_digit()
+                    || (previous.is_ascii_uppercase() && next_is_lower)
+            });
+        if boundary {
+            segments.push(String::new());
+        }
+        if let Some(segment) = segments.last_mut() {
+            segment.push(ch.to_ascii_lowercase());
+        }
+    }
+    segments.retain(|segment| !segment.is_empty());
+    segments
+}
+
+/// `true` if the key name marks a secret. See [`SECRET_KEY_NAMES`].
+fn is_secret_key(key: &str) -> bool {
+    let segments = key_segments(key);
+    let is_key = |kind: &String, last: &String| {
+        matches!(last.as_str(), "key" | "keys") && SECRET_KEY_KINDS.contains(&kind.as_str())
+    };
+    segments
+        .iter()
+        .any(|segment| SECRET_KEY_NAMES.contains(&segment.as_str()))
+        || matches!(&segments[..], [.., kind, last] if is_key(kind, last))
+}
+
+/// `true` if `text` is a URL with a password: `scheme://user:password@host`.
+/// The user can be empty; the password cannot.
+fn has_url_password(text: &str) -> bool {
+    let Some((_, rest)) = text.split_once("://") else {
+        return false;
+    };
+    // RFC 3986: the authority ends at the first `/`, `?` or `#`, and the
+    // user information ends at the last `@` in the authority.
+    // shortcut: a password with an unencoded `/`, `?` or `#` is not found;
+    // upgrade to a URL parser if settings get typed connection URLs.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority
+        .rsplit_once('@')
+        .and_then(|(user_info, _)| user_info.split_once(':'))
+        .is_some_and(|(_, password)| !password.is_empty())
+}
+
+/// Fails if a key that marks a secret holds anything but a secret URI, or if
+/// a string under any key is a URL with a password.
 /// `path` is the dotted key of `table`; it is empty for the root.
 fn reject_secret_values(source: &str, path: &str, table: &Table) -> Result<()> {
     for (key, value) in table {
@@ -342,10 +437,7 @@ fn reject_secret_values(source: &str, path: &str, table: &Table) -> Result<()> {
         } else {
             format!("{path}.{key}")
         };
-        if SECRET_KEY_NAMES
-            .iter()
-            .any(|name| key.eq_ignore_ascii_case(name))
-        {
+        if is_secret_key(key) {
             let is_uri = value
                 .as_str()
                 .is_some_and(|text| text.parse::<SecretUri>().is_ok());
@@ -356,9 +448,8 @@ fn reject_secret_values(source: &str, path: &str, table: &Table) -> Result<()> {
                      keychain://); settings do not accept a secret value"
                 )));
             }
-        } else {
-            reject_in_value(source, &path, value)?;
         }
+        reject_in_value(source, &path, value)?;
     }
     Ok(())
 }
@@ -369,6 +460,11 @@ fn reject_in_value(source: &str, path: &str, value: &Value) -> Result<()> {
         Value::Array(items) => items.iter().enumerate().try_for_each(|(index, item)| {
             reject_in_value(source, &format!("{path}[{index}]"), item)
         }),
+        // The message never contains the value.
+        Value::String(text) if has_url_password(text) => Err(Error::user(format!(
+            "{source}: key `{path}` holds a URL with a password; put the password in a secret \
+             store and use a secret URI (for example keychain://)"
+        ))),
         _ => Ok(()),
     }
 }
@@ -680,13 +776,144 @@ mod tests {
     }
 
     #[test]
-    fn secret_check_matches_whole_key_names_only() {
-        // The documented limit: other key names are not checked.
+    fn secret_value_is_refused_under_each_key_with_a_secret_segment() {
+        for key in [
+            "db_password",
+            "access_token",
+            "client_secret",
+            "secret_key",
+            "pwd",
+            "passwd",
+            "dbPassword",
+            "DB_PASSWORD",
+            "db-password",
+            "APIKey",
+            "awsAccessKey",
+            "aws_access_key",
+            "ssh_private_key",
+            "api_keys",
+            "credentials",
+            "user-credential",
+            "refreshTokens",
+            "secrets",
+        ] {
+            let mut settings = Settings::new();
+            let text = assert_user_error(
+                settings.set_layer(
+                    Layer::User,
+                    "user.toml",
+                    &format!("schema_version = 1\n[db]\n{key} = \"hunter2\"\n"),
+                ),
+                &["user.toml", &format!("`db.{key}`"), "secret"],
+            );
+            assert!(!text.contains("hunter2"), "leaked: {text}");
+        }
+        // A key that contains `.` is one key with two segments.
+        let mut settings = Settings::new();
+        let text = assert_user_error(
+            settings.set_layer(
+                Layer::User,
+                "user.toml",
+                "schema_version = 1\n\"db.password\" = \"hunter2\"\npasswords = [\"hunter2\"]\n",
+            ),
+            &["user.toml", "secret"],
+        );
+        assert!(!text.contains("hunter2"), "leaked: {text}");
+        assert_user_error(
+            settings.set_layer(
+                Layer::User,
+                "user.toml",
+                "schema_version = 1\npasswords = [\"hunter2\"]\n",
+            ),
+            &["user.toml", "`passwords`"],
+        );
+    }
+
+    #[test]
+    fn secret_check_matches_whole_segments_only() {
         let settings = settings(&[(
             Layer::User,
-            "schema_version = 1\npassword_hint = \"pet\"\ntokens_per_page = 50\n",
+            "schema_version = 1\npublic_key = \"ssh-ed25519 AAAA\"\nkey = \"k\"\n\
+             keymap = \"vim\"\ntokenizer = \"simple\"\nsecretary = \"ann\"\n\
+             api_key_id = \"AKIA\"\npassport = \"x\"\n",
         )]);
-        assert_eq!(settings.get::<u32>("tokens_per_page").unwrap(), Some(50));
+        for key in [
+            "public_key",
+            "key",
+            "keymap",
+            "tokenizer",
+            "secretary",
+            "api_key_id",
+            "passport",
+        ] {
+            assert!(settings.get::<String>(key).unwrap().is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn url_with_a_password_is_refused_under_any_key() {
+        for body in [
+            "dsn = \"postgres://app:hunter2@db/prod\"\n",
+            "[db]\nurl = \"postgres://app:hunter2@db:5432/prod?sslmode=require\"\n",
+            "urls = [\"postgres://app@db/prod\", \"jdbc:postgresql://app:hunter2@db/prod\"]\n",
+            "proxy = \"http://:hunter2@proxy\"\n",
+            "password = \"postgres://app:hunter2@db/prod\"\n",
+        ] {
+            let mut settings = Settings::new();
+            let text = assert_user_error(
+                settings.set_layer(
+                    Layer::User,
+                    "user.toml",
+                    &format!("schema_version = 1\n{body}"),
+                ),
+                &["user.toml", "`"],
+            );
+            assert!(!text.contains("hunter2"), "leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn url_without_a_password_is_accepted() {
+        let settings = settings(&[(
+            Layer::User,
+            "schema_version = 1\na = \"postgres://app@db/prod\"\nb = \"keychain://a/b\"\n\
+             c = \"postgres://app:@db/prod\"\nd = \"http://host:8080/path@x\"\n\
+             e = \"http://host/a:b@c\"\nf = \"at 10:30 mail a@b\"\n",
+        )]);
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            assert!(settings.get::<String>(key).unwrap().is_some(), "{key}");
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    enum Mode {
+        Fast,
+    }
+
+    #[test]
+    fn lookup_with_the_wrong_type_never_contains_the_value() {
+        let settings = settings(&[(
+            Layer::User,
+            "schema_version = 1\ndb_pass = \"hunter2\"\nmode = \"hunter2\"\n\
+             [editor]\ntab_width = \"hunter2\"\nfont = \"mono\"\n",
+        )]);
+        let text = assert_user_error(
+            settings.get::<u32>("db_pass"),
+            &["user.toml", "`db_pass`", "u32", "string"],
+        );
+        assert!(!text.contains("hunter2"), "leaked: {text}");
+        // An unknown enum variant, a field in a table and a failed parse.
+        for result in [
+            settings.get::<Mode>("mode").map(|_| ()),
+            settings.get::<Editor>("editor").map(|_| ()),
+            settings.get::<SecretUri>("mode").map(|_| ()),
+        ] {
+            let error = result.expect_err("an error");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("hunter2"), "leaked: {text}");
+        }
+        assert_user_error(settings.get::<Editor>("editor"), &["`editor`", "table"]);
     }
 
     #[test]

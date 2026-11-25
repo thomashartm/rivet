@@ -37,13 +37,15 @@ struct Registered {
 }
 
 /// The forms of `value` that the two log formats can write:
-/// the value itself, its `Debug` form (a field logged with `?`), and each of
-/// the two as a JSON string (the JSON format).
+/// the value itself, its `Debug` form (a field logged with `?`), its
+/// [`sanitized`] form (a message in the human format), and each of the three
+/// as a JSON string (the JSON format).
 fn needles(value: &str) -> Vec<Zeroizing<String>> {
     let quoted = Zeroizing::new(format!("{value:?}"));
     let debug = &quoted[1..quoted.len() - 1];
+    let sanitized = sanitized(value);
     let mut needles: Vec<Zeroizing<String>> = Vec::new();
-    for form in [value, debug] {
+    for form in [value, debug, &sanitized] {
         let mut forms = vec![Zeroizing::new(form.to_owned())];
         if let Ok(json) = serde_json::to_string(form).map(Zeroizing::new) {
             forms.push(Zeroizing::new(json[1..json.len() - 1].to_owned()));
@@ -55,6 +57,28 @@ fn needles(value: &str) -> Vec<Zeroizing<String>> {
         }
     }
     needles
+}
+
+/// Returns `value` as the human format writes it in a message and in an
+/// error field. The format rewrites the control characters that a terminal
+/// can interpret as text.
+///
+/// This is the rule of `EscapingWriter` in tracing-subscriber 0.3.23
+/// (`src/fmt/format/escape.rs`). The rule is private there, so it is repeated
+/// here. The test `a_secret_with_any_special_character_is_redacted_in_every_position`
+/// fails if an update of tracing-subscriber changes the rule.
+fn sanitized(value: &str) -> Zeroizing<String> {
+    let mut text = Zeroizing::new(String::with_capacity(value.len()));
+    for ch in value.chars() {
+        match ch {
+            '\x07' | '\x08' | '\x0c' | '\x1b' | '\x7f' => {
+                text.push_str(&format!("\\x{:02x}", u32::from(ch)));
+            }
+            '\u{80}'..='\u{9f}' => text.push_str(&format!("\\u{{{:x}}}", u32::from(ch))),
+            _ => text.push(ch),
+        }
+    }
+    text
 }
 
 /// The set of live secret values that must not appear in log output.
@@ -78,9 +102,11 @@ fn needles(value: &str) -> Vec<Zeroizing<String>> {
 /// # Limits
 ///
 /// - A value shorter than [`MIN_REDACTED_LEN`] bytes is not redacted.
-/// - The redactor finds the value itself, its `Debug`-escaped form and the
-///   JSON-escaped form of both. It does not find other encodings of the
-///   value, for example Base64, URL encoding or a part of the value.
+/// - The redactor finds the value itself, its `Debug`-escaped form, the form
+///   in which the human format writes control characters (for example ESC
+///   as `\x1b`), and the JSON-escaped form of each. It does not find other
+///   encodings of the value, for example Base64, URL encoding or a part of
+///   the value.
 /// - Redaction applies to log output only. Errors must not contain secrets
 ///   by construction (§5.6).
 ///
@@ -546,6 +572,51 @@ mod tests {
                 assert!(!output.contains(part), "{format:?} leaked {part}: {output}");
             }
         }
+    }
+
+    /// R-1: the human format rewrites some control characters in a message
+    /// as text. This test does not know which ones: it tries each character
+    /// of C0, DEL, C1 and Latin-1, and some others, so it also guards an
+    /// update of tracing-subscriber that changes the rule.
+    #[test]
+    fn a_secret_with_any_special_character_is_redacted_in_every_position() {
+        let chars = ('\0'..='\u{ff}').chain(['\u{2028}', '\u{202e}', '\u{feff}', '\u{fffd}']);
+        for ch in chars {
+            // The character alone, then mixed with a quote and a backslash.
+            for value in [format!("Zq{ch}Xw{ch}Jk"), format!("Zq\"{ch}Xw\\{ch}Jk")] {
+                let redactor = redactor(&[&value]);
+                let failure = io::Error::other(value.clone());
+                for format in FORMATS {
+                    let output = captured(Level::INFO, format, &redactor, || {
+                        let _span =
+                            info_span!("connect", display = %value, debug = ?value).entered();
+                        info!("connecting with {value}");
+                        info!(display = %value, debug = ?value, plain = value, "fields");
+                        info!(
+                            error = &failure as &(dyn std::error::Error + 'static),
+                            "failed"
+                        );
+                    });
+                    for part in ["Zq", "Xw", "Jk"] {
+                        assert!(
+                            !output.contains(part),
+                            "{format:?} leaked {part} of a secret with {ch:?}: {output}"
+                        );
+                    }
+                    assert!(output.contains(REDACTED), "{output}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_reported_secret_with_an_escape_sequence_is_redacted() {
+        let value = "tok\u{1b}[31mHUNTER2zz";
+        let redactor = redactor(&[value]);
+        let output = captured(Level::INFO, LogFormat::Human, &redactor, || {
+            info!("connecting with {value}");
+        });
+        assert!(!output.contains("HUNTER2"), "leaked: {output}");
     }
 
     #[test]

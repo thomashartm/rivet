@@ -98,10 +98,11 @@ impl Resolution {
 /// 2. It is in a dependency cycle. The reason names the cycle.
 /// 3. Its SDK range does not include `host_sdk`.
 /// 4. A dependency is not present.
-/// 5. A dependency is present in a version outside the range. If the range
-///    of a different extension includes that version, the two ranges are in
-///    conflict and the reason names both extensions and both ranges. The
-///    extension with the satisfied range is not rejected for this.
+/// 5. A dependency is present in a version outside the range. If other
+///    extensions depend on the same extension with a different range, the
+///    ranges are in conflict: the reason also names each of these extensions
+///    and its range, sorted by id. An extension whose range includes the
+///    present version is not rejected for this.
 /// 6. A dependency is rejected.
 ///
 /// Reasons 4 to 6 are checked for one dependency after the other, sorted by
@@ -208,7 +209,7 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
                         );
                         let others = unique.values().filter_map(|other| {
                             let other_range = other.dependencies.get(dependency)?;
-                            other_range.matches(&found.version).then(|| {
+                            (other_range != range).then(|| {
                                 format!(
                                     "extension `{}`, which depends on `{dependency}` \
                                      `{other_range}`",
@@ -557,6 +558,51 @@ mod tests {
             &["`b`", "`^2`", "conflict", "`a`", "`^1`", "`lib`"],
         );
         assert!(is_resolved(&resolution, "a"));
+    }
+
+    #[test]
+    fn conflicting_ranges_are_named_when_no_range_includes_the_present_version() {
+        let resolution = resolve_all(&[
+            ext("a", "1.0.0", &[("lib", "^1")]),
+            ext("b", "1.0.0", &[("lib", "^2")]),
+            ext("lib", "3.0.0", &[]),
+        ]);
+        rejected(
+            &resolution,
+            "a",
+            &["`a`", "`^1`", "3.0.0", "conflict", "`b`", "`^2`", "`lib`"],
+        );
+        rejected(
+            &resolution,
+            "b",
+            &["`b`", "`^2`", "3.0.0", "conflict", "`a`", "`^1`", "`lib`"],
+        );
+    }
+
+    #[test]
+    fn conflict_of_three_dependents_names_each_other_dependent_in_id_order() {
+        let manifests = [
+            ext("c", "1.0.0", &[("lib", "^3")]),
+            ext("a", "1.0.0", &[("lib", "^1")]),
+            ext("b", "1.0.0", &[("lib", "^2")]),
+            // The same range as `a`: not a conflict with `a`.
+            ext("d", "1.0.0", &[("lib", "^1")]),
+            ext("lib", "2.0.0", &[]),
+        ];
+        let resolution = resolve_all(&manifests);
+        assert!(is_resolved(&resolution, "b"));
+        let b = "extension `b`, which depends on `lib` `^2`";
+        let c = "extension `c`, which depends on `lib` `^3`";
+        let a = "extension `a`, which depends on `lib` `^1`";
+        let d = "extension `d`, which depends on `lib` `^1`";
+        let message = rejected(&resolution, "a", &[&format!("conflict with {b} and {c}")]);
+        assert!(!message.contains("`d`"), "{message}");
+        rejected(&resolution, "d", &[&format!("conflict with {b} and {c}")]);
+        rejected(
+            &resolution,
+            "c",
+            &[&format!("conflict with {a} and {b} and {d}")],
+        );
     }
 
     #[test]
