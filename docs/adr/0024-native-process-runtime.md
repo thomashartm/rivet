@@ -1,13 +1,13 @@
 # ADR-0024: Native process runtime: protocol and supervision
 
-- Status: Proposed
+- Status: Accepted (maintainer, 2026-11-25). The points that the text marks as open or as a proposal stay open.
 - Date: 2026-11-25
 
 ## Context
 
 ADR-0003 says native plugins run in a separate extension host process. ARCHITECTURE.md §6.6 says control messages use a typed schema and bulk data uses Arrow IPC over a local socket. Neither fixes the process model, the message form or the limits. Part 1 of the native runtime ticket (#95) needs them. Part 1 is on `main` since PR #142 (`crates/rivet-core/src/native.rs`). Compared with that file at commit 12255a3: the environment list, the three limits (64 KiB, 5 s, 2 s), the refusal of a relative program path and the level `info` of the error output are equal to the table below. The other rows were not compared with the code. None of the values below is measured.
 
-This ADR changes two accepted texts. They change only when the maintainer accepts this ADR; no "Amends" line is in them yet.
+This ADR changes two accepted texts. The maintainer accepted this ADR on 2026-11-25. Both texts have a line "Amended by ADR-0024" since that date.
 
 | Text | It says | This ADR says |
 | --- | --- | --- |
@@ -41,7 +41,7 @@ This ADR changes two accepted texts. They change only when the maintainer accept
   - To drop the instance also ends the task that reads the error output, also when another process still holds the pipe. After the child has ended, the runtime waits for this task for the grace time at most, so the last lines of a crash are not lost; then it stops the task and writes the count of dropped lines.
   - After the child exits during a call, the runtime waits for the grace time at most for an answer that is still in the pipe (review finding R-104, on `main` since PR #172; read in the module documentation of `native.rs`). Before, it read one time, and an answer was lost under load. Consequences: if another process holds the output of the child open, a failed call ends later by the grace time (2 s by default; 0 before), so the rule that such a process delays no call is not true for a failed call. An answer without a line end is refused: the message form is one JSON object per line. So a last line that the child wrote without a line end before its exit is an `internal` error; before PR #172 it was taken as the answer. Known limit: the runtime cannot see which process wrote a line. If a process that the child started holds the output open and writes a line inside the grace time, that line counts as the answer of the child. This is accepted: each process of a native extension is code of the same extension (review finding R-117). With a grace time of 0 an answer directly before an exit can be lost.
   - Known limit: a process that the child starts itself is not ended with the child. To end a process group needs a system call that the standard library and tokio do not give without `unsafe` or a new crate. It belongs to the OS sandbox work.
-  - Proposed, waits for the owner (review finding R-87; nothing of this is built): the limit above is closed on Unix with the crate `rustix`.
+  - Decided by the maintainer on 2026-11-25 (review finding R-87; nothing of this is built): a new direct dependency is permitted for this, the crate `rustix` with the feature `process`; Windows stays a known limit. The limit above is closed on Unix with the crate `rustix`.
     - The child starts in its own process group (`process_group(0)` of the tokio command; no crate is needed for this).
     - To end an extension, the runtime sends the kill signal to the group, not only to the child: `rustix::process::kill_process_group`, a safe function. The workspace rule `unsafe_code = "forbid"` stays for each crate of the workspace; the `unsafe` call is inside `rustix`.
     - The runtime sends the group signal before it reads the exit status of the child. After that read the number of the group can belong to other processes.
@@ -68,4 +68,4 @@ This ADR changes two accepted texts. They change only when the maintainer accept
 - A plugin that writes to its standard output breaks the control channel and is failed. The extension host program of part 3 must keep plugin output away from it.
 - An extension cannot read the other variables of the engine environment. A credential source that needs it (for example the AWS default chain) cannot work yet. The first extension that needs it asks for a rule.
 - The call timeout of the host (ADR-0021) also limits a native call, and it really stops the work, because the process is killed.
-- The Windows allow list and the behaviour of pipes and process kill on Windows are not tested.
+- Supported: Linux and macOS. Windows: not tested (decided by the maintainer on 2026-11-25; review finding R-105). macOS is checked only on a local machine; CI runs on Linux. The Windows allow list and the behaviour of pipes and process kill on Windows are not tested.

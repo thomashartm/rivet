@@ -1,6 +1,7 @@
 # ADR-0003: Native plugins run out-of-process by default
 
 - Status: Accepted
+- Amended by: [ADR-0024](0024-native-process-runtime.md) (one child process for each native extension, not one host process for all)
 - Date: 2026-11-25
 
 ## Context
