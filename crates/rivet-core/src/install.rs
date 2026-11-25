@@ -128,7 +128,8 @@
 //! version. The same applies to a journal whose old version has no
 //! directory. The recovery then reads the directories: an active directory
 //! stays; if there is none, the one retired directory in the store goes
-//! back. A symbolic link is never moved back. `pending` is then deleted, a
+//! back. A journal that is valid and has no old version (a first install)
+//! puts nothing back. A symbolic link is never moved back. `pending` is then deleted, a
 //! directory with its content. With two or more retired
 //! directories the recovery changes nothing and returns an `internal` error.
 //! `previous` is not written in this case.
