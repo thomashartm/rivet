@@ -5,7 +5,7 @@
 
 ## Context
 
-ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 requires that a restart of a failed extension takes less than 1 s. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is not merged on this date.
+ARCHITECTURE.md §4.4 has the edges `Failed → Active: restart (with backoff)` and `Failed → Disabled: restart limit reached`. §4.3 requires limits per extension. §9 requires that a restart of a failed extension takes less than 1 s. The values and the behaviour of dependents are not defined. The fault isolation ticket (#11) needs them. Part 1 of #11 is not merged on this date: the settings and the behaviour below are decided, not implemented on `main` (ticket #11).
 
 ## Decision
 
