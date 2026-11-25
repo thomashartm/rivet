@@ -153,6 +153,21 @@ fn child(directory: &Path) -> ! {
                 reply(json!({"type": "ok"}));
                 std::process::exit(0);
             }
+            ("activate", "exit-grandchild-answers") => {
+                // Known limit: the answer comes from a process that is not
+                // the child, after the child has exited.
+                grandchild_answers();
+                std::process::exit(3);
+            }
+            ("activate", "no-line-end-exit" | "no-line-end-exit-held") => {
+                if behaviour == "no-line-end-exit-held" {
+                    second(directory, true);
+                }
+                // A complete message, but without the line end.
+                print!("{{\"type\":\"ok\"}}");
+                std::io::stdout().flush().unwrap();
+                std::process::exit(0);
+            }
             ("activate", "half-exit" | "half-exit-held") => {
                 if behaviour == "half-exit-held" {
                     second(directory, true);
@@ -244,6 +259,21 @@ fn second(directory: &Path, output: bool) {
         .spawn()
         .unwrap();
     std::fs::write(directory.join("second"), second.id().to_string()).unwrap();
+}
+
+/// Starts a process that has the output of the child and writes a complete
+/// answer after 0.1 s. The process ends after that.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the process must live longer than the child"
+)]
+fn grandchild_answers() {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 0.1; echo '{\"type\":\"ok\"}'"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
 }
 
 // ------------------------------------------------------------- fixtures
@@ -683,6 +713,42 @@ async fn a_failed_call_with_a_held_output_ends_after_the_grace_time() {
     internal(&error);
     assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+/// Criterion 4 (R-117, ADR-0024): a complete message without the line end
+/// is not an answer, also if the process then exits.
+#[cfg(unix)]
+async fn an_answer_without_a_line_end_before_an_exit_is_an_end_of_the_process() {
+    for behaviour in ["no-line-end-exit", "no-line-end-exit-held"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, mut crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        let error = within(instance.activate(context())).await.unwrap_err();
+        internal(&error);
+        let reason = "ended or closed its output during the call";
+        assert!(error.message().contains(reason), "{behaviour}: {error}");
+        assert!(crashes.try_recv().is_err(), "{behaviour}");
+    }
+}
+
+/// Criterion 4 (R-117, ADR-0024). KNOWN LIMIT, not a wanted behaviour: the
+/// child exits without an answer, and another process that holds the output
+/// writes a line within the grace time. The runtime takes the line as the
+/// answer of the child.
+///
+/// The other process writes after 0.1 s; the grace time is the default of
+/// 2 s, so a margin of 1.9 s on a loaded machine.
+#[cfg(unix)]
+async fn known_limit_a_line_of_another_process_within_the_grace_time_is_the_answer() {
+    let package = package("exit-grandchild-answers");
+    let (runtime, mut crashes) = runtime(config());
+    let instance = load(&runtime, &package).await.unwrap();
+    within(instance.activate(context())).await.unwrap();
+    // The exit of the child is then a crash while no call runs.
+    let (_, error) = within(crashes.recv()).await.unwrap();
+    assert!(error.message().contains("the process ended"), "{error}");
 }
 
 /// Criterion 4 (R-88): the answer of a process that exits directly after
@@ -1201,6 +1267,10 @@ const TESTS: &[Test] = tests![
     an_answer_before_an_exit_is_kept,
     #[cfg(unix)]
     a_failed_call_with_a_held_output_ends_after_the_grace_time,
+    #[cfg(unix)]
+    an_answer_without_a_line_end_before_an_exit_is_an_end_of_the_process,
+    #[cfg(unix)]
+    known_limit_a_line_of_another_process_within_the_grace_time_is_the_answer,
     #[cfg(unix)]
     an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first,
     #[cfg(unix)]
