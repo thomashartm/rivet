@@ -2062,6 +2062,8 @@ mod tests {
             fuel_per_call: u64::MAX,
             ..Limits::for_host(&config)
         };
+        // R-116c: the limits are equal, not only both set.
+        assert_eq!(limits.call_timeout, config.call_timeout);
         let runtime = Arc::new(runtime_with(limits, &Redactor::new()));
         let hosted = hosted_with(runtime, config);
         let endless = guest("", "(loop $l (br $l)) unreachable");
