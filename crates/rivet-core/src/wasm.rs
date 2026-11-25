@@ -2251,33 +2251,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_trap_error_has_no_text_of_the_guest() {
-        // T-1: a function name of the name section, and a custom section.
+    async fn an_error_of_guest_code_has_no_text_of_the_guest() {
+        // T-1 (ADR-0018): a function name of the name section, and a custom
+        // section, for each kind of failure of guest code.
         let redactor = Redactor::new();
         redactor.register(&Secret::from("hunter2-value".to_owned()));
         let name = format!("{}\\nERROR forged\\1b[2J hunter2-value", "n".repeat(10000));
-        let data = format!(
-            r#"(@custom "hunter2-value" "hunter2-value")
-               (func $boom (@name "{name}") unreachable)"#
-        );
-        let bytes = guest(&data, "(call $boom) (i32.const 0)");
+        let named = |body: &str, more: &str| {
+            format!(
+                r#"(@custom "hunter2-value" "hunter2-value")
+                   (func $named (@name "{name}") {body})
+                   {more}"#
+            )
+        };
+        let wild = r#"(data (i32.const 32) "\01\00\00\00\00\00\00\00\00\00\ff\7f\04\00\00\00")"#;
+        let call = "(call $named) (i32.const 0)";
+        let cases = [
+            (
+                "activate failed: the component trapped",
+                guest(&named("unreachable", ""), call),
+            ),
+            (
+                "instantiate failed: the component trapped",
+                guest(&named("unreachable", "(start $named)"), call),
+            ),
+            (
+                "the component could not be instantiated",
+                guest(&named("", &"(table 0 funcref) ".repeat(65)), call),
+            ),
+            (
+                "the call broke the rules of the component model",
+                guest(&named("", wild), "(call $named) (i32.const 32)"),
+            ),
+        ];
         let runtime = runtime_with(SMALL, &redactor);
-        let direct = instance(&runtime, bytes.clone(), "acme.trap").await;
-        let direct = direct.activate().await.unwrap_err();
-
-        let hosted = hosted(Arc::new(runtime));
-        hosted.install("acme.trap", "1.0.0", &bytes);
-        let report = hosted.start("acme.trap").await;
-        for error in [&direct, &report.not_activated[&id("acme.trap")]] {
-            let texts = all_text(error);
-            for text in &texts {
-                assert!(text.len() < 1000, "{} bytes", text.len());
-                for guest in ["nnnn", "forged", "hunter2", "\n", "\u{1b}"] {
-                    assert!(!text.contains(guest), "{guest:?} in {text:?}");
+        let hosted = hosted(Arc::new(runtime.clone()));
+        for (reason, bytes) in cases {
+            let component = runtime.load(bytes.clone()).await.unwrap();
+            let direct = match runtime.instantiate(&component, id("acme.named")).await {
+                Ok(instance) => instance.activate().await.unwrap_err(),
+                Err(error) => error,
+            };
+            hosted.install("acme.named", "1.0.0", &bytes);
+            let report = hosted.start("acme.named").await;
+            hosted.host.unload(&id("acme.named")).await.unwrap();
+            for error in [&direct, &report.not_activated[&id("acme.named")]] {
+                assert!(error.message().contains(reason), "{error}");
+                let texts = all_text(error);
+                println!("{texts:#?}");
+                // The cause that Wasmtime gives stays.
+                assert_eq!(texts.len(), 3, "{texts:?}");
+                for text in &texts {
+                    assert!(text.len() < 1000, "{} bytes", text.len());
+                    for guest in ["nnnn", "forged", "hunter2", "\n", "\u{1b}"] {
+                        assert!(!text.contains(guest), "{guest:?} in {text:?}");
+                    }
                 }
             }
-            // The cause that Wasmtime gives stays.
-            assert!(texts[2..].concat().contains("`unreachable`"), "{texts:?}");
         }
     }
 
