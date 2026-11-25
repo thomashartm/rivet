@@ -2,10 +2,12 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod jobs;
 pub mod logging;
 pub mod registry;
 pub mod resolve;
 pub mod secrets;
+pub mod settings;
 
 /// The extension that owns a registration.
 pub type Owner = rivet_sdk::manifest::ExtensionId;
