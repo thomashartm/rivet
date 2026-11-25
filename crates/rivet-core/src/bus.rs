@@ -37,7 +37,7 @@ struct Registration {
 ///
 /// # async fn example() -> rivet_sdk::error::Result<()> {
 /// let bus = CommandBus::new();
-/// bus.register("ext.a".into(), "text.len", |text: String| async move {
+/// bus.register("ext.a".parse()?, "text.len", |text: String| async move {
 ///     Ok(text.len())
 /// })?;
 ///
@@ -267,7 +267,7 @@ mod tests {
     use std::sync::Arc;
 
     fn owner(text: &str) -> Owner {
-        text.into()
+        text.parse().expect("valid extension id")
     }
 
     fn capacity(n: u16) -> NonZeroU16 {
@@ -384,7 +384,7 @@ mod tests {
             .map(|n| {
                 let bus = Arc::clone(&bus);
                 tokio::spawn(async move {
-                    bus.register(format!("ext.{n}"), "double", |n: u64| async move {
+                    bus.register(owner(&format!("ext.{n}")), "double", |n: u64| async move {
                         tokio::task::yield_now().await;
                         Ok(n * 2)
                     })
