@@ -136,9 +136,7 @@ const MAX_SHOWN_KEY_BYTES: usize = 128;
 /// [`MAX_SHOWN_KEY_BYTES`], and with its control characters escaped. The
 /// file can come from another program, so a key has no safe form.
 fn shown_key(key: &str) -> String {
-    let start = &key[..key.floor_char_boundary(MAX_SHOWN_KEY_BYTES)];
-    let mark = if start.len() < key.len() { "…" } else { "" };
-    format!("{}{mark}", start.escape_debug())
+    crate::logging::shown(key, MAX_SHOWN_KEY_BYTES)
 }
 
 /// The largest trust store file that is read. One pinned key needs about 80

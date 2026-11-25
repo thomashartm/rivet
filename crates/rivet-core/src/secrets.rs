@@ -48,9 +48,7 @@ const MAX_SHOWN_BYTES: usize = crate::permissions::MAX_RESOURCE_BYTES;
 /// Returns `text` for an error message: cut to [`MAX_SHOWN_BYTES`], and with
 /// each control character escaped so that it cannot start a line in a log.
 fn shown(text: &str) -> String {
-    let start = &text[..text.floor_char_boundary(MAX_SHOWN_BYTES)];
-    let mark = if start.len() < text.len() { "…" } else { "" };
-    format!("{}{mark}", start.escape_debug())
+    crate::logging::shown(text, MAX_SHOWN_BYTES)
 }
 
 /// The future that [`SecretBackend::resolve`] returns.
