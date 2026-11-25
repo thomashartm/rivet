@@ -133,8 +133,8 @@
 //! directories the recovery changes nothing and returns an `internal` error.
 //! `previous` is not written in this case.
 //!
-//! An active version whose manifest is missing, cannot be read or is invalid
-//! cannot be updated or rolled back. [`Installer::install`] replaces it with a verified package and
+//! An active version whose manifest is missing, cannot be read, is invalid
+//! or is for another id cannot be updated or rolled back. [`Installer::install`] replaces it with a verified package and
 //! deletes it. A stop between the two renames of this change leaves no
 //! active version.
 //!
@@ -327,7 +327,8 @@ impl Installer {
     /// # Errors
     ///
     /// Returns a `user` error that names the file if the manifest of the
-    /// active version is missing, cannot be read or is invalid.
+    /// active version is missing, cannot be read, is invalid or is for
+    /// another id.
     pub fn installed(&self, id: &ExtensionId) -> Result<Option<Manifest>> {
         let active = self.active(id);
         match fs::symlink_metadata(&active) {
@@ -346,14 +347,16 @@ impl Installer {
         // A regular file within the limit of the host: a FIFO would block.
         let text = read_text_file(&path, "extension manifest", MAX_MANIFEST_BYTES)
             .map_err(|error| broken("cannot read the manifest").with_source(error))?;
-        Manifest::parse(&text)
-            .map(Some)
-            .map_err(|error| broken(error.message()))
+        let manifest = Manifest::parse(&text).map_err(|error| broken(error.message()))?;
+        if manifest.id != *id {
+            return Err(broken(&format!("the manifest is for `{}`", manifest.id)));
+        }
+        Ok(Some(manifest))
     }
 
     /// Installs `version` of `id` from the registry and activates it. An
-    /// active version whose manifest is missing, cannot be read or is
-    /// invalid is replaced and deleted.
+    /// active version whose manifest is missing, cannot be read, is
+    /// invalid or is for another id is replaced and deleted.
     ///
     /// # Errors
     ///
@@ -2557,6 +2560,9 @@ mod tests {
             ("a directory", |path| {
                 fs::remove_file(path).unwrap();
                 fs::create_dir(path).unwrap();
+            }),
+            ("another id", |path| {
+                fs::write(path, manifest("acme.mysql", "1.1.0", "")).unwrap();
             }),
             ("above the size limit", |path| {
                 let mut text = manifest("acme.postgres", "1.1.0", "");
