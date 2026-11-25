@@ -22,17 +22,22 @@
 //! What the check refuses:
 //!
 //! - A string under a key whose name marks a secret, if the string is not a
-//!   [`SecretUri`]. In an array or a table under such a key, each string is
+//!   [`SecretUri`]. In an array or a table under such a key, each value is
 //!   checked.
+//! - A number or a date under a key whose name marks a secret:
+//!   `password = 12345678`. A numeric password is a secret value.
 //! - A string under any key, if it contains a URL with a password
 //!   (`scheme://user:password@host`) or a parameter with a secret name and a
-//!   value (`?password=x`, `;Password=x`).
-//! - Exception: a secret URI with a built-in scheme (`keychain`, `aws-sm`,
-//!   `gcp-sm`) and no second `://` gets no check of its text. Its path can
-//!   contain `:`, `@` and `=`.
+//!   value (`?password=x`, `;Password=x`, `host=db password=x`,
+//!   `user=a,password=x`). Each `name=` of the string is checked. A value
+//!   that is a placeholder and nothing more is permitted: `password=%s`,
+//!   `password={name}`, `password=${env:PGPASSWORD}`.
+//! - Exception: a string that is one secret URI with a built-in scheme
+//!   (`keychain`, `aws-sm`, `gcp-sm`) and nothing more gets no check of its
+//!   text. Its path can contain `:`, `@` and `=`. A string with a second
+//!   `://`, a `;` or whitespace is not one URI: it gets all checks.
 //!
-//! A value that is not a string (integer, float, boolean, date) is accepted
-//! under each key: `max_tokens = 4096`, `show_password = true`.
+//! A boolean is accepted under each key: `show_password = true`.
 //!
 //! Which key names mark a secret:
 //!
@@ -47,14 +52,30 @@
 //!   `access_key_id` do not mark a secret.
 //! - A key that marks a secret cannot hold other text: `password_hint = "pet"`
 //!   is refused. Use a key name that does not mark a secret.
+//! - A key with a segment of [`ABOUT_A_SECRET`] is a setting about a secret.
+//!   It does not mark a secret and can hold each type of value:
+//!   `max_tokens = 4096`, `token_ttl = "5m"`, `db_password_file = "/run/x"`.
+//!   The same applies to a key in a table under a secret key
+//!   (`[credentials] retries = 3`) and to the name of a parameter in a
+//!   string (`password_encryption=scram-sha-256`).
 //!
 //! What the check does not find (examples, not a complete list):
 //!
 //! - A secret value under a key with another name: `auth`, `pass`, `pw`,
-//!   `bearer`, `signing_key`, `ssh_key`, `dbpassword`, `apikey`.
+//!   `bearer`, `signing_key`, `ssh_key`, `dbpassword`, `apikey`, `pin`.
+//!   `pin` is a common word in settings of the user interface
+//!   (`pin_sidebar`).
+//! - A secret value under a key about a secret: `password_file = "hunter2"`.
+//! - A secret parameter in a built-in secret URI:
+//!   `keychain://x?password=hunter2`.
+//! - A secret value in the form of a placeholder: `password={hunter2}`.
 //! - A URL password that contains an unencoded `/`, `?`, `#` or space.
 //! - A URL with a secret as the user name and no password
 //!   (`https://secret@host`).
+//! - A user and a password before a host without `://`
+//!   (`app:hunter2@db:5432/prod`).
+//! - A parameter with spaces around the `=` that is not the first parameter
+//!   of its part: `host = db password = hunter2`.
 //! - A string under a secret key that is a secret value with the form of a
 //!   URI and no password part: `password = "x://hunter2"` parses as a secret
 //!   URI.
@@ -111,7 +132,8 @@ const MIGRATIONS: &[Migration] = &[];
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
 /// Key-name segments that mark a secret. A string under a key that has one
-/// of these segments must be a secret URI, not a secret value: `password`,
+/// of these segments and no segment of [`ABOUT_A_SECRET`] must be a secret
+/// URI, not a secret value: `password`,
 /// `db_password`, `dbPassword`, `DB-PASSWORD` and `password2` all have the
 /// segment `password`.
 ///
@@ -135,6 +157,26 @@ pub const SECRET_KEY_NAMES: &[&str] = &[
 /// The schemes of the built-in secret backends (ADR-0008). The text of a
 /// secret URI with one of these schemes is not checked for a password.
 const BUILT_IN_SECRET_SCHEMES: [&str; 3] = [crate::secrets::KEYCHAIN_SCHEME, "aws-sm", "gcp-sm"];
+
+/// Key-name segments that make a key a setting about a secret, not a
+/// secret: `max_tokens`, `token_ttl`, `db_password_file`. Such a key, and
+/// each key in a table under it, can hold each type of value.
+pub const ABOUT_A_SECRET: &[&str] = &[
+    "max",
+    "min",
+    "ttl",
+    "length",
+    "len",
+    "limit",
+    "count",
+    "size",
+    "timeout",
+    "retries",
+    "per",
+    "file",
+    "path",
+    "encryption",
+];
 
 /// The segments that mark a secret when `key` or `keys` follows.
 /// `secret key` is not here: `secret` alone marks a secret.
@@ -203,12 +245,13 @@ impl Settings {
     ///
     /// Returns a `user` error that names `source` if:
     ///
-    /// - `text` is not valid TOML (the message gives the line),
+    /// - `text` is not valid TOML (the message gives the line and a fixed
+    ///   text for the kind of the problem),
     /// - [`SCHEMA_VERSION_KEY`] is missing, not a positive integer, or newer
     ///   than [`SCHEMA_VERSION`],
     /// - a migration step fails,
     /// - a key that marks a secret ([`SECRET_KEY_NAMES`]) holds a string that
-    ///   is not a secret URI,
+    ///   is not a secret URI, or a number or a date,
     /// - a string under another key contains a URL with a password or a
     ///   parameter with a secret name and a value.
     ///
@@ -379,18 +422,46 @@ fn user_config_dir(os: &str, env: impl Fn(&str) -> Option<OsString>) -> Result<P
     })
 }
 
+/// Returns a fixed text for the kind of a parser error. `message` is the
+/// text of `toml` (version 1.2); it can repeat a value of the file, so no
+/// part of it is returned. A kind that is not known gets the general text.
+fn parse_problem(message: &str) -> &'static str {
+    const NUMBER: &str = "a number is out of range";
+    const STRING: &str = "a string is not valid or is not closed";
+    const KINDS: [(&str, &str); 10] = [
+        ("duplicate key", "a key or a table is set two times"),
+        ("invalid type", NUMBER),
+        ("integer number overflowed", NUMBER),
+        ("floating-point number overflowed", NUMBER),
+        (
+            "string values must be quoted",
+            "a string value has no quotes",
+        ),
+        ("key with no value", "a key has no value"),
+        ("invalid basic string", STRING),
+        ("invalid literal string", STRING),
+        ("invalid multi-line basic string", STRING),
+        ("invalid multi-line literal string", STRING),
+    ];
+    KINDS
+        .iter()
+        .find(|(start, _)| message.starts_with(start))
+        .map_or("the text is not valid TOML", |(_, problem)| problem)
+}
+
 /// Parses one settings document, migrates it to the newest version of
 /// `migrations` and checks it. Returns the content without the version key.
 fn parse_layer(source: &str, text: &str, migrations: &[Migration]) -> Result<Table> {
     let mut table: Table = text.parse().map_err(|error: toml::de::Error| {
-        // `message()`, not `Display`: `Display` quotes the line of the file,
-        // and the line can contain a secret value.
+        // The text of the parser is not passed on: `Display` quotes the line
+        // of the file and `message()` can quote a value (R-63).
+        let problem = parse_problem(error.message());
         let line = error
             .span()
             .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
         match line {
-            Some(line) => Error::user(format!("{source}: line {line}: {}", error.message())),
-            None => Error::user(format!("{source}: {}", error.message())),
+            Some(line) => Error::user(format!("{source}: line {line}: {problem}")),
+            None => Error::user(format!("{source}: {problem}")),
         }
     })?;
 
@@ -461,25 +532,41 @@ fn key_segments(key: &str) -> Vec<String> {
     segments
 }
 
-/// `true` if the key name marks a secret. See [`SECRET_KEY_NAMES`].
+/// The segments of a key name without the digits at their end: `password2`
+/// and `token_1` are `password` and `token`.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = key_segments(key);
+    for word in &mut words {
+        word.truncate(word.trim_end_matches(|ch: char| ch.is_ascii_digit()).len());
+    }
+    words.retain(|word| !word.is_empty());
+    words
+}
+
+/// `true` if the key name has a word of [`ABOUT_A_SECRET`].
+fn is_about_a_secret(key: &str) -> bool {
+    let words = key_words(key);
+    words.iter().any(|word| ABOUT_A_SECRET.contains(&&**word))
+}
+
+/// `true` if the key name marks a secret. See [`SECRET_KEY_NAMES`]. A key
+/// name with a word of [`ABOUT_A_SECRET`] does not mark a secret.
 fn is_secret_key(key: &str) -> bool {
-    let segments = key_segments(key);
-    // `password2` and `token_1` are `password` and `token`.
-    let segments: Vec<&str> = segments
-        .iter()
-        .map(|segment| segment.trim_end_matches(|ch: char| ch.is_ascii_digit()))
-        .filter(|segment| !segment.is_empty())
-        .collect();
+    let words = key_words(key);
+    let segments: Vec<&str> = words.iter().map(String::as_str).collect();
     let is_key_pair = |index: usize| {
         SECRET_KEY_KINDS.contains(&segments[index])
             && matches!(segments.get(index + 1), Some(&("key" | "keys")))
             // `access_key_id` is the public name of a key, not the key.
             && segments.get(index + 2) != Some(&"id")
     };
-    segments
+    !segments
         .iter()
-        .any(|segment| SECRET_KEY_NAMES.contains(segment))
-        || (0..segments.len()).any(is_key_pair)
+        .any(|segment| ABOUT_A_SECRET.contains(segment))
+        && (segments
+            .iter()
+            .any(|segment| SECRET_KEY_NAMES.contains(segment))
+            || (0..segments.len()).any(is_key_pair))
 }
 
 /// `true` if `text` contains a URL with a password:
@@ -503,15 +590,36 @@ fn has_url_password(text: &str) -> bool {
 }
 
 /// `true` if `text` contains a parameter `name=value` whose name marks a
-/// secret ([`is_secret_key`]) and whose value is not empty. A parameter
-/// starts at the start of the text or after `?`, `&`, `#` or `;`: a URL
-/// query (`?user=a&password=x`) and a connection string
-/// (`Server=h;Password=x`).
+/// secret ([`is_secret_key`]) and whose value is not empty.
+///
+/// - The text is split into parts at `?`, `&`, `#`, `;` and `,`: a URL query
+///   (`?user=a&password=x`) and a connection string (`Server=h;Password=x`).
+/// - In a part, the name is the word directly before each `=`, and the value
+///   starts directly after it: the keyword form of PostgreSQL
+///   (`host=db user=app password=x`).
+/// - For the first `=` of a part, the name is also all the text before it,
+///   and spaces around the `=` are permitted (`; Pwd = x`).
+/// - The value ends at whitespace. A value that is a placeholder and nothing
+///   more is not a secret value: `%s`, `{...}` and `${...}`.
 fn has_secret_parameter(text: &str) -> bool {
-    text.split(['?', '&', '#', ';']).any(|parameter| {
-        parameter
-            .split_once('=')
-            .is_some_and(|(name, value)| is_secret_key(name.trim()) && !value.trim().is_empty())
+    // A placeholder as the whole value is not a secret value.
+    let is_value = |value: &str| {
+        let is_placeholder = value == "%s"
+            || ((value.starts_with("${") || value.starts_with('{')) && value.ends_with('}'));
+        !value.is_empty() && !is_placeholder
+    };
+    text.split(['?', '&', '#', ';', ',']).any(|part| {
+        part.match_indices('=')
+            .enumerate()
+            .any(|(number, (at, _))| {
+                let (before, after) = (&part[..at], &part[at + 1..]);
+                let word = before.rsplit(char::is_whitespace).next().unwrap_or("");
+                // Empty if whitespace follows the `=`.
+                let value = after.split(char::is_whitespace).next().unwrap_or("");
+                let spaced = after.split_whitespace().next().unwrap_or("");
+                (is_secret_key(word) && is_value(value))
+                    || (number == 0 && is_secret_key(before.trim()) && is_value(spaced))
+            })
     })
 }
 
@@ -536,6 +644,9 @@ fn reject_in_table(
         };
         let secret_key = if is_secret_key(key) {
             Some(key.as_str())
+        } else if is_about_a_secret(key) {
+            // `[credentials] retries = 3`: a setting about the secret.
+            None
         } else {
             secret_key
         };
@@ -558,12 +669,17 @@ fn reject_in_value(
             });
         }
         Value::String(text) => text,
-        // An integer, a float, a boolean or a date is not a secret value.
-        _ => return Ok(()),
+        // A boolean cannot be a secret value.
+        Value::Boolean(_) => return Ok(()),
+        // A number or a date can: a numeric password, a PIN. Its text
+        // cannot be a secret URI, so the checks of a string apply to "".
+        Value::Integer(_) | Value::Float(_) | Value::Datetime(_) => "",
     };
     // A built-in secret URI can contain `:`, `@` and `=` in its path. A
-    // second `://` shows that the text is more than one URI.
+    // second `://`, a `;` or whitespace shows that the text is more than
+    // one URI.
     let is_built_in = text.matches("://").count() == 1
+        && !text.contains(|ch: char| ch == ';' || ch.is_whitespace())
         && text
             .parse::<SecretUri>()
             .is_ok_and(|uri| BUILT_IN_SECRET_SCHEMES.contains(&uri.scheme()));
@@ -1011,21 +1127,6 @@ mod tests {
         }
     }
 
-    /// R-44: only a string can be a secret value.
-    #[test]
-    fn value_that_is_not_a_string_is_accepted_under_a_secret_key() {
-        let settings = settings(&[(
-            Layer::User,
-            "schema_version = 1\ntokens_per_page = 50\nmax_password_length = 12\n\
-             show_password = true\nsave_passwords = false\ntoken_limit = 5\n\
-             max_tokens = 4096\nmask_secrets = true\nsecret = 1.5\n\
-             token = 2026-11-25\npasswords = [1, true]\n[credentials]\nretries = 3\n",
-        )]);
-        assert_eq!(settings.get::<u32>("max_tokens").unwrap(), Some(4096));
-        assert_eq!(settings.get::<bool>("show_password").unwrap(), Some(true));
-        assert_eq!(settings.get::<u32>("credentials.retries").unwrap(), Some(3));
-    }
-
     /// R-44: an array or a table under a secret key is checked string by
     /// string.
     #[test]
@@ -1095,7 +1196,11 @@ mod tests {
             "secretkey = \"hunter2\"\n",
             "url = \"postgres://app:hun/ter2@db/prod\"\n",
             "url = \"https://hunter2@api.example.com\"\n",
+            "url = \"app:hunter2@db:5432/prod\"\n",
+            "dsn = \"host = db password = hunter2\"\n",
             "password = \"x://hunter2\"\n",
+            "ref = \"keychain://x?password=hunter2\"\n",
+            "fmt = \"password={hunter2}\"\n",
         ] {
             let mut settings = Settings::new();
             let result = settings.set_layer(
@@ -1341,5 +1446,231 @@ mod tests {
         // The test environment sets HOME (Unix) or APPDATA (Windows).
         let path = user_settings_path().unwrap();
         assert!(path.ends_with("rivet/settings.toml"), "{}", path.display());
+    }
+    /// R-63: the text of a parser error can repeat a value of the file.
+    #[test]
+    fn parser_text_of_an_unknown_kind_is_not_passed_on() {
+        let problem = parse_problem("some new kind that quotes `hunter2secret`");
+        assert_eq!(problem, "the text is not valid TOML");
+    }
+
+    /// R-63: each kind of parser error gives a fixed text.
+    #[test]
+    fn parse_error_of_each_kind_names_the_file_and_the_line_and_hides_the_content() {
+        let number = "a number is out of range";
+        let general = "the text is not valid TOML";
+        for (body, problem, leaks) in [
+            // Invalid type: an integer that is too large.
+            (
+                "password = 31415926535897932384\n",
+                number,
+                &["31415926535897932384"][..],
+            ),
+            (
+                "token = 0xFFFFFFFFFFFFFFFFFFFFFFFF\n",
+                number,
+                &["79228162514264337593543950335", "FFFF"],
+            ),
+            ("pin = 1e999999\n", number, &["999999"]),
+            // Invalid value.
+            (
+                "password = hunter2secret\n",
+                "no quotes",
+                &["hunter2secret"],
+            ),
+            (
+                "password = 2026-99-99T25:61:61Zhunter2secret\n",
+                general,
+                &["hunter2secret", "99"],
+            ),
+            // Duplicate key.
+            (
+                "hunter2secret = 1\nhunter2secret = 2\n",
+                "two times",
+                &["hunter2secret"],
+            ),
+            (
+                "[hunter2secret]\n[hunter2secret]\n",
+                "two times",
+                &["hunter2secret"],
+            ),
+            // Unterminated string, invalid escape, key with no value.
+            (
+                "password = \"hunter2secret\n",
+                "not closed",
+                &["hunter2secret"],
+            ),
+            (
+                "password = '''hunter2secret\n",
+                "not closed",
+                &["hunter2secret"],
+            ),
+            (
+                "password = \"hunter2secret\\q\"\n",
+                general,
+                &["hunter2secret"],
+            ),
+            ("hunter2secret\n", "no value", &["hunter2secret"]),
+            (
+                "password = [\"hunter2secret\", 1 2]\n",
+                "no quotes",
+                &["hunter2secret"],
+            ),
+        ] {
+            let mut settings = Settings::new();
+            let text = assert_user_error(
+                settings.set_layer(
+                    Layer::Workspace,
+                    "ws.toml",
+                    &format!("schema_version = 1\n{body}"),
+                ),
+                &["ws.toml: line ", problem],
+            );
+            for leak in leaks {
+                assert!(!text.contains(leak), "{body} leaked: {text}");
+            }
+        }
+    }
+    /// Asserts that each body is refused and that the message does not
+    /// contain `hunter2`.
+    fn assert_each_is_refused(bodies: &[&str]) {
+        for body in bodies {
+            let mut settings = Settings::new();
+            let result = settings.set_layer(
+                Layer::User,
+                "user.toml",
+                &format!("schema_version = 1\n{body}"),
+            );
+            assert!(result.is_err(), "accepted: {body}");
+            let text = assert_user_error(result, &["user.toml", "`"]);
+            assert!(!text.contains("hunter2"), "{body} leaked: {text}");
+        }
+    }
+
+    fn assert_each_is_accepted(bodies: &[&str]) {
+        for body in bodies {
+            let mut settings = Settings::new();
+            let result = settings.set_layer(
+                Layer::User,
+                "user.toml",
+                &format!("schema_version = 1\n{body}"),
+            );
+            assert!(result.is_ok(), "{body}: {result:?}");
+        }
+    }
+
+    /// R-44: the keyword form of a PostgreSQL connection string, and each
+    /// `name=` of a text, not only the first one.
+    #[test]
+    fn secret_parameter_is_found_after_whitespace_and_comma() {
+        assert_each_is_refused(&[
+            "dsn = \"host=db user=app password=hunter2\"\n",
+            "dsn = \"password=hunter2 host=db\"\n",
+            "dsn = \"user=a,password=hunter2\"\n",
+            "dsn = \"host=db\\tpassword='hunter2 x'\"\n",
+            "dsn = \"dbname=x sslmode=require pwd=hunter2 connect_timeout=5\"\n",
+            "dsn = \"Server=h; User=a; Pwd = hunter2\"\n",
+        ]);
+        assert_each_is_accepted(&[
+            "dsn = \"host=db user=app sslmode=require\"\n",
+            "dsn = \"host=db user=app password= sslmode=require\"\n",
+            "sql = \"select 1; select token = 5\"\n",
+        ]);
+    }
+
+    /// R-65 (a): only a built-in secret URI and nothing else skips the checks.
+    #[test]
+    fn text_after_a_built_in_secret_uri_is_checked() {
+        assert_each_is_refused(&[
+            "dsn = \"keychain://x;Password=hunter2\"\n",
+            "password = \"keychain://x;Password=hunter2\"\n",
+            "dsn = \"aws-sm://x password=hunter2\"\n",
+            "dsn = \"gcp-sm://x\\npassword=hunter2\"\n",
+        ]);
+    }
+    /// R-64: a number or a date under a secret key is a secret value.
+    #[test]
+    fn number_and_date_are_refused_under_a_secret_key() {
+        for (body, key) in [
+            ("password = 12345678\n", "`password`"),
+            ("[db]\nsecret = 12345\n", "`db.secret`"),
+            ("secret = 1.5\n", "`secret`"),
+            ("token = 2026-11-25\n", "`token`"),
+            ("passwords = [true, 12345678, 1.5]\n", "`passwords[1]`"),
+            ("password = { value = 12345678 }\n", "`password.value`"),
+            ("api_key = 12345678\n", "`api_key`"),
+        ] {
+            let mut settings = Settings::new();
+            let text = assert_user_error(
+                settings.set_layer(
+                    Layer::User,
+                    "user.toml",
+                    &format!("schema_version = 1\n{body}"),
+                ),
+                &["user.toml", key, "secret URI", "use a key name"],
+            );
+            for value in ["12345", "1.5", "2026"] {
+                assert!(!text.contains(value), "{body} leaked: {text}");
+            }
+        }
+    }
+
+    /// R-64, R-65 (b): a key with a word of [`ABOUT_A_SECRET`] is a setting
+    /// about a secret. A boolean is not a secret under any key.
+    #[test]
+    fn setting_about_a_secret_accepts_each_value_type() {
+        assert_each_is_accepted(&[
+            "max_tokens = 4096\n",
+            "token_ttl = 60\n",
+            "token_ttl = \"5m\"\n",
+            "password_min_length = 12\n",
+            "tokens_per_page = 50\n",
+            "token_limit = 5\n",
+            "secret_timeout = 1.5\n",
+            "password_file_2 = \"/run/secrets/db\"\n",
+            "db_password_file = \"/run/secrets/db\"\n",
+            "credentialsPath = \"/etc/creds\"\n",
+            "password_encryption = \"scram-sha-256\"\n",
+            "[credentials]\nretries = 3\nfile = \"/etc/creds\"\n",
+            "[tokens]\nttl = 60\n[tokens.limit]\nburst = 5\n",
+            "password = true\nshow_password = true\nsave_passwords = false\n",
+            "passwords = [true, false]\n",
+            // The documented limits.
+            "password_file = \"hunter2\"\n",
+            "pin = 1234\npin_code = \"hunter2\"\n",
+        ]);
+        // The text checks still apply.
+        assert_each_is_refused(&[
+            "password_file = \"postgres://app:hunter2@db/prod\"\n",
+            "token_path = \"/x?password=hunter2\"\n",
+            "[tokens]\nttl = 60\nprod = \"hunter2\"\n",
+            "password_hint = \"hunter2\"\n",
+        ]);
+    }
+
+    /// R-65 (b): a parameter about a secret, and a placeholder as the value.
+    #[test]
+    fn parameter_about_a_secret_and_placeholder_value_are_accepted() {
+        assert_each_is_accepted(&[
+            "opt = \"password_encryption=scram-sha-256\"\n",
+            "opt = \"host=db password_file=/run/secrets/db\"\n",
+            "fmt = \"token=%s\"\n",
+            "url = \"postgres://db/prod?user=a&password=${env:PGPASSWORD}\"\n",
+            "dsn = \"password=${PGPASSWORD} host=db\"\n",
+            "dsn = \"host=db password={password} user={}\"\n",
+            "dsn = \"Server=h; Pwd = {}\"\n",
+            // `?` starts a new parameter, so the value is empty.
+            "fmt = \"token=?\"\n",
+        ]);
+        // Other placeholder forms and a placeholder with more text.
+        assert_each_is_refused(&[
+            "fmt = \"token=%v\"\n",
+            "fmt = \"token=$TOKEN\"\n",
+            "fmt = \"token=$1\"\n",
+            "fmt = \"token=:name\"\n",
+            "fmt = \"token=%shunter2\"\n",
+            "fmt = \"token=${a}hunter2\"\n",
+            "fmt = \"token={a}hunter2\"\n",
+        ]);
     }
 }

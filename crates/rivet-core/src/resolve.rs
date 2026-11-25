@@ -91,6 +91,18 @@ impl Resolution {
 /// conflict parties.
 pub const MAX_CONFLICT_PARTIES: usize = 5;
 
+/// The largest number of characters of one version range that a rejection
+/// reason contains. A longer range is cut and gets `...` at the end.
+pub const MAX_RANGE_CHARS: usize = 64;
+
+/// Returns `range` cut to [`MAX_RANGE_CHARS`] characters.
+fn cut(range: &str) -> String {
+    match range.char_indices().nth(MAX_RANGE_CHARS) {
+        Some((end, _)) => format!("{}...", &range[..end]),
+        None => range.to_owned(),
+    }
+}
+
 /// Resolves the dependencies of `manifests` for a host with the SDK version
 /// `host_sdk` (§4.5).
 ///
@@ -117,6 +129,10 @@ pub const MAX_CONFLICT_PARTIES: usize = 5;
 ///      that have only pre-release versions in common are named as a
 ///      conflict.
 ///    - An extension that is rejected for another reason is not named.
+///      Reason 4 names no conflicts: a dependency that is not present has
+///      no version that a range can exclude.
+///    - A range longer than [`MAX_RANGE_CHARS`] characters is cut, in this
+///      reason and in reasons 3 and 4.
 ///    - At most [`MAX_CONFLICT_PARTIES`] extensions are named. The reason
 ///      gives the number of the others.
 /// 6. A dependency is rejected.
@@ -186,7 +202,7 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
 
     let mut resolved = Vec::new();
     // (dependent, dependency): the range rejects the present version.
-    let mut mismatches: Vec<(&ExtensionId, &ExtensionId)> = Vec::new();
+    let mut mismatches: BTreeSet<(&ExtensionId, &ExtensionId)> = BTreeSet::new();
     for id in sorted.iter().copied().chain(unsorted) {
         let Some(&manifest) = unique.get(id) else {
             continue;
@@ -208,7 +224,7 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
             reject(format!(
                 "extension `{id}` supports the SDK versions `{}`, but the host has the SDK \
                  version {host_sdk}",
-                manifest.sdk
+                cut(&manifest.sdk.to_string())
             ))
         } else {
             manifest
@@ -216,14 +232,16 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
                 .iter()
                 .find_map(|(dependency, range)| match unique.get(dependency) {
                     None if !outcomes.contains_key(dependency) => Some(format!(
-                        "extension `{id}` depends on `{dependency}` `{range}`, but \
-                         `{dependency}` is not present"
+                        "extension `{id}` depends on `{dependency}` `{}`, but \
+                         `{dependency}` is not present",
+                        cut(&range.to_string())
                     )),
                     Some(found) if !range.matches(&found.version) => {
-                        mismatches.push((id, dependency));
+                        mismatches.insert((id, dependency));
                         Some(format!(
-                            "extension `{id}` depends on `{dependency}` `{range}`, but \
+                            "extension `{id}` depends on `{dependency}` `{}`, but \
                              `{dependency}` {} is present",
+                            cut(&range.to_string()),
                             found.version
                         ))
                     }
@@ -255,12 +273,15 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
             .filter(|other| other.id != *id)
             .filter_map(|other| {
                 let other_range = other.dependencies.get(dependency)?;
-                let takes_part = matches!(outcomes.get(&other.id), Some(Outcome::Resolved))
-                    || mismatches.contains(&(&other.id, dependency));
+                let takes_part = matches!(outcomes.get(&other.id), Some(Outcome::Resolved)) || {
+                    count_step();
+                    mismatches.contains(&(&other.id, dependency))
+                };
                 (takes_part && ranges_conflict(range, other_range)).then(|| {
                     format!(
-                        "extension `{}`, which depends on `{dependency}` `{other_range}`",
-                        other.id
+                        "extension `{}`, which depends on `{dependency}` `{}`",
+                        other.id,
+                        cut(&other_range.to_string())
                     )
                 })
             })
@@ -280,6 +301,19 @@ pub fn resolve(manifests: &[Manifest], host_sdk: &Version) -> Resolution {
         outcomes.insert(id.clone(), reject(message));
     }
     Resolution { outcomes, resolved }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of lookups in the conflict pass of [`resolve`] on this
+    /// thread. A test uses it to check the cost without a clock.
+    static CONFLICT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one lookup of the conflict pass. Does nothing outside tests.
+fn count_step() {
+    #[cfg(test)]
+    CONFLICT_STEPS.set(CONFLICT_STEPS.get() + 1);
 }
 
 /// `true` if no release version satisfies both ranges.
@@ -999,5 +1033,61 @@ mod tests {
             assert!(plan.activate.is_empty(), "{trigger:?}");
             assert!(plan.blocked.is_empty(), "{trigger:?}");
         }
+    }
+    /// R-66 (a): the conflict pass does one lookup for each pair of
+    /// dependents, not one for each triple.
+    #[test]
+    fn conflict_pass_does_at_most_one_lookup_for_each_pair_of_dependents() {
+        const DEPENDENTS: usize = 60;
+        let mut manifests = vec![ext("lib", "9.0.0", &[])];
+        for index in 0..DEPENDENTS {
+            // Each range excludes the present version.
+            let range = format!("^{}", index % 8 + 1);
+            manifests.push(ext(&format!("e{index}"), "1.0.0", &[("lib", &range)]));
+        }
+        CONFLICT_STEPS.set(0);
+        let resolution = resolve_all(&manifests);
+        let steps = CONFLICT_STEPS.get();
+        rejected(&resolution, "e0", &["conflict with", "more extensions"]);
+        assert!(
+            steps <= DEPENDENTS * (DEPENDENTS + 1),
+            "{steps} lookups for {DEPENDENTS} dependents"
+        );
+    }
+
+    /// R-66 (b): a long range is cut in each message.
+    #[test]
+    fn long_range_is_cut_in_the_rejection_reason() {
+        let long = format!("<1.0.0-{}", "a".repeat(5000));
+        let manifests = [
+            ext("a", "1.0.0", &[("lib", &long)]),
+            ext("b", "1.0.0", &[("lib", "^3")]),
+            ext("c", "1.0.0", &[("gone", &long)]),
+            ext("lib", "2.0.0", &[]),
+        ];
+        let limit = 5 * MAX_RANGE_CHARS + 400;
+        for id in ["a", "b", "c"] {
+            let message = rejected(
+                &resolve_all(&manifests),
+                id,
+                &["`lib`"][..usize::from(id != "c")],
+            );
+            assert!(message.len() <= limit, "{id}: {} bytes", message.len());
+            assert!(!message.contains(&"a".repeat(MAX_RANGE_CHARS + 1)), "{id}");
+        }
+        rejected(
+            &resolve_all(&manifests),
+            "b",
+            &["conflict with extension `a`", "..."],
+        );
+        let mut sdk = ext("s", "1.0.0", &[]);
+        sdk.sdk = long.replace('<', ">=").parse().expect("valid range");
+        let message = rejected(&resolve_all(&[sdk]), "s", &["SDK", "..."]);
+        assert!(message.len() <= limit, "{} bytes", message.len());
+
+        assert_eq!(cut("^1"), "^1");
+        let exact = "é".repeat(MAX_RANGE_CHARS);
+        assert_eq!(cut(&exact), exact);
+        assert_eq!(cut(&format!("{exact}é")), format!("{exact}..."));
     }
 }

@@ -40,9 +40,10 @@ struct Registered {
     count: usize,
 }
 
-/// How many escapes on top of each other the redactor undoes: one by the log
-/// format, and two by the application before it logs the text.
-const ESCAPE_DEPTH: usize = 3;
+/// How many escapes on top of each other the redactor undoes: up to two by
+/// the log path (a field logged with `?` in the JSON format), and two by the
+/// application before it logs the text.
+const ESCAPE_DEPTH: usize = 4;
 
 /// The forms of `value` that a log line can contain: the value itself, then
 /// each chain of up to [`ESCAPE_DEPTH`] escapes of it. An escape is the
@@ -133,14 +134,23 @@ fn sanitized(value: &str) -> Zeroizing<String> {
 /// - The redactor searches the formatted line for the value and for its
 ///   escaped forms. An escape is the `Debug` form of Rust, a JSON string as
 ///   serde_json writes it, or the form in which the human format writes
-///   control characters (for example ESC as `\\x1b`). Up to three escapes on
-///   top of each other are found. The log format adds one, so the
-///   application can add two: for example a JSON body that is logged with
-///   `?`. Text that the application escaped three or more times is not
-///   redacted.
+///   control characters (for example ESC as `\\x1b`). Up to four escapes on
+///   top of each other are found. The log path adds up to two (a field
+///   logged with `?` in the JSON format), so the application can add two:
+///   for example a JSON body in a `Debug` text. Text that the application
+///   escaped three or more times is not redacted.
+/// - Cost: each form of each value is searched in each log line. A value
+///   that no escape changes has 1 form. Measured: a value with one quote
+///   has 5 forms; a value with a quote, a backslash and control characters
+///   has 25 forms.
 /// - It does not find other encodings of the value: Base64, URL encoding,
 ///   hex, a JSON encoder with other rules than serde_json (for example `\\/`
 ///   or `\\u001B`), or a part of the value.
+/// - The redactor replaces text and does not know the log format. A value
+///   that is equal to a part of the format damages the line: with the
+///   values `true` and `1234`, the JSON text `"ok":true,"rows":12345`
+///   becomes `"ok":[REDACTED],"rows":[REDACTED]5`, which is not JSON.
+///   [`MIN_REDACTED_LEN`] does not prevent this.
 /// - Redaction applies to log output only. Errors must not contain secrets
 ///   by construction (§5.6).
 ///
@@ -685,7 +695,8 @@ mod tests {
         twice.chain(once.clone()).collect()
     }
 
-    /// R-43: each escape alone, and three escapes on top of each other.
+    /// R-43, R-67 (a): each escape alone, and four escapes on top of each
+    /// other.
     #[test]
     fn json_form_of_a_secret_with_a_quote_at_the_end_is_complete() {
         let value = "ZqXwJk7\"";
@@ -695,11 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn redact_finds_each_escaped_form_and_a_chain_of_three() {
+    fn redact_finds_each_escaped_form_and_a_chain_of_four() {
         // No escape leaves this value as it is.
         let value = "Zq\"Xw\u{1b}Jk";
         let redactor = redactor(&[value]);
-        let chain = json_escaped(&debug_escaped(&json_escaped(value)));
+        let chain = json_escaped(&debug_escaped(&debug_escaped(&json_escaped(value))));
         let forms = [
             debug_escaped(value),
             json_escaped(value),
@@ -710,9 +721,9 @@ mod tests {
             assert_ne!(*form, value);
             assert_eq!(redactor.redact(&format!("<{}>", *form)), "<[REDACTED]>");
         }
-        // The limit: four escapes are not found.
+        // The limit: five escapes are not found.
         let four = json_escaped(&json_escaped(&json_escaped(&json_escaped(value))));
-        assert!(redactor.redact(&four).contains("Zq"));
+        assert!(redactor.redact(&json_escaped(&four)).contains("Zq"));
     }
 
     /// R-43: the reported cases.
@@ -784,5 +795,35 @@ mod tests {
             writer.flush().unwrap();
         }
         assert_eq!(String::from_utf8(output).unwrap(), "[REDACTED]\n");
+    }
+    /// R-67 (a): the reported case. A JSON body in a `Debug` text in an error
+    /// that is logged with `?`.
+    #[test]
+    fn a_secret_in_a_json_body_in_an_error_text_logged_with_debug_is_redacted() {
+        let value = "Zq\"XwJk";
+        let redactor = redactor(&[value]);
+        let body = serde_json::json!({ "password": value }).to_string();
+        let failure = format!("bad response {body:?}");
+        for format in FORMATS {
+            let output = captured(Level::INFO, format, &redactor, || {
+                error!(err = ?failure, "request failed");
+            });
+            for part in ["Zq", "Xw", "Jk"] {
+                assert!(!output.contains(part), "{format:?} leaked {part}: {output}");
+            }
+        }
+    }
+
+    /// R-67 (c): the documented limit. A secret that is equal to a part of
+    /// the JSON syntax or of a number breaks the JSON line.
+    #[test]
+    fn a_secret_that_is_json_syntax_makes_the_json_line_invalid() {
+        let redactor = redactor(&["true", "1234"]);
+        let output = captured(Level::INFO, LogFormat::Json, &redactor, || {
+            info!(ok = true, rows = 12345, "done");
+        });
+        assert!(output.contains("\"ok\":[REDACTED]"), "{output}");
+        assert!(output.contains("\"rows\":[REDACTED]5"), "{output}");
+        assert!(serde_json::from_str::<serde_json::Value>(output.trim()).is_err());
     }
 }
