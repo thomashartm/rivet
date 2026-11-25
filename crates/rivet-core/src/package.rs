@@ -129,7 +129,7 @@ pub const PACKAGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The first id segment that is reserved for the project (ADR-0019). An
 /// extension with this segment is a built-in extension.
-const PROJECT_PUBLISHER: &str = "rivet";
+pub(crate) const PROJECT_PUBLISHER: &str = "rivet";
 
 /// The algorithm id of a minisign public key. A signature has another id
 /// (`ED` for a prehashed signature).
@@ -743,7 +743,7 @@ fn read_text_file(path: &Path, what: &str, max_bytes: u64) -> Result<String> {
 /// Opens `path` for reading. Refuses a symbolic link, anything that is not
 /// a regular file (a directory, a FIFO, a device) and a file of more than
 /// `max_bytes`. `what` names the kind of file in the error.
-fn open_regular(path: &Path, what: &str, max_bytes: u64) -> Result<File> {
+pub(crate) fn open_regular(path: &Path, what: &str, max_bytes: u64) -> Result<File> {
     let unreadable = |error| io_error(path, &format!("cannot read the {what} file"), error);
     let check = |meta: Metadata| {
         let refused =
