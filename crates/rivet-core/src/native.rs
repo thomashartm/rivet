@@ -239,7 +239,8 @@ struct Slot {
 struct SlotUser {
     id: ExtensionId,
     slots: Arc<Slots>,
-    slot: Arc<Semaphore>,
+    /// `None` only in the drop: it is dropped with the lock held.
+    slot: Option<Arc<Semaphore>>,
 }
 
 impl Drop for SlotUser {
@@ -248,10 +249,16 @@ impl Drop for SlotUser {
     /// also.
     fn drop(&mut self) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        // The two owners are the map and this user: its permit or its wait
-        // for the permit is dropped before it. Each other user is one or
-        // two more, and it became a user with this lock held.
-        if Arc::strong_count(&self.slot) == 2 {
+        // With the lock held, so that two last users cannot both count the
+        // other one (R-125).
+        drop(self.slot.take());
+        // The map is then the only owner: the permit or the wait for the
+        // permit of this user is dropped before it. Each other user is one
+        // or two more, and it became a user with this lock held.
+        if slots
+            .get(&self.id)
+            .is_some_and(|slot| Arc::strong_count(slot) == 1)
+        {
             slots.remove(&self.id);
         }
     }
@@ -295,19 +302,20 @@ impl NativeRuntime {
     /// Waits until no process of `id` runs. A load of a different
     /// extension does not wait, and no lock is held during the wait.
     async fn slot(&self, id: &ExtensionId) -> Result<Slot> {
-        let user = {
+        let (user, slot) = {
             let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
             let slot = slots
                 .entry(id.clone())
                 .or_insert_with(|| Arc::new(Semaphore::new(1)));
-            SlotUser {
+            let user = SlotUser {
                 id: id.clone(),
                 slots: Arc::clone(&self.slots),
-                slot: Arc::clone(slot),
-            }
+                slot: Some(Arc::clone(slot)),
+            };
+            (user, Arc::clone(slot))
         };
         // Nothing closes the semaphore.
-        let permit = Arc::clone(&user.slot)
+        let permit = slot
             .acquire_owned()
             .await
             .map_err(|error| failure(id, "the process slot is closed").with_source(error))?;
@@ -813,5 +821,37 @@ mod tests {
         assert_eq!(entries(&runtime), 0);
         // The next load does not wait.
         let _slot = runtime.slot(&id).await.unwrap();
+    }
+
+    // R-125: the last two users end at the same time on two threads.
+    #[tokio::test]
+    async fn two_last_users_on_two_threads_remove_the_entry() {
+        const ROUNDS: usize = 40_000;
+        let runtime = runtime();
+        let id: ExtensionId = "acme.native".parse().unwrap();
+        let mut left = 0;
+        for _ in 0..ROUNDS {
+            let slot = runtime.slot(&id).await.unwrap();
+            // A second user, as a load that waits for the slot.
+            let user = SlotUser {
+                id: id.clone(),
+                slots: Arc::clone(&runtime.slots),
+                slot: slot._user.slot.clone(),
+            };
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    drop(slot);
+                });
+                start.wait();
+                drop(user);
+            });
+            if entries(&runtime) != 0 {
+                left += 1;
+                runtime.slots.lock().unwrap().clear();
+            }
+        }
+        assert_eq!(left, 0, "an entry stayed in {left} of {ROUNDS} rounds");
     }
 }
