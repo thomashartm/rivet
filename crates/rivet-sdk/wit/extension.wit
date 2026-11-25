@@ -1,0 +1,55 @@
+/// The contract between the Rivet host and an extension that runs as a
+/// WASM component (ARCHITECTURE.md §4.3, ADR-0002).
+///
+/// The version of this package is the version of the `rivet-sdk` crate.
+package rivet:extension@0.1.0;
+
+/// The error model of the SDK (ARCHITECTURE.md §5.6).
+interface types {
+    /// The kind of failure. It has the categories of `ErrorCategory` in
+    /// `rivet-sdk`.
+    enum error-category {
+        user,
+        auth,
+        connectivity,
+        database,
+        policy,
+        cancelled,
+        retryable,
+        internal,
+    }
+
+    /// A failure. The message must not contain secrets.
+    record error {
+        category: error-category,
+        message: string,
+    }
+}
+
+/// Log output of an extension. The host writes it to its own log.
+interface logging {
+    /// The severity of a log message.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Writes one message to the log of the host.
+    log: func(level: log-level, message: string);
+}
+
+/// The world that every extension component implements.
+world extension {
+    use types.{error};
+
+    import logging;
+
+    /// Starts the extension. The host calls it before any other function.
+    export activate: func() -> result<_, error>;
+
+    /// Stops the extension. The extension releases what it holds.
+    export deactivate: func() -> result<_, error>;
+}
