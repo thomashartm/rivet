@@ -1643,6 +1643,9 @@ mod tests {
             "password = \"keychain://x;Password=hunter2\"\n",
             "dsn = \"aws-sm://x password=hunter2\"\n",
             "dsn = \"gcp-sm://x\\npassword=hunter2\"\n",
+            // A second `://` and no `;` or whitespace.
+            "dsn = \"keychain://x,postgres://app:hunter2@db/prod\"\n",
+            "password = \"keychain://x/postgres://app:hunter2@db/prod\"\n",
         ]);
     }
     /// R-64: a number or a date under a secret key is a secret value.

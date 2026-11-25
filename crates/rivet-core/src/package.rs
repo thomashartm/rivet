@@ -272,8 +272,8 @@ fn decode_key(base64: &str) -> Option<[u8; 42]> {
 ///
 /// Source: the list `blacklist` in `ge25519_has_small_order` of libsodium,
 /// tag `1.0.18`, file
-/// `src/libsodium/crypto_core/ed25519/ref10/ed25519_ref10.c`. A later
-/// libsodium has no list: its function calculates the check from the point.
+/// `src/libsodium/crypto_core/ed25519/ref10/ed25519_ref10.c`. The list
+/// has 7 entries there; tag `1.0.20` has the same list of 7 entries.
 /// The entries of the list for y = p and y = p + 1 are not here:
 /// [`is_weak_key`] refuses each y that is not below p.
 const SMALL_ORDER_Y: [[u8; 32]; 5] = [
@@ -1706,6 +1706,29 @@ mod tests {
         );
     }
 
+    /// R-95 (b): a key is cut at a character boundary. `é` has 2 bytes.
+    #[test]
+    fn key_with_a_multi_byte_character_at_the_cut_is_cut_before_it() {
+        // `é` is in the bytes 127 and 128: the cut moves to its start.
+        let start = "k".repeat(MAX_SHOWN_KEY_BYTES - 1);
+        assert_eq!(shown_key(&format!("{start}éx")), format!("{start}…"));
+        // `é` ends at the limit: it stays.
+        let start = "k".repeat(MAX_SHOWN_KEY_BYTES - 2);
+        assert_eq!(shown_key(&format!("{start}éx")), format!("{start}é…"));
+        assert_eq!(shown_key(&format!("{start}é")), format!("{start}é"));
+
+        // The whole message of a trust store file with such a key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.toml");
+        let start = "k".repeat(MAX_SHOWN_KEY_BYTES - 1);
+        std::fs::write(&path, format!("schema_version = 1\n\"{start}éx\" = 1\n")).unwrap();
+        let error = TrustStore::load(TestKey::new().public, &path).unwrap_err();
+        assert_eq!(
+            error.message(),
+            format!("{}: unknown key `{start}…`", shown(&path))
+        );
+    }
+
     #[test]
     fn save_to_a_path_that_cannot_be_written_names_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2545,7 +2568,7 @@ mod tests {
         let message = assert_error(
             verify_acme(&store),
             ErrorCategory::Policy,
-            &["changed its key"],
+            &["publisher `acme`", "changed its key", "new review"],
         );
         assert!(!message.contains("key id"), "{message}");
         let message = assert_error(
