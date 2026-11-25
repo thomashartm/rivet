@@ -10,7 +10,7 @@ ADR-0006 pins publisher keys on first install. It does not say what identifies a
 ## Decision
 
 - The publisher of an extension is the first segment of its extension id: `acme.postgres` has the publisher `acme`. An id with one segment is its own publisher. The manifest gets no free publisher field.
-- The publisher of a bundled extension is the project. Its package is verified with the project key only. The first segment `rivet` is reserved for the project: a key cannot be pinned for the publisher `rivet` (to enforce in #12 part 2; no check exists).
+- The publisher of a bundled extension is the project. Its package is verified with the project key only. The first segment `rivet` is reserved for the project, in both directions: a built-in package is verified only if the first segment of its id is `rivet`, and a key cannot be pinned for the publisher `rivet`, and a publisher package with this segment is refused. The checks are in `package.rs` on `main` (read at commit cb047c8).
 - Verification uses the `minisign-verify` crate. Legacy signatures (not prehashed) are refused, so a package is verified as a stream.
 - Pinned keys are stored in `trust.toml` in the user configuration directory. The file has `schema_version` and a table `[publishers]` with one public key per publisher.
 - The trust store MUST NOT be read from a workspace directory or a bundled directory (to enforce in #12 part 2, which gives the path; no check exists).
