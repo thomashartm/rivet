@@ -535,8 +535,14 @@ impl Inner {
         let overdue = async {
             token.cancelled().await;
             tokio::time::sleep(grace).await;
+            // Work that ends at the same moment as the grace period gets
+            // its turn before the abort.
+            tokio::task::yield_now().await;
         };
         let joined = tokio::select! {
+            // A job that has finished keeps its result, also if the grace
+            // period ends in the same poll.
+            biased;
             joined = &mut work => joined,
             () = overdue => {
                 work.abort();
@@ -1259,6 +1265,28 @@ mod tests {
         assert_eq!(next.join().await.unwrap(), "next");
         let again = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok("again") });
         assert_eq!(again.unwrap().join().await.unwrap(), "again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_that_ends_at_the_end_of_the_grace_period_keeps_its_result() {
+        let grace = JobConfig::default().cancel_grace;
+        let scheduler = scheduler(1);
+        for round in 0..200 {
+            // The work and the grace period end at the same moment.
+            let handle = scheduler
+                .spawn(owner("ext.a"), "query", move |ctx| async move {
+                    ctx.cancelled().await;
+                    tokio::time::sleep(grace).await;
+                    Ok(round)
+                })
+                .unwrap();
+            wait_for(&handle, JobState::Running).await;
+            handle.cancel();
+
+            let watch = handle.watch();
+            assert_eq!(handle.join().await.unwrap(), round);
+            assert_eq!(watch.borrow().state, JobState::Succeeded);
+        }
     }
 
     #[test]
