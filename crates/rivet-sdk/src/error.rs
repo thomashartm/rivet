@@ -63,7 +63,17 @@ pub struct Error {
 }
 
 impl Error {
-    fn new(category: ErrorCategory, message: impl Into<String>) -> Self {
+    /// Creates an error of the given category. Use it when the category is a
+    /// value, for example to keep the category of another error.
+    ///
+    /// ```
+    /// use rivet_sdk::error::Error;
+    ///
+    /// let cause = Error::auth("token expired");
+    /// let error = Error::new(cause.category(), "the backend failed");
+    /// assert_eq!(error.to_string(), "auth: the backend failed");
+    /// ```
+    pub fn new(category: ErrorCategory, message: impl Into<String>) -> Self {
         Self {
             category,
             message: message.into(),
@@ -164,6 +174,25 @@ mod tests {
         for (error, category) in cases {
             assert_eq!(error.category(), category);
             assert_eq!(error.message(), "m");
+        }
+    }
+
+    #[test]
+    fn new_keeps_each_category() {
+        for category in [
+            ErrorCategory::User,
+            ErrorCategory::Auth,
+            ErrorCategory::Connectivity,
+            ErrorCategory::Database,
+            ErrorCategory::Policy,
+            ErrorCategory::Cancelled,
+            ErrorCategory::Retryable,
+            ErrorCategory::Internal,
+        ] {
+            let error = Error::new(category, "m");
+            assert_eq!(error.category(), category);
+            assert_eq!(error.message(), "m");
+            assert!(error.source().is_none());
         }
     }
 

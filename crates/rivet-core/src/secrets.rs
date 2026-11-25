@@ -9,7 +9,7 @@ use crate::Owner;
 use crate::logging::{MIN_REDACTED_LEN, Redactor};
 use crate::permissions::Permissions;
 use crate::wasm::guest_text;
-use rivet_sdk::error::{Error, ErrorCategory, Result};
+use rivet_sdk::error::{Error, Result};
 use rivet_sdk::manifest::ExtensionId;
 use rivet_sdk::secret::{Secret, SecretUri};
 use std::collections::HashMap;
@@ -425,19 +425,7 @@ impl SecretStore {
             "the secret backend for the scheme `{}` failed: {text}",
             shown(scheme)
         );
-        // shortcut: the SDK has no constructor that takes a category; add
-        // one there and remove this list (`guest_error` in `wasm.rs` has the
-        // same list).
-        match error.category() {
-            ErrorCategory::User => Error::user(message),
-            ErrorCategory::Auth => Error::auth(message),
-            ErrorCategory::Connectivity => Error::connectivity(message),
-            ErrorCategory::Database => Error::database(message),
-            ErrorCategory::Policy => Error::policy(message),
-            ErrorCategory::Cancelled => Error::cancelled(message),
-            ErrorCategory::Retryable => Error::retryable(message),
-            _ => Error::internal(message),
-        }
+        Error::new(error.category(), message)
     }
 
     /// Registers the value of `secret` with `redactor`: for the extension
@@ -658,6 +646,7 @@ impl fmt::Debug for ExtensionSecrets {
 mod tests {
     use super::*;
     use crate::logging::{Capture, Level, LogFormat, REDACTED, capture_logs};
+    use rivet_sdk::error::ErrorCategory;
     use rivet_sdk::manifest::Manifest;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing::info;
