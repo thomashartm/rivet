@@ -1102,6 +1102,10 @@ impl ExtensionHost {
     ///   the host checks this first and changes nothing: the old version
     ///   and its dependents stay as they are. An extension without loaded
     ///   code is `Rejected` with the reason, or removed.
+    ///
+    ///   After each of these two errors, a `Failed` extension stays `Failed`
+    ///   with the reason of the refusal, and its pending automatic restart
+    ///   is stopped: the host does not restart it by itself (ADR-0017).
     /// - The error of its `deactivate` call. The extension is `Failed`. The
     ///   host does not restart it automatically.
     /// - An `internal` error if the read of the directories panicked.
@@ -1119,21 +1123,31 @@ impl ExtensionHost {
         let mut was_active = BTreeSet::new();
         let mut report = ActivationReport::default();
         let old_directory = {
-            let inner = self.inner();
+            let mut inner = self.inner();
             let entry = inner.entries.get(id);
-            let in_use = entry.map(|entry| entry.package.directory.as_path());
-            if let Some(reason) = scan.broken(id, in_use) {
-                return Err(Error::user(reason.clone()));
-            }
+            let in_use = entry.map(|entry| entry.package.directory.clone());
+            let broken = scan.broken(id, in_use.as_deref());
+            let mut refused = broken.map(|reason| Error::user(reason.clone()));
             // The old version stops only if the new package can replace it.
-            if entry.is_some_and(Entry::keeps_package) {
-                self.replaceable(&inner, id, new.as_ref())?;
+            if refused.is_none() && entry.is_some_and(Entry::keeps_package) {
+                refused = self.replaceable(&inner, id, new.as_ref()).err();
+            }
+            if let Some(error) = refused {
+                // A restart would load the old manifest with the new files
+                // (ADR-0017).
+                if let Some(entry) = inner.entries.get_mut(id)
+                    && entry.state == ExtensionState::Failed
+                {
+                    entry.cancel_restart(id, "a reload of the extension was refused");
+                    entry.reason = Some(error.message().to_owned());
+                }
+                return Err(error);
             }
             if entry.is_some_and(|entry| entry.state == ExtensionState::Active) {
                 was_active.extend(inner.active_dependents(id));
                 was_active.insert(id.clone());
             }
-            in_use.map(Path::to_owned)
+            in_use
         };
         if !was_active.is_empty()
             && let Err(error) = self.deactivate_tree(id).await
@@ -3681,6 +3695,70 @@ mod tests {
         assert_eq!(f.fake.count("activate a"), 1);
         assert_eq!(f.state("a"), Some(Disabled));
         assert!(f.all_scheduled().await.is_empty());
+    }
+
+    // ADR-0017: a reload cancels the pending automatic restart first.
+    #[tokio::test(start_paused = true)]
+    async fn reload_stops_the_pending_restart_after_a_crash() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
+        f.fake.take_calls();
+
+        // In the middle of the delay of 100 ms.
+        pass(50 * MS).await;
+        f.write(USER, "a", &manifest("a", "1.1.0", &[], ""));
+        let report = f.host.reload(&id("a")).await.unwrap();
+        assert!(report.activated.is_empty());
+        assert_eq!(f.state("a"), Some(Resolved));
+
+        // The new version fails: its own restart is due 100 ms from now.
+        f.fake.set("activate a", Some(Mode::Fail));
+        f.go("a").await;
+        assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
+        let failed = ["load a@1.1.0", "activate a", "unload a"];
+        assert_eq!(f.fake.take_calls(), failed);
+        // The end of the old delay: the old restart does not run.
+        pass(60 * MS).await;
+        assert!(f.fake.take_calls().is_empty());
+        // The end of the new delay.
+        f.fake.set("activate a", None);
+        pass(50 * MS).await;
+        assert_eq!(f.fake.take_calls(), ["load a@1.1.0", "activate a"]);
+        assert_eq!(f.state("a"), Some(Active));
+    }
+
+    // ADR-0017: after a refused reload the host does not restart the
+    // extension by itself: a restart would load the old manifest with the
+    // new files.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_reload_stops_the_pending_restart_and_gives_the_reason() {
+        let mut f = fixture(true);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        f.go("a").await;
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        assert_eq!(f.all_scheduled().await, [("a".to_owned(), 1)]);
+        f.fake.take_calls();
+
+        // No version.
+        f.write(USER, "a", "id = \"a\"\n");
+        let error = f.host.reload(&id("a")).await.unwrap_err();
+        pass(HOUR).await;
+
+        assert_eq!(error.category(), ErrorCategory::User);
+        assert!(f.fake.take_calls().is_empty());
+        assert_eq!(f.state("a"), Some(Failed));
+        assert_eq!(f.reason("a"), error.message());
+        assert!(f.all_scheduled().await.is_empty());
+        // A manual restart is still possible.
+        f.host.restart(&id("a")).await.unwrap();
+        assert_eq!(f.fake.take_calls(), ["load a@1.0.0", "activate a"]);
     }
 
     #[tokio::test(start_paused = true)]
