@@ -37,6 +37,8 @@ Behaviour:
 - The `jobs.*` settings are owned by the job scheduler. The `extensions.*` settings are owned by the extension host.
 - A cancel request of a running async job starts the grace period. After it the scheduler aborts the task and the job ends `Cancelled`.
 - A job keeps its slot until its code has really stopped. A blocking job and an async job that never yields cannot be aborted; each keeps its slot.
+- When the host releases an extension, the service registry, the command bus, the event bus and the job scheduler refuse this owner until the release has ended (review finding R-17a, not on `main` on this date). Each component keeps its own mark and checks it under its own lock. A new subscription of this owner is closed at once.
+- Limit: the host waits until each job has ended or was aborted after the grace period. Code that cannot be aborted can run on after the release and after a restart of the same extension, and it can register again under the same id. The next release removes it. The host does not keep the extension stopped for this.
 - Unload, disable, a manual restart and shutdown cancel the pending restarts that they make useless.
 
 ## Consequences
