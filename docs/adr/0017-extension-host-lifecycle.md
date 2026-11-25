@@ -32,4 +32,5 @@ As built (read in the code on 2026-11-25):
 - b: subscribers of `ExtensionStateChanged` can trust that `Active` means the activation succeeded.
 - e: today a workspace directory can replace a bundled extension, for example a driver, with unsigned code. This is the same gap as the missing signature check of §7.7. The project MUST NOT ship a release before #12 closes both.
 - e: the precedence bundled < user < workspace itself stays. A user can still override a bundled extension with a package from the same publisher.
+- e: a package with an invalid manifest never replaces a valid package with the same id from an earlier directory. It is listed as invalid. As built in PR #109 it does replace it; this is a defect.
 - The diagram in §4.4 is not changed until the maintainer accepts this ADR.

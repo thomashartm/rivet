@@ -23,6 +23,7 @@
 | [0019](0019-publisher-identity-and-trust-store.md) | Publisher identity and trust store | Proposed |
 | [0020](0020-permission-matching-rules.md) | Permission matching rules | Proposed |
 | [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Proposed |
+| [0022](0022-short-secrets-not-redacted.md) | Secrets shorter than 4 bytes are not redacted in logs | Proposed |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
