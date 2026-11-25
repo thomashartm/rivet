@@ -725,3 +725,59 @@ async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Re
     }
     log.renew();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> NativeRuntime {
+        // No test here starts the program.
+        let program = std::env::current_exe().unwrap();
+        NativeRuntime::new(
+            NativeConfig::new(program),
+            Redactor::new(),
+            Arc::new(|_, _| {}),
+        )
+        .unwrap()
+    }
+
+    fn entries(runtime: &NativeRuntime) -> usize {
+        runtime.slots.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_slot_removes_its_entry() {
+        let runtime = runtime();
+        let ids: Vec<ExtensionId> = (0..8)
+            .map(|n| format!("acme.e{n}").parse().unwrap())
+            .collect();
+        let mut slots = Vec::new();
+        for id in &ids {
+            slots.push(runtime.slot(id).await.unwrap());
+        }
+        assert_eq!(entries(&runtime), ids.len());
+        drop(slots);
+        assert_eq!(entries(&runtime), 0);
+    }
+
+    #[tokio::test]
+    async fn a_load_that_waits_keeps_the_entry_and_gets_the_slot() {
+        let runtime = runtime();
+        let id: ExtensionId = "acme.native".parse().unwrap();
+        let old = runtime.slot(&id).await.unwrap();
+        let waiter = runtime.slot(&id);
+        tokio::pin!(waiter);
+        // One poll: the waiter is in the queue of the slot.
+        tokio::select! {
+            biased;
+            _ = &mut waiter => panic!("two slots for one extension"),
+            () = std::future::ready(()) => {}
+        }
+        drop(old);
+        assert_eq!(entries(&runtime), 1);
+        let new = waiter.await.unwrap();
+        assert_eq!(entries(&runtime), 1);
+        drop(new);
+        assert_eq!(entries(&runtime), 0);
+    }
+}
