@@ -1,0 +1,19 @@
+[package]
+name = "rivet-testkit"
+description = "Test support for rivet extensions: mock engine, database fixtures, extension test harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rivet-core = { path = "../rivet-core" }
+rivet-sdk = { path = "../rivet-sdk" }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
