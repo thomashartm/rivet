@@ -6,8 +6,47 @@ use rivet_sdk::error::{Error, Result};
 use semver::{Version, VersionReq};
 use std::any::{Any, type_name};
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+
+/// The owners that the host stops at this time (§5.2, ADR-0021).
+///
+/// The service registry, the command bus, the event bus and the job
+/// scheduler each have their own set. They refuse a closed owner, so that
+/// code of an extension that stops cannot register again behind the host.
+///
+/// [`check`](Self::check) MUST be called while the caller holds the lock of
+/// the collection that it inserts into. The host closes the owner before it
+/// removes the entries of the owner, and the removal needs the same lock.
+/// Thus an insert is refused, or the removal finds it.
+#[derive(Debug, Default)]
+pub(crate) struct ClosedOwners(Mutex<BTreeSet<Owner>>);
+
+impl ClosedOwners {
+    /// Refuses `owner` until [`open`](Self::open).
+    pub(crate) fn close(&self, owner: &Owner) {
+        let mut closed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        closed.insert(owner.clone());
+    }
+
+    /// Accepts `owner` again.
+    pub(crate) fn open(&self, owner: &Owner) {
+        let mut closed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        closed.remove(owner);
+    }
+
+    /// Returns a `policy` error if `owner` is closed.
+    pub(crate) fn check(&self, owner: &Owner) -> Result<()> {
+        let closed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match closed.contains(owner) {
+            true => Err(Error::policy(format!(
+                "extension `{owner}` stops: it cannot register, subscribe or start a job \
+                 until the stop has ended"
+            ))),
+            false => Ok(()),
+        }
+    }
+}
 
 struct Registration {
     owner: Owner,
@@ -37,6 +76,7 @@ struct Registration {
 #[derive(Default)]
 pub struct ServiceRegistry {
     services: RwLock<HashMap<String, BTreeMap<Version, Registration>>>,
+    closed: ClosedOwners,
 }
 
 impl ServiceRegistry {
@@ -52,8 +92,9 @@ impl ServiceRegistry {
     ///
     /// # Errors
     ///
-    /// Returns an `internal` error if this id and version are already
-    /// registered. The first registration stays.
+    /// - An `internal` error if this id and version are already registered.
+    ///   The first registration stays.
+    /// - A `policy` error while the host stops the extension `owner`.
     pub fn register<S>(
         &self,
         owner: Owner,
@@ -68,6 +109,7 @@ impl ServiceRegistry {
             .services
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        self.closed.check(&owner)?;
         match services.entry(id.to_owned()).or_default().entry(version) {
             Entry::Occupied(taken) => Err(Error::internal(format!(
                 "service `{id}` version {} is already registered by `{}`",
@@ -139,6 +181,18 @@ impl ServiceRegistry {
         removed
     }
 
+    /// Refuses each new registration of `owner` until
+    /// [`open_owner`](Self::open_owner). The host calls it when it starts
+    /// to stop the extension.
+    pub(crate) fn close_owner(&self, owner: &Owner) {
+        self.closed.close(owner);
+    }
+
+    /// Accepts the registrations of `owner` again.
+    pub(crate) fn open_owner(&self, owner: &Owner) {
+        self.closed.open(owner);
+    }
+
     /// Removes every registration of `owner`. Returns how many were removed.
     pub fn unregister_owner(&self, owner: &Owner) -> usize {
         let mut services = self
@@ -187,6 +241,30 @@ mod tests {
 
     fn owner(text: &str) -> Owner {
         text.parse().expect("valid extension id")
+    }
+
+    #[test]
+    fn a_closed_owner_cannot_register_until_it_is_open_again() {
+        let registry = ServiceRegistry::new();
+        let (a, b) = (owner("ext.a"), owner("ext.b"));
+        let add = |owner: &Owner, id: &str| {
+            registry.register(owner.clone(), id, version("1.0.0"), greeter("hello"))
+        };
+
+        registry.close_owner(&a);
+
+        let error = add(&a, "a.one").unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Policy);
+        assert!(error.message().contains("`ext.a` stops"), "{error}");
+        assert!(
+            registry
+                .lookup::<dyn Greeter>("a.one", &range("*"))
+                .is_err()
+        );
+        // Only this owner is refused.
+        add(&b, "b.one").unwrap();
+        registry.open_owner(&a);
+        add(&a, "a.one").unwrap();
     }
 
     #[test]

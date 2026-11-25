@@ -49,6 +49,7 @@
 //! ```
 
 use crate::Owner;
+use crate::registry::ClosedOwners;
 use crate::settings::Settings;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use std::collections::{BTreeMap, VecDeque};
@@ -262,6 +263,8 @@ struct Inner {
     cancel_grace: Duration,
     next_id: AtomicU64,
     jobs: Mutex<Jobs>,
+    /// The owners that the host stops: they cannot start a job.
+    closed: ClosedOwners,
 }
 
 #[derive(Debug, Default)]
@@ -310,6 +313,7 @@ impl JobScheduler {
                 cancel_grace: config.cancel_grace,
                 next_id: AtomicU64::new(1),
                 jobs: Mutex::default(),
+                closed: ClosedOwners::default(),
             }),
         }
     }
@@ -337,6 +341,7 @@ impl JobScheduler {
     /// - An `internal` error if the caller is not in a Tokio runtime.
     /// - A `policy` error if `owner` has as many queued and running jobs as
     ///   [`JobConfig::max_per_extension`] permits.
+    /// - A `policy` error while the host stops the extension `owner`.
     pub fn spawn<T, F, Fut>(
         &self,
         owner: Owner,
@@ -383,6 +388,19 @@ impl JobScheduler {
         })
     }
 
+    /// Refuses each new job of `owner` until
+    /// [`open_owner`](Self::open_owner). The host calls it before
+    /// [`stop_owner`](Self::stop_owner), so that a job cannot answer the
+    /// cancel request with a new job.
+    pub(crate) fn close_owner(&self, owner: &Owner) {
+        self.inner.closed.close(owner);
+    }
+
+    /// Accepts the jobs of `owner` again.
+    pub(crate) fn open_owner(&self, owner: &Owner) {
+        self.inner.closed.open(owner);
+    }
+
     /// Asks every queued or running job of `owner` to stop. Returns how
     /// many jobs received the request. A job that does not stop is aborted
     /// after [`JobConfig::cancel_grace`].
@@ -403,6 +421,13 @@ impl JobScheduler {
             let _ = status.wait_for(|status| status.state.is_finished()).await;
         }
         count
+    }
+
+    /// Returns how many aborted jobs of `owner` have code that has not
+    /// stopped. Such a job is `Cancelled`, but it keeps its slot.
+    pub(crate) fn aborted_running(&self, owner: &Owner) -> usize {
+        let jobs = self.inner.lock();
+        jobs.stopping.values().filter(|of| *of == owner).count()
     }
 
     /// Sends a cancel request to every queued or running job of `owner`.
@@ -454,6 +479,7 @@ impl JobScheduler {
             // One lock for the count and the insert: two spawns at the same
             // time cannot both take the last place.
             let mut jobs = self.inner.lock();
+            self.inner.closed.check(&owner)?;
             if let Some(limit) = self.inner.max_per_extension {
                 let active = jobs.active.values().filter(|job| job.owner == owner);
                 let stopping = jobs
@@ -1208,6 +1234,36 @@ mod tests {
         assert_eq!(other.status().state, JobState::Running);
         assert_eq!(scheduler.stop_owner(&owner("ext.a")).await, 0);
         assert_eq!(start.elapsed(), grace);
+    }
+
+    #[tokio::test]
+    async fn job_cannot_start_a_job_of_its_owner_while_the_owner_is_closed() {
+        let scheduler = scheduler(4);
+        let again = scheduler.clone();
+        // The parent answers the cancel request with a child job.
+        let parent = scheduler
+            .spawn(owner("ext.a"), "parent", |ctx| async move {
+                ctx.cancelled().await;
+                let child = again.spawn(owner("ext.a"), "child", until_cancelled);
+                Err::<(), _>(child.map_or_else(|refused| refused, |_| Error::internal("started")))
+            })
+            .unwrap();
+        wait_for(&parent, JobState::Running).await;
+
+        scheduler.close_owner(&owner("ext.a"));
+        assert_eq!(scheduler.stop_owner(&owner("ext.a")).await, 1);
+
+        // The error of the parent is the refusal of the child.
+        let refused = parent.join().await.unwrap_err();
+        assert!(refused.message().contains("`ext.a` stops"), "{refused}");
+        let left = |job: &JobSnapshot| !job.state.is_finished();
+        assert_eq!(scheduler.jobs().into_iter().filter(left).count(), 0);
+        // Only this owner is refused, and only until it is open again.
+        let other = scheduler.spawn(owner("ext.b"), "query", |_| async { Ok(()) });
+        other.unwrap().join().await.unwrap();
+        scheduler.open_owner(&owner("ext.a"));
+        let next = scheduler.spawn(owner("ext.a"), "query", |_| async { Ok(()) });
+        next.unwrap().join().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
