@@ -23,18 +23,25 @@
 //! | Step | Command |
 //! | --- | --- |
 //! | Start the containers | `docker compose -f docker/compose.test.yml up -d --wait` |
-//! | Run the container tests | `RIVET_TEST_CONTAINERS=1 cargo test --workspace` |
+//! | Run the container tests | `RIVET_TEST_CONTAINERS=1 cargo test -p rivet-testkit` |
 //! | Stop the containers | `docker compose -f docker/compose.test.yml down -v` |
+//!
+//! | Value of `RIVET_TEST_CONTAINERS` | Result |
+//! | --- | --- |
+//! | not set, empty or `0` | The container tests are skipped. |
+//! | `1` | The container tests run. |
+//! | any other value | The container tests fail. |
 
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::model::{ConnectionProfile, Endpoint, ExtensionValue, ProviderRef, TlsSettings};
 use rivet_sdk::secret::Secret;
 use std::io::Write;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// The switch for container tests: they run only when this environment
-/// variable is `1`.
+/// variable is `1`. See [`containers_enabled`] for the other values.
 pub const CONTAINERS_SWITCH: &str = "RIVET_TEST_CONTAINERS";
 
 /// The command that starts the containers, from the repository root.
@@ -53,11 +60,35 @@ const POSTGRES_PORT: u16 = 54329;
 const MYSQL_PORT: u16 = 33069;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Decides from the value of [`CONTAINERS_SWITCH`] if the container tests
+/// run. `None` means that the variable is not set.
+fn switch(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{CONTAINERS_SWITCH} has the value `{other}`; the permitted values are \
+             `1` (run the container tests) and `0`, empty or not set (skip them)"
+        )),
+    }
+}
+
 /// Returns `true` when the container tests are switched on
-/// ([`CONTAINERS_SWITCH`] is `1`). If not, it writes one line to the standard
-/// error output that says the test is skipped, and returns `false`.
+/// ([`CONTAINERS_SWITCH`] is `1`). If the variable is not set, empty or `0`,
+/// it writes one line to the standard error output that says the test is
+/// skipped, and returns `false`.
+///
+/// # Panics
+///
+/// Panics if the variable has another value, for example `true`. The test
+/// fails: a typing error must not skip the container tests silently.
 pub fn containers_enabled() -> bool {
-    let enabled = std::env::var(CONTAINERS_SWITCH).is_ok_and(|value| value == "1");
+    let value = match std::env::var(CONTAINERS_SWITCH) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => Some(value.to_string_lossy().into_owned()),
+    };
+    let enabled = switch(value.as_deref()).unwrap_or_else(|message| panic!("{message}"));
     if !enabled {
         let test = std::thread::current();
         let test = test.name().unwrap_or("test");
@@ -71,8 +102,39 @@ pub fn containers_enabled() -> bool {
     enabled
 }
 
+/// The PostgreSQL `SSLRequest` message: length 8, request code 80877103.
+const POSTGRES_SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
+/// The protocol version in the first packet of a MySQL server.
+const MYSQL_PROTOCOL_VERSION: u8 = 10;
+
+/// Reads the first answer of the server and checks that it is the answer of
+/// a PostgreSQL server (`postgres` is `true`) or of a MySQL server. Returns
+/// what is wrong, if anything.
+async fn probe(postgres: bool, stream: &mut TcpStream) -> std::io::Result<Option<String>> {
+    let wrong = if postgres {
+        stream.write_all(&POSTGRES_SSL_REQUEST).await?;
+        // `S`: the server accepts TLS. `N`: it does not. Both are PostgreSQL.
+        let answer = stream.read_u8().await?;
+        (!matches!(answer, b'S' | b'N'))
+            .then(|| format!("the answer to SSLRequest was byte {answer}, not `S` or `N`"))
+    } else {
+        // Packet header (3 bytes length, 1 byte sequence), then the payload.
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).await?;
+        let version = stream.read_u8().await?;
+        (version != MYSQL_PROTOCOL_VERSION).then(|| {
+            format!("the first packet has protocol version {version}, not {MYSQL_PROTOCOL_VERSION}")
+        })
+    };
+    Ok(wrong)
+}
+
 /// One test database: how to reach it, and the test credentials.
+///
+/// The fields are public: a test can change the profile. Create a fixture
+/// with [`postgres`] or [`mysql`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DatabaseFixture {
     /// The profile of the database. The engine id is `postgres` or `mysql`.
     /// TLS is off: the containers accept plaintext on the loopback address.
@@ -112,27 +174,50 @@ impl DatabaseFixture {
         }
     }
 
-    /// Checks that the database accepts a TCP connection. The check waits
-    /// two seconds at most. It does not speak the database protocol.
+    /// Checks that a database server of the correct type answers. The check
+    /// waits two seconds at most.
+    ///
+    /// | Engine | Check |
+    /// | --- | --- |
+    /// | `postgres` | The server answers an `SSLRequest` with `S` or `N`. |
+    /// | `mysql` | The first packet of the server has protocol version 10. |
+    ///
+    /// The check does not log in: it does not prove the user, the password
+    /// or the database name. A real login is a part-2 item; it needs a
+    /// database client, and the testkit has none.
     ///
     /// # Errors
     ///
-    /// - A `connectivity` error if the connection fails or takes too long.
-    ///   The message contains [`START_COMMAND`].
-    /// - A `user` error if the endpoint of the profile has no port.
+    /// - A `connectivity` error if the connection fails, takes too long or
+    ///   the answer is not from a database of the correct type. The message
+    ///   contains [`START_COMMAND`].
+    /// - A `user` error if the endpoint of the profile has no port, or if
+    ///   the engine of the profile is not `postgres` or `mysql`.
     pub async fn ensure_reachable(&self) -> Result<()> {
         let Endpoint { host, port, .. } = &self.profile.endpoint;
         let port = port.ok_or_else(|| Error::user("the endpoint of the profile has no port"))?;
         let engine = &self.profile.engine.id;
+        let postgres = match engine.as_str() {
+            "postgres" => true,
+            "mysql" => false,
+            other => {
+                let message = format!("the testkit has no check for the engine `{other}`");
+                return Err(Error::user(message));
+            }
+        };
         let unreachable = |reason: &str| {
             Error::connectivity(format!(
                 "the {engine} test database at {host}:{port} is not reachable ({reason}); \
                  start the containers from the repository root: `{START_COMMAND}`"
             ))
         };
-        let connect = TcpStream::connect((host.as_str(), port));
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(_stream)) => Ok(()),
+        let check = async {
+            let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+            probe(postgres, &mut stream).await
+        };
+        match tokio::time::timeout(CONNECT_TIMEOUT, check).await {
+            Ok(Ok(None)) => Ok(()),
+            Ok(Ok(Some(wrong))) => Err(unreachable(&wrong)),
             Ok(Err(error)) => Err(unreachable("connection failed").with_source(error)),
             Err(elapsed) => Err(unreachable("timeout").with_source(elapsed)),
         }
@@ -247,11 +332,130 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::User);
     }
 
-    #[tokio::test]
-    async fn reachable_database_passes() {
+    #[test]
+    fn switch_is_off_on_or_an_error() {
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(switch(off), Ok(false), "{off:?}");
+        }
+        assert_eq!(switch(Some("1")), Ok(true));
+        for wrong in ["true", "TRUE", "yes", "on", "2", " 1", "1 ", "01"] {
+            let message = switch(Some(wrong)).unwrap_err();
+            assert!(message.contains(CONTAINERS_SWITCH), "{message}");
+            assert!(message.contains(&format!("`{wrong}`")), "{message}");
+            assert!(
+                message.contains("`1`") && message.contains("`0`"),
+                "{message}"
+            );
+        }
+    }
+
+    /// A server that accepts one connection, reads `request` bytes and
+    /// writes `answer`. Returns the fixture that points at it.
+    async fn server(engine: &str, request: usize, answer: &'static [u8]) -> DatabaseFixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut fixture = postgres();
-        fixture.profile.endpoint.port = Some(listener.local_addr().unwrap().port());
-        fixture.ensure_reachable().await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = vec![0; request];
+            stream.read_exact(&mut received).await.unwrap();
+            stream.write_all(answer).await.unwrap();
+            // Keep the connection open until the client closes it.
+            let _ = stream.read_u8().await;
+        });
+        DatabaseFixture::new(engine, port)
+    }
+
+    #[tokio::test]
+    async fn server_that_speaks_the_protocol_is_reachable() {
+        for (engine, request, answer) in [
+            ("postgres", 8, &b"N"[..]),
+            ("postgres", 8, b"S"),
+            ("mysql", 0, b"\x4a\x00\x00\x00\x0a8.4.13\x00"),
+        ] {
+            let fixture = server(engine, request, answer).await;
+            fixture.ensure_reachable().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_check_sends_an_ssl_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixture = DatabaseFixture::new("postgres", listener.local_addr().unwrap().port());
+        let request = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"N").await.unwrap();
+            request
+        };
+        let (request, reachable) = tokio::join!(request, fixture.ensure_reachable());
+        reachable.unwrap();
+        assert_eq!(request[..4], 8u32.to_be_bytes());
+        assert_eq!(request[4..], 80_877_103u32.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn server_of_another_type_is_not_reachable() {
+        for (engine, request, answer, reason) in [
+            // PostgreSQL answers with an error message (`E`) to a bad start.
+            ("postgres", 8, &b"E"[..], "byte 69, not `S` or `N`"),
+            (
+                "postgres",
+                0,
+                b"HTTP/1.1 400 Bad Request\r\n\r\n",
+                "byte 72",
+            ),
+            // A MySQL error packet, for example "too many connections".
+            (
+                "mysql",
+                0,
+                b"\x17\x00\x00\x00\xff\x10\x04Too many",
+                "version 255, not 10",
+            ),
+            ("mysql", 0, b"HTTP/1.1 400 Bad Request\r\n\r\n", "not 10"),
+        ] {
+            let fixture = server(engine, request, answer).await;
+            let error = fixture.ensure_reachable().await.unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::Connectivity);
+            assert!(error.message().contains(reason), "{error:?}");
+            assert!(error.message().contains(START_COMMAND), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_without_a_check_is_a_user_error() {
+        let error = DatabaseFixture::new("oracle", 1).ensure_reachable().await;
+        let error = error.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::User);
+        assert!(error.message().contains("`oracle`"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn server_that_closes_the_connection_is_not_reachable() {
+        for engine in ["postgres", "mysql"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fixture = DatabaseFixture::new(engine, listener.local_addr().unwrap().port());
+            let close = async { drop(listener.accept().await.unwrap()) };
+            let (error, ()) = tokio::join!(fixture.ensure_reachable(), close);
+            let error = error.unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::Connectivity);
+            assert!(error.message().contains("connection failed"), "{error:?}");
+        }
+    }
+
+    /// R-36: a listener that is not a database is not a reachable database.
+    #[tokio::test]
+    async fn plain_listener_is_not_a_reachable_database() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = Some(listener.local_addr().unwrap().port());
+        let (mut postgres, mut mysql) = (postgres(), mysql());
+        postgres.profile.endpoint.port = port;
+        mysql.profile.endpoint.port = port;
+
+        let (postgres, mysql) = tokio::join!(postgres.ensure_reachable(), mysql.ensure_reachable());
+        for error in [postgres.unwrap_err(), mysql.unwrap_err()] {
+            assert_eq!(error.category(), ErrorCategory::Connectivity);
+            assert!(error.message().contains("timeout"), "{error:?}");
+        }
     }
 }

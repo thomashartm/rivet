@@ -2,7 +2,8 @@
 
 use Kind::{Core, EngineApi, Ext, Interface, Sdk, TestKit, UiExt, UiSdk, UiShell};
 
-/// The xtask is tooling, not part of the architecture.
+/// The xtask is tooling, not part of the architecture. One rule applies to it
+/// too: it uses the testkit as a dev-dependency only (ADR-0016 rule 2).
 const EXEMPT: &str = "xtask";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,17 +70,18 @@ pub struct Edge<'a> {
 /// Returns why `edge` is forbidden, or `None` if it is permitted.
 fn forbidden(edge: Edge<'_>) -> Option<String> {
     let Edge { from, to, dev } = edge;
-    let ok = match (kind(from)?, kind(to)) {
+    // Test support is in no crate as a normal or build dependency. This is
+    // the one rule that looks at the dependency kind.
+    let must_be_dev = || format!("{from} -> {to} must be a dev-dependency (ARCHITECTURE.md §3.2)");
+    let Some(from_kind) = kind(from) else {
+        // The xtask. A crate of an unknown kind is reported in `violations`.
+        return (from == EXEMPT && kind(to) == Some(TestKit) && !dev).then(must_be_dev);
+    };
+    let ok = match (from_kind, kind(to)) {
         // No cycle, also not with a dev-dependency: the tests of a crate
         // would see two copies of its types.
         (from, Some(TestKit)) if permitted(TestKit, from) => false,
-        // Test support is in no shipped crate: a dev-dependency only. This
-        // is the one rule that looks at the dependency kind.
-        (_, Some(TestKit)) if !dev => {
-            return Some(format!(
-                "{from} -> {to} must be a dev-dependency (ARCHITECTURE.md §3.2)"
-            ));
-        }
+        (_, Some(TestKit)) if !dev => return Some(must_be_dev()),
         (_, Some(TestKit)) => true,
         (from, Some(to)) => permitted(from, to),
         (_, None) => false,
@@ -99,7 +101,7 @@ pub fn violations(crates: &[&str], edges: &[Edge<'_>]) -> Vec<String> {
                  add the kind to §3.2 and to the table in xtask/src/arch.rs"
             )
         });
-    // An unknown `from` (the xtask too) gives `None`: it is reported above.
+    // An unknown `from` gives `None`: it is reported above.
     let forbidden = edges.iter().filter_map(|edge| forbidden(*edge));
     unknown.chain(forbidden).collect()
 }
@@ -239,13 +241,20 @@ mod tests {
 
     #[test]
     fn xtask_is_exempt() {
-        let (from, to) = ("xtask", "rivet-core");
-        let edge = Edge {
-            from,
-            to,
-            dev: false,
-        };
-        let found = violations(&["xtask", "rivet-core"], &[edge]);
-        assert_eq!(found, Vec::<String>::new());
+        for to in ["rivet-core", "rivet-ext-postgres", "rivet-cli"] {
+            for dev in [false, true] {
+                assert_eq!(check("xtask", to, dev), Vec::<String>::new(), "{to}");
+            }
+        }
+    }
+
+    /// ADR-0016 rule 2 has no exception for the xtask.
+    #[test]
+    fn xtask_uses_testkit_as_a_dev_dependency_only() {
+        assert_eq!(check("xtask", "rivet-testkit", true), Vec::<String>::new());
+        assert_eq!(
+            edge("xtask", "rivet-testkit"),
+            ["xtask -> rivet-testkit must be a dev-dependency (ARCHITECTURE.md §3.2)"]
+        );
     }
 }

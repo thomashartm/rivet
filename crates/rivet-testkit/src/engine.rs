@@ -183,7 +183,10 @@ impl Drop for TestInstance {
 /// [`host`](Self::host) and uses the services through
 /// [`services`](Self::services). The host is headless.
 ///
-/// The temporary directory is deleted when the engine is dropped.
+/// When the engine is dropped, it asks every job that is not finished to
+/// stop, and the temporary directory is deleted. The drop does not wait for
+/// the jobs and does not call `deactivate`: call `host().shutdown().await`
+/// for that.
 pub struct TestEngine {
     host: Arc<ExtensionHost>,
     services: Services,
@@ -316,6 +319,19 @@ impl TestEngine {
                     )));
                 }
                 Poll::Ready(None) | Poll::Pending => return Ok(changes),
+            }
+        }
+    }
+}
+
+impl Drop for TestEngine {
+    /// A test that fails early does not call `shutdown`. Its jobs must not
+    /// continue after the temporary directory is deleted.
+    fn drop(&mut self) {
+        let jobs = &self.services.jobs;
+        for job in jobs.jobs() {
+            if !job.state.is_finished() {
+                jobs.cancel_owner(&job.owner);
             }
         }
     }
