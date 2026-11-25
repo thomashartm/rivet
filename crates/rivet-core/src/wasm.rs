@@ -1458,7 +1458,15 @@ mod tests {
         };
         let directories = vec![root.path().to_owned()];
         let sdk = Version::new(0, 1, 0);
-        let host = ExtensionHost::new(runtime, services, sdk, directories, true, config);
+        let host = ExtensionHost::new(
+            runtime,
+            services,
+            Arc::new(crate::secrets::SecretStore::new()),
+            sdk,
+            directories,
+            true,
+            config,
+        );
         Hosted { host, root }
     }
 

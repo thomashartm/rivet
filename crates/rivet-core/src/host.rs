@@ -92,6 +92,7 @@
 //! };
 //! use rivet_core::jobs::JobScheduler;
 //! use rivet_core::registry::ServiceRegistry;
+//! use rivet_core::secrets::SecretStore;
 //! use rivet_sdk::error::{Error, Result};
 //! use rivet_sdk::extension::BoxFuture;
 //! use rivet_sdk::manifest::{Manifest, Version};
@@ -121,7 +122,16 @@
 //! let directories = vec!["bundled".into(), "user".into(), "workspace".into()];
 //! let sdk = Version::new(0, 1, 0);
 //! let config = HostConfig::default();
-//! let host = ExtensionHost::new(Arc::new(NoRuntime), services, sdk, directories, true, config);
+//! let secrets = Arc::new(SecretStore::new());
+//! let host = ExtensionHost::new(
+//!     Arc::new(NoRuntime),
+//!     services,
+//!     secrets,
+//!     sdk,
+//!     directories,
+//!     true,
+//!     config,
+//! );
 //! host.discover().await?;
 //! assert!(host.extensions().is_empty());
 //! # Ok::<(), Error>(())
@@ -135,6 +145,7 @@ use crate::registry::ServiceRegistry;
 use crate::resolve::{
     ActivationIndex, ActivationPlan, ActivationTrigger, Outcome, Resolution, resolve,
 };
+use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::BoxFuture;
@@ -189,8 +200,9 @@ pub trait ExtensionInstance: Send + Sync {
     fn activate(&self, context: ExtensionContext) -> BoxFuture<'_, Result<()>>;
 
     /// Deactivates the extension. After the call, the host removes every
-    /// service and command handler of the extension, closes its event
-    /// subscriptions and cancels its jobs, also when the call fails.
+    /// service, command handler and secret backend of the extension, closes
+    /// its event subscriptions and cancels its jobs, also when the call
+    /// fails.
     fn deactivate(&self) -> BoxFuture<'_, Result<()>>;
 }
 
@@ -734,6 +746,8 @@ pub struct ExtensionHost {
     config: HostConfig,
     runtime: Arc<dyn ExtensionRuntime>,
     services: Services,
+    /// Not in [`Services`]: an extension must not get the store (§7.4).
+    secrets: Arc<SecretStore>,
     sdk_version: Version,
     directories: Vec<PathBuf>,
     headless: bool,
@@ -754,6 +768,9 @@ impl ExtensionHost {
     /// Creates a host with no extensions. Call [`discover`](Self::discover)
     /// to find them.
     ///
+    /// - `secrets` is the secret store of the core. When an extension stops,
+    ///   the host removes the secret backends that the extension owns. The
+    ///   host does not give the store to an extension (§7.4).
     /// - `sdk_version` is the SDK version of the host. An extension whose
     ///   SDK range does not include it is rejected (§4.5).
     /// - `directories` are the discovery directories in the order bundled,
@@ -768,6 +785,7 @@ impl ExtensionHost {
     pub fn new(
         runtime: Arc<dyn ExtensionRuntime>,
         services: Services,
+        secrets: Arc<SecretStore>,
         sdk_version: Version,
         directories: Vec<PathBuf>,
         headless: bool,
@@ -779,6 +797,7 @@ impl ExtensionHost {
             config,
             runtime,
             services,
+            secrets,
             sdk_version,
             directories,
             headless,
@@ -1419,7 +1438,10 @@ impl ExtensionHost {
         removed
     }
 
-    /// Releases everything that `owner` registered (§5.2).
+    /// Releases everything that `owner` registered (§5.2), also its secret
+    /// backends. It does not change the grants of `owner`: a grant is the
+    /// decision of the user and ends only with an uninstall or a new review
+    /// (§4.7, ADR-0020).
     ///
     /// It waits until the jobs of `owner` have ended. The job scheduler
     /// limits this wait: it aborts a job that ignores the cancel request.
@@ -1428,6 +1450,11 @@ impl ExtensionHost {
         self.services.commands.unregister_owner(owner);
         self.services.events.unsubscribe_owner(owner);
         self.services.jobs.stop_owner(owner).await;
+        // After the jobs: a job that still runs could register a backend
+        // again after the removal, and that backend would stay. Until its
+        // jobs have ended, the extension keeps complete backends; a resolve
+        // that runs holds its own reference to the backend.
+        self.secrets.unregister_owner(owner);
     }
 
     /// Handles a failure of `id`: releases what it owns, puts it in the
@@ -1716,7 +1743,9 @@ mod tests {
     use super::*;
     use crate::bus::{Received, Subscription};
     use crate::jobs::JobHandle;
+    use crate::secrets::{SecretBackend, SecretFuture};
     use rivet_sdk::error::ErrorCategory;
+    use rivet_sdk::secret::Secret;
     use std::num::{NonZeroU16, NonZeroUsize};
     use tempfile::TempDir;
 
@@ -1741,6 +1770,18 @@ mod tests {
         jobs: Mutex<BTreeMap<String, JobHandle<()>>>,
         subscriptions: Mutex<BTreeMap<String, Subscription<Ping>>>,
         gate: tokio::sync::Notify,
+        /// The store of the host. The host gives it to no extension; the
+        /// fake stands for the host service that registers a backend.
+        secrets: Arc<SecretStore>,
+    }
+
+    /// The secret backend of each fake extension.
+    struct Fixed;
+
+    impl SecretBackend for Fixed {
+        fn resolve<'a>(&'a self, _path: &'a str) -> SecretFuture<'a> {
+            Box::pin(async { Ok(Secret::from(String::from("value"))) })
+        }
     }
 
     /// An event that each fake extension subscribes to.
@@ -1826,9 +1867,10 @@ mod tests {
     }
 
     impl ExtensionInstance for FakeInstance {
-        /// Registers the service `<id>.service` and the command
-        /// `<id>.command`, subscribes to `Ping` and starts a job that runs
-        /// until it is cancelled.
+        /// Registers the service `<id>.service`, the command `<id>.command`
+        /// and a secret backend for the scheme `<id>`, subscribes to `Ping`
+        /// and starts a job that runs until it is cancelled. The job then
+        /// registers a secret backend for the scheme `<id>.late`.
         fn activate(&self, context: ExtensionContext) -> BoxFuture<'_, Result<()>> {
             Box::pin(async move {
                 let ExtensionContext { owner, services } = context;
@@ -1841,6 +1883,8 @@ mod tests {
                 let name = format!("{owner}.command");
                 let handler = |(): ()| async { Ok(()) };
                 services.commands.register(owner.clone(), &name, handler)?;
+                let secrets = Arc::clone(&self.fake.secrets);
+                secrets.register(owner.clone(), owner.as_str(), Arc::new(Fixed))?;
                 let subscription = services.events.subscribe_owned(owner.clone());
                 self.fake
                     .subscriptions
@@ -1849,6 +1893,7 @@ mod tests {
                     .insert(owner.to_string(), subscription);
                 // `job <id>` = `Hang`: the job ignores the cancel request.
                 let stubborn = self.fake.mode(&format!("job {owner}")).is_some();
+                let late = owner.clone();
                 let job = services
                     .jobs
                     .spawn(owner.clone(), "work", move |job| async move {
@@ -1856,6 +1901,7 @@ mod tests {
                             std::future::pending::<()>().await;
                         }
                         job.cancelled().await;
+                        secrets.register(late.clone(), &format!("{late}.late"), Arc::new(Fixed))?;
                         Err(Error::cancelled("stopped"))
                     })?;
                 self.fake
@@ -1931,6 +1977,7 @@ mod tests {
         let host = ExtensionHost::new(
             Arc::new(FakeRuntime(Arc::clone(&fake))),
             services.clone(),
+            Arc::clone(&fake.secrets),
             Version::new(0, 1, 0),
             directories,
             headless,
@@ -2069,6 +2116,30 @@ mod tests {
             let name = format!("{owner}.command");
             let command = self.services.commands.execute::<(), ()>(&name, ()).await;
             (service.is_ok(), command.is_ok())
+        }
+
+        /// `true` if the secret backend that `owner` registered in its
+        /// activation resolves.
+        async fn has_backend(&self, owner: &str) -> bool {
+            let uri = format!("{owner}://x").parse().unwrap();
+            self.fake.secrets.resolve(&uri).await.is_ok()
+        }
+
+        /// Asserts that the store has no secret backend of `owner`: not the
+        /// one from its activation and not the one its job registers when
+        /// the job is cancelled.
+        async fn assert_no_backend(&self, owner: &str) {
+            for scheme in [owner.to_owned(), format!("{owner}.late")] {
+                let uri = format!("{scheme}://x").parse().unwrap();
+                let error = self.fake.secrets.resolve(&uri).await.err();
+                let error = error.unwrap_or_else(|| panic!("`{scheme}` has a backend"));
+                assert_eq!(error.category(), ErrorCategory::User, "{scheme}");
+                let message = error.message();
+                assert!(
+                    message.contains("no secret backend is registered"),
+                    "{message}"
+                );
+            }
         }
 
         /// Takes the job that `owner` started in its last activation.
@@ -3641,5 +3712,172 @@ mod tests {
         assert!(disabled.contains("restart limit of 0"), "{disabled}");
         // The reason in the event is the reason in the status.
         assert_eq!(f.reason("a"), disabled);
+    }
+
+    /// A fixture with the extension `a`, discovered. With `active`, `a` is
+    /// active and its secret backend resolves.
+    async fn with_backend(active: bool, config: HostConfig) -> Fixture {
+        let mut f = fixture_with(true, config);
+        f.add("a", &[]);
+        f.host.discover().await.unwrap();
+        if active {
+            assert_eq!(f.go("a").await.activated, [id("a")]);
+            assert!(f.has_backend("a").await);
+        }
+        f.changes().await;
+        f
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deactivation_removes_the_secret_backends_of_that_extension_only() {
+        let f = with_backend(true, HostConfig::default()).await;
+        f.add("other", &[]);
+        f.host.discover().await.unwrap();
+        f.go("other").await;
+
+        f.host.deactivate(&id("a")).await.unwrap();
+
+        f.assert_no_backend("a").await;
+        assert!(f.has_backend("other").await);
+        // The backend of the core has no owner. It is still registered: its
+        // scheme is not free.
+        let keychain = f
+            .fake
+            .secrets
+            .register(id("a"), "keychain", Arc::new(Fixed));
+        assert_eq!(keychain.unwrap_err().category(), ErrorCategory::Policy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_activation_removes_the_secret_backends() {
+        let f = with_backend(false, HostConfig::default()).await;
+        f.fake.set("activate a", Some(Mode::Fail));
+
+        f.go("a").await;
+
+        assert_eq!(f.state("a"), Some(Failed));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_in_the_activation_removes_the_secret_backends() {
+        let f = with_backend(false, HostConfig::default()).await;
+        f.fake.set("activate a", Some(Mode::Panic));
+
+        f.go("a").await;
+
+        assert_eq!(f.state("a"), Some(Failed));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_activation_that_exceeds_the_time_limit_removes_the_secret_backends() {
+        let f = with_backend(false, HostConfig::default()).await;
+        f.fake.set("activate a", Some(Mode::Hang));
+
+        f.go("a").await;
+
+        assert_eq!(f.state("a"), Some(Failed));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reported_crash_removes_the_secret_backends() {
+        let f = with_backend(true, HostConfig::default()).await;
+
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+
+        assert_eq!(f.state("a"), Some(Failed));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_deactivation_removes_the_secret_backends() {
+        let f = with_backend(true, HostConfig::default()).await;
+        f.fake.set("deactivate a", Some(Mode::Fail));
+
+        f.host.deactivate(&id("a")).await.unwrap_err();
+
+        assert_eq!(f.state("a"), Some(Failed));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unloaded_extension_has_no_secret_backends() {
+        let f = with_backend(true, HostConfig::default()).await;
+        f.host.deactivate(&id("a")).await.unwrap();
+
+        f.host.unload(&id("a")).await.unwrap();
+
+        assert_eq!(f.state("a"), None);
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_removes_the_secret_backends_of_the_old_version() {
+        for version in ["1.0.0", "2.0.0"] {
+            let f = with_backend(true, HostConfig::default()).await;
+            f.write(USER, "a", &manifest("a", version, &[], ""));
+            // The new version registers no backend: its activation fails
+            // before that, in the load.
+            f.fake.set(&format!("load a@{version}"), Some(Mode::Fail));
+
+            let report = f.host.reload(&id("a")).await.unwrap();
+
+            assert!(report.not_activated.contains_key(&id("a")), "{version}");
+            assert_eq!(f.fake.count("unload a"), 1, "{version}");
+            f.assert_no_backend("a").await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_registers_the_secret_backend_of_the_new_version() {
+        let f = with_backend(true, HostConfig::default()).await;
+        f.write(USER, "a", &manifest("a", "2.0.0", &[], ""));
+
+        let report = f.host.reload(&id("a")).await.unwrap();
+
+        // The scheme was free again, or the activation had failed.
+        assert_eq!(report.activated, [id("a")]);
+        assert!(f.has_backend("a").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disabled_extension_has_no_secret_backends() {
+        let config = HostConfig {
+            restart_limit: 1,
+            ..HostConfig::default()
+        };
+        let mut f = with_backend(true, config).await;
+        f.fake.set("activate a", Some(Mode::Fail));
+
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.until("a", Disabled).await;
+
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_removes_the_secret_backends() {
+        let f = with_backend(true, HostConfig::default()).await;
+
+        assert!(f.host.shutdown().await.is_empty());
+
+        assert_eq!(f.state("a"), Some(Inactive));
+        f.assert_no_backend("a").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_extension_registers_its_secret_backend_again() {
+        let mut f = with_backend(true, HostConfig::default()).await;
+
+        let crash = Error::internal("trap");
+        f.host.report_crash(&id("a"), crash).await.unwrap();
+        f.assert_no_backend("a").await;
+        f.until("a", Active).await;
+
+        assert!(f.has_backend("a").await);
     }
 }

@@ -8,6 +8,7 @@ use rivet_core::host::{
 };
 use rivet_core::jobs::JobScheduler;
 use rivet_core::registry::ServiceRegistry;
+use rivet_core::secrets::SecretStore;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::BoxFuture;
 use rivet_sdk::manifest::{ExtensionId, Manifest, Version};
@@ -223,6 +224,7 @@ impl TestEngine {
         let host = ExtensionHost::new(
             Arc::new(TestRuntime(Arc::clone(&shared))),
             services.clone(),
+            Arc::new(SecretStore::new()),
             sdk_version,
             vec![directory.path().to_owned()],
             true,
