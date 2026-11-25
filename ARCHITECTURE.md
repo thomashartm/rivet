@@ -211,10 +211,10 @@ stateDiagram-v2
     Inactive --> [*]: unload
 ```
 
-- As built, the extension host differs from this diagram in two points ([ADR-0017](docs/adr/0017-extension-host-lifecycle.md), Proposed):
-  - a failed activation goes from `Resolved` or `Inactive` directly to `Failed` (since PR #121);
-  - an extension in `Resolved` or `Rejected` can be removed and discovered again.
-- Proposed, not on `main` on this date (ADR-0017 row f, PR #131): an explicit unload or reload can also remove an extension in `Failed` or `Disabled`. A reload then reads the package again and gives `Resolved` or `Rejected`.
+- The extension host has two edges that this diagram does not show. The code is as [ADR-0017](docs/adr/0017-extension-host-lifecycle.md) (Proposed) wants it; the diagram changes when the ADR is accepted:
+  - a failed activation goes from `Resolved` or `Inactive` directly to `Failed` (row b, since PR #121);
+  - an extension in `Resolved` or `Rejected` can be removed and discovered again (row c).
+- Also not in the diagram (ADR-0017 row f, Proposed; in the code since PR #131): an explicit unload or reload can also remove an extension in `Failed` or `Disabled`. A reload then reads the package again and gives `Resolved` or `Rejected`.
 - As built, if two discovery directories contain the same extension id, the later directory wins: bundled < user < workspace. ADR-0017 proposes to limit this when signature checks exist.
 - Hot reload = deactivate, unload, load new version, activate. Open handles of the old version MUST be closed or migrated before unload.
 

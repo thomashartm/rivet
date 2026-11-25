@@ -5,7 +5,7 @@
 
 ## Context
 
-ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no version. ARCHITECTURE.md §4.3 allows fuel or epoch interruption and gives no memory rule. The WASM runtime ticket (#4) needs these values. Part 1 of #4 is on `main` (`crates/rivet-core/src/wasm.rs`). The rows "Time limit", "Component size" and "Guest log output" are review fixes that are not on `main` on this date.
+ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no version. ARCHITECTURE.md §4.3 allows fuel or epoch interruption and gives no memory rule. The WASM runtime ticket (#4) needs these values. Part 1 of #4 is on `main` (`crates/rivet-core/src/wasm.rs`). The rows "Time limit", "Component size" and "Guest log output" are review fixes; they are on `main` (read in `wasm.rs` at commit aafd7b8).
 
 ## Decision
 
@@ -13,14 +13,14 @@ ADR-0002 chose Wasmtime and says that a WASI version is pinned. It names no vers
 | --- | --- |
 | WASI | None for now. The host gives no `wasi:*` interface. A component that imports one does not load; the error names the import. |
 | CPU limit | Fuel, set again before each call. Default 1 000 000 000 units per call, not measured. The value is a setting. |
-| Time limit | Epoch interruption, in addition to fuel. One ticker for the engine; each call has its own deadline. Default 30 s, the value of `extensions.call_timeout_ms` (ADR-0021). The host owns the setting and gives it to the runtime. |
+| Time limit | Epoch interruption, in addition to fuel. One ticker for the engine; each call has its own deadline. A call MUST NOT end before its limit: the number of ticks is rounded up. A call can run longer than the limit, by about two ticks (100 ms each) plus the delay of the ticker; this limit is a backstop, not an exact timer. (Rounding up: review fix R-62, not on `main` on this date.) Default 30 s, the value of `extensions.call_timeout_ms` (ADR-0021). The host owns the setting and gives it to the runtime. |
 | Component size | A component file larger than the limit does not load. Default 16 MiB. |
-| Guest log output | Limited per call (64 KiB, 100 lines); the rest is dropped and counted. The guest text is logged as a separate field, so it cannot imitate a field of the host. |
+| Guest log output | Limited per call (64 KiB, 100 lines); the messages past the budget are dropped and counted. One message is cut to 8 KiB. A message that is not written because its level is off costs no budget (review fix R-60, not on `main` on this date). One call of an import can pass 64 KiB of data at most; a log message above this size is not cut, it traps the instance. The guest text is logged as a separate field, so it cannot imitate a field of the host. |
 | Memory limit | One budget per instance for linear memories and tables together. Default 64 MiB. Growth past the budget traps the instance. |
 | WIT package | `rivet:extension`, in `crates/rivet-sdk/wit/`. World `extension` with `activate` and `deactivate`. Interfaces of extension points go into the same package (ADR-0013). |
 | WIT version | Equal to the SDK crate version. A test checks it. |
 | Errors in WIT | The WIT has an `error` record with the categories of §5.6. Lifecycle functions return it. The host keeps the category of the guest. Trap and limit violation give `internal`. Invalid component gives `user`. |
-| Component file | The component of a package is the file `extension.wasm` in the package directory. The manifest has no field for it. (#4 part 2, not on `main` on this date.) |
+| Component file | The component of a package is the file `extension.wasm` in the package directory. The manifest has no field for it. (#4 part 2, on `main` since PR #130.) |
 | Execution | Synchronous Wasmtime. Compile, instantiate and each call run on the blocking pool (§5.1). |
 
 ## Consequences

@@ -12,7 +12,7 @@ As built (read in the code on 2026-11-25):
 | # | Topic | Behaviour |
 | --- | --- | --- |
 | a | Runtime contract | One contract: `ExtensionRuntime::load` gives an `ExtensionInstance` with `activate` and `deactivate`. To drop the instance unloads it. There is no `unload` call that can fail. |
-| b | Failed activation | The host publishes two changes: start state → `Active`, then `Active` → `Failed`. |
+| b | Failed activation | In PR #109 the host published two changes: start state → `Active`, then `Active` → `Failed`. Since PR #121 it does what the decision below says: one change, directly to `Failed`. |
 | c | Forget | The host can remove an extension in `Resolved` or `Rejected` and discover it again. These states have no loaded code. |
 | d | Concurrency | One host-wide lock. Lifecycle operations run one after the other. |
 | e | Same id in two directories | The later discovery directory wins: bundled < user < workspace. |
@@ -26,7 +26,7 @@ As built (read in the code on 2026-11-25):
 | c | Keep. Add the edges `Resolved → [*]` and `Rejected → [*]` with the label "forgotten for new discovery" to §4.4. Without them, a corrected manifest needs a process restart. | Diagram in §4.4 only. |
 | d | Keep for now. Timeouts for calls into extensions come with #11. Use finer locks only when a delay is measured. | None. |
 | e | Accept only as long as no release exists. With the signature check (#12): a package MAY replace a package with the same id from an earlier directory only if its signature verifies against the key of the publisher of that id (ADR-0019: the project key for a bundled extension, else the key pinned for the publisher), or in developer mode. Otherwise the earlier package stays and the later package is reported with a reason. | Rule in #12; text in §4.4. |
-| f | New, not in PR #109: an extension in `Failed` or `Disabled` has no loaded code. An explicit unload removes it. An explicit reload reads its package again and gives `Resolved` or `Rejected`; it is not activated at once. Discovery alone does not replace it. Without this, a failed extension can be replaced only by a process restart. | Edges `Failed → [*]` and `Disabled → [*]` in §4.4; `transition` in `host.rs` (review fix R-23, not on `main` on this date). |
+| f | New, not in PR #109: an extension in `Failed` or `Disabled` has no loaded code. An explicit unload removes it. An explicit reload reads its package again and gives `Resolved` or `Rejected`; it is not activated at once. Discovery alone does not replace it. Without this, a failed extension can be replaced only by a process restart. | Edges `Failed → [*]` and `Disabled → [*]` in §4.4; `transition` in `host.rs` (review fix R-23, on `main` since PR #131). |
 
 ## Consequences
 
