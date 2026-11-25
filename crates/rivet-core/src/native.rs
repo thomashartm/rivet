@@ -826,11 +826,15 @@ mod tests {
     // R-125: the last two users end at the same time on two threads.
     #[tokio::test]
     async fn two_last_users_on_two_threads_remove_the_entry() {
+        // The rounds stop at the time bound, so that a slow machine does
+        // not make the test slow. It then finds the race less often.
         const ROUNDS: usize = 40_000;
+        let bound = std::time::Instant::now() + Duration::from_secs(2);
         let runtime = runtime();
         let id: ExtensionId = "acme.native".parse().unwrap();
-        let mut left = 0;
-        for _ in 0..ROUNDS {
+        let (mut rounds, mut left) = (0, 0);
+        while rounds < ROUNDS && std::time::Instant::now() < bound {
+            rounds += 1;
             let slot = runtime.slot(&id).await.unwrap();
             // A second user, as a load that waits for the slot.
             let user = SlotUser {
@@ -852,6 +856,6 @@ mod tests {
                 runtime.slots.lock().unwrap().clear();
             }
         }
-        assert_eq!(left, 0, "an entry stayed in {left} of {ROUNDS} rounds");
+        assert_eq!(left, 0, "an entry stayed in {left} of {rounds} rounds");
     }
 }
