@@ -1,0 +1,12 @@
+# The manifest of the MySQL driver extension (ARCHITECTURE.md §4.4).
+id = "rivet.mysql"
+version = "0.1.0"
+sdk = ">=0.1.0, <0.2.0"
+
+[[contributes]]
+kind = "driver"
+id = "mysql"
+
+[[activation]]
+on = "connection"
+type = "mysql"
