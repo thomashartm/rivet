@@ -5,7 +5,7 @@
 
 ## Context
 
-ARCHITECTURE.md §4.8 lists what an extension package contains and requires versioned packages with rollback. It does not define the file format or the directories. ADR-0019 verifies one signed file. Part 2 of the registry ticket (#12) needs the format and the layout. No code for it is on `main` on this date. No archive crate is in `Cargo.lock`.
+ARCHITECTURE.md §4.8 lists what an extension package contains and requires versioned packages with rollback. It does not define the file format or the directories. ADR-0019 verifies one signed file. Part 2 of the registry ticket (#12) needs the format and the layout. The installer is on `main` since PR #134 (`crates/rivet-core/src/install.rs`). The behaviour below was not compared with that code line by line.
 
 ## Decision
 
@@ -40,9 +40,10 @@ Directories:
 - Two new crates: `tar` and `filetime`.
 - The same code runs on Windows, macOS and Linux. No symbolic link is used.
 - Between the two renames an extension id has no active directory. A load in that time fails and the host retries it (ADR-0021).
-- The host does not verify a signature when it loads an extension (§7.7 "on load"). The store keeps the package and the signature so that this can be added. No ticket has it yet.
-- Limits of the first version (`install.rs`, not on `main` on this date):
+- Gap: the host does not verify a signature when it loads an extension. §7.7 and ADR-0006 require it ("on install and on load"). This ADR does not change that rule. The gap is tracked in ticket #138. The owner decides the design: check the extracted files against the kept signed package, or store digests at install. The store keeps the package and the signature for this.
+- Limits of the first version (`install.rs`, on `main` since PR #134):
   - The caller gives `<data>`. The installer does not check that it is private or outside a workspace. No function for the platform data directory exists.
-  - There is no lock. Two processes MUST NOT change the same extension id at the same time; nothing enforces this.
+  - As merged with PR #134 there is no lock, and two operations on one id at the same time can lose the active version (review finding R-69). Decision for the fix (not on `main` on this date): each operation on an id, the recovery step included, holds one exclusive lock file for this id for its whole time (`File::try_lock` of the standard library; it also works between processes). A second operation on the same id does not wait: it fails at once with a `retryable` error. The lock file is never deleted.
+  - After the second move the change is done (review finding R-70). If the clean-up after it fails, the failure is logged, the operation returns success, and the next recovery step completes the clean-up. Before the second move, each error leaves the old version active.
   - Files are synced; the parent directory is not synced after a move. A power loss can undo the last move. The recovery step repairs the states that the journal describes.
 - The caller MUST activate a reviewed update only after the user review and the grant (to enforce in #51; no check exists).
