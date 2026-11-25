@@ -664,6 +664,27 @@ async fn an_exit_during_a_call_ends_the_call_while_the_output_stays_open() {
     assert!(!alive(package.pid()));
 }
 
+/// Criterion 4 (R-117): another process holds the output, so a failed call
+/// ends after the grace time: not before, and not much later.
+///
+/// Limits: at least 250 ms (the grace is 300 ms). At most 2 s, so a margin
+/// of 1.7 s for a loaded machine. A grace time 10 times longer (3 s) fails
+/// the upper limit; the wait of the test itself (20 s) is no limit here.
+#[cfg(unix)]
+async fn a_failed_call_with_a_held_output_ends_after_the_grace_time() {
+    let package = package("exit-held");
+    let mut config = config();
+    config.grace = Duration::from_millis(300);
+    let (runtime, _crashes) = runtime(config);
+    let instance = load(&runtime, &package).await.unwrap();
+    let start = std::time::Instant::now();
+    let error = within(instance.activate(context())).await.unwrap_err();
+    let elapsed = start.elapsed();
+    internal(&error);
+    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
 /// Criterion 4 (R-88): the answer of a process that exits directly after
 /// it is not lost. The exit is then a crash while no call runs.
 #[cfg(unix)]
@@ -1178,6 +1199,8 @@ const TESTS: &[Test] = tests![
     an_exit_during_a_call_ends_the_call_while_the_output_stays_open,
     #[cfg(unix)]
     an_answer_before_an_exit_is_kept,
+    #[cfg(unix)]
+    a_failed_call_with_a_held_output_ends_after_the_grace_time,
     #[cfg(unix)]
     an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first,
     #[cfg(unix)]
