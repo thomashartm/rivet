@@ -723,7 +723,11 @@ fn scan(directories: &[PathBuf]) -> Scan {
                 }
                 _ => {
                     scan.refused.remove(&id);
-                    scan.packages.insert(id, package);
+                    let used = package.directory.clone();
+                    // The package of the earlier directory is in no list.
+                    if let Some(ignored) = scan.packages.insert(id.clone(), package) {
+                        tracing::warn!(extension = %id, used = %used.display(), ignored = %ignored.directory.display(), "a later discovery directory has the same extension: the earlier package is ignored");
+                    }
                 }
             }
         }
@@ -4112,6 +4116,34 @@ mod tests {
         );
         assert!(
             events[0].contains(&new.join("a").display().to_string()),
+            "{text}"
+        );
+    }
+
+    // The scan runs on the blocking pool, so the test calls it directly.
+    #[test]
+    fn the_scan_logs_a_package_that_a_later_directory_shadows() {
+        let (log, dispatch) = log();
+        let _guard = capture_logs(&dispatch);
+        let f = fixture(true);
+        f.write(BUNDLED, "a", &manifest("a", "1.0.0", &[], ""));
+        f.write(WORKSPACE, "a-fork", &manifest("a", "1.2.0", &[], ""));
+        f.write(USER, "b", &manifest("b", "1.0.0", &[], ""));
+        let directories: Vec<PathBuf> = f.roots.iter().map(|r| r.path().to_owned()).collect();
+
+        let scan = scan(&directories);
+
+        let used = f.roots[WORKSPACE].path().join("a-fork");
+        assert_eq!(scan.packages[&id("a")].directory, used);
+        assert!(scan.invalid.is_empty(), "{:?}", scan.invalid);
+        let text = log.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("extension=a"), "{text}");
+        assert!(text.contains(&format!("used={}", used.display())), "{text}");
+        let ignored = f.roots[BUNDLED].path().join("a");
+        assert!(
+            text.contains(&format!("ignored={}", ignored.display())),
             "{text}"
         );
     }
