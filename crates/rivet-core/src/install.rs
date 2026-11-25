@@ -569,6 +569,9 @@ impl Installer {
                 Some((Some(old), _)) if is_real_dir(&store.join(old.to_string())) => {
                     Some(old.clone())
                 }
+                // A first install: no version was active, so none goes back
+                // (a retired directory here is one that a clean-up left).
+                Some((None, _)) => None,
                 _ => sole_retired(&store, &pending)?,
             };
             if let Some(old) = old {
@@ -2652,13 +2655,20 @@ mod tests {
     #[test]
     fn a_journal_that_names_no_directory_puts_the_one_retired_version_back() {
         let pending = |f: &Fixture| f.store().join(PENDING_FILE);
-        for journal in ["new = \"2.0.0\"", "old = \"0.8.0\"\nnew = \"2.0.0\""] {
+        // The journal names an old version that has no directory: the one
+        // retired version goes back. The journal of a first install names
+        // no old version: nothing goes back.
+        let journals = [
+            ("old = \"0.8.0\"\nnew = \"2.0.0\"", Some("1.0.0")),
+            ("new = \"2.0.0\"", None),
+        ];
+        for (journal, active) in journals {
             let f = fixture();
             f.staged_update();
             fs::write(pending(&f), journal).unwrap();
             f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
             f.installer.recover(&id()).unwrap();
-            assert_eq!(f.active_version().as_deref(), Some("1.0.0"), "{journal}");
+            assert_eq!(f.active_version().as_deref(), active, "{journal}");
             assert!(!pending(&f).exists());
         }
 
