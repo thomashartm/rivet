@@ -10,6 +10,27 @@
 //! | Wasmtime | 51.0.0 |
 //! | WASI | none: the host gives no WASI interface |
 //!
+//! # Extension host
+//!
+//! [`WasmRuntime`] is an [`ExtensionRuntime`]: the extension host
+//! ([`crate::host`]) loads the file [`COMPONENT_FILE`] of a package directory
+//! into a [`WasmInstance`], calls its lifecycle functions, and drops it to
+//! unload it. An error of a call puts the extension in the state `Failed`
+//! (ARCHITECTURE.md §4.4): a trap, a limit violation, or an error that the
+//! component returns.
+//!
+//! - A WASM extension cannot register a service, a command handler or a job
+//!   yet. The imports for this come with the first extension point that has
+//!   a WIT interface (ADR-0013).
+//! - A package with a missing or invalid component file fails with a `user`
+//!   error. The host restarts it with backoff until it is `Disabled`
+//!   (ADR-0021), although a restart cannot repair the file.
+//! - The component file must be a regular file. A symbolic link is refused,
+//!   so a package cannot make the host read a file outside its directory.
+//! - [`Limits::call_timeout`] is not set from the setting
+//!   `extensions.call_timeout_ms` yet. The code that builds the runtime and
+//!   the host must copy the value; that wiring comes in a later ticket.
+//!
 //! # Sandbox
 //!
 //! A component can use only what the host gives it as an import. The host
@@ -58,9 +79,11 @@
 //! the caller drops continues until it returns or reaches a limit: the fuel
 //! or the time limit.
 
+use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
 use crate::logging::Redactor;
 use rivet_sdk::error::{Error, Result};
-use rivet_sdk::manifest::ExtensionId;
+use rivet_sdk::extension::BoxFuture;
+use rivet_sdk::manifest::{ExtensionId, Manifest};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -75,6 +98,10 @@ mod bindings {
 use bindings::rivet::extension::logging::{self, LogLevel};
 use bindings::rivet::extension::types::{self, ErrorCategory as GuestCategory};
 use bindings::{Extension, ExtensionPre};
+
+/// The name of the component file in an extension directory, next to the
+/// manifest ([`MANIFEST_FILE`](crate::host::MANIFEST_FILE)).
+pub const COMPONENT_FILE: &str = "extension.wasm";
 
 /// The default of [`Limits::memory_bytes`]: 64 MiB.
 pub const DEFAULT_MEMORY_BYTES: usize = 64 << 20;
@@ -119,6 +146,11 @@ pub struct Limits {
     pub fuel_per_call: u64,
     /// The longest time of one call into a component. The instantiation is
     /// also one call. The call can end up to 100 ms later.
+    ///
+    /// The value has one owner: the code that builds the runtime and the
+    /// extension host sets it from
+    /// [`HostConfig::call_timeout`](crate::host::HostConfig::call_timeout)
+    /// (ADR-0018). This module reads no settings.
     pub call_timeout: Duration,
     /// The most bytes that a component file can have.
     pub component_bytes: usize,
@@ -470,7 +502,8 @@ impl WasmRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a `user` error if the file cannot be read, and the errors of
+    /// Returns a `user` error if the file cannot be read or is not a regular
+    /// file (a symbolic link is refused), and the errors of
     /// [`load`](Self::load).
     pub async fn load_file(&self, path: &Path) -> Result<WasmComponent> {
         let path = path.to_owned();
@@ -479,13 +512,27 @@ impl WasmRuntime {
         let most =
             u64::try_from(self.limits.component_bytes).map_or(u64::MAX, |n| n.saturating_add(1));
         let bytes = blocking(move || {
+            let unreadable = |error| {
+                Error::user(format!("cannot read the WASM component {}", path.display()))
+                    .with_source(error)
+            };
+            // Not `metadata`: that follows a symbolic link.
+            // shortcut: the file can be replaced between this check and the
+            // open; open with `O_NOFOLLOW` (needs a new crate or `unsafe`)
+            // when the package directory can change while the host loads it.
+            if !std::fs::symlink_metadata(&path)
+                .map_err(unreadable)?
+                .is_file()
+            {
+                return Err(Error::user(format!(
+                    "the WASM component {} is not a regular file",
+                    path.display()
+                )));
+            }
             let mut bytes = Vec::new();
             std::fs::File::open(&path)
                 .and_then(|file| file.take(most).read_to_end(&mut bytes))
-                .map_err(|error| {
-                    Error::user(format!("cannot read the WASM component {}", path.display()))
-                        .with_source(error)
-                })?;
+                .map_err(unreadable)?;
             Ok(bytes)
         })
         .await?;
@@ -533,6 +580,32 @@ impl WasmRuntime {
             })
         })
         .await
+    }
+}
+
+impl WasmRuntime {
+    /// Loads [`COMPONENT_FILE`] of the package in `directory` and makes the
+    /// instance of the extension of `manifest`.
+    async fn load_package(&self, manifest: &Manifest, directory: &Path) -> Result<WasmInstance> {
+        let component = self.load_file(&directory.join(COMPONENT_FILE)).await?;
+        self.instantiate(&component, manifest.id.clone()).await
+    }
+}
+
+impl ExtensionRuntime for WasmRuntime {
+    /// Loads the file [`COMPONENT_FILE`] in `directory`.
+    ///
+    /// Gives the errors of [`load_file`](Self::load_file) and
+    /// [`instantiate`](Self::instantiate).
+    fn load<'a>(
+        &'a self,
+        manifest: &'a Manifest,
+        directory: &'a Path,
+    ) -> BoxFuture<'a, Result<Box<dyn ExtensionInstance>>> {
+        Box::pin(async move {
+            let instance = self.load_package(manifest, directory).await?;
+            Ok(Box::new(instance) as Box<dyn ExtensionInstance>)
+        })
     }
 }
 
@@ -618,13 +691,38 @@ impl WasmInstance {
     }
 }
 
+impl ExtensionInstance for WasmInstance {
+    /// Calls `activate` of the component. The component cannot register a
+    /// service, a command handler or a job yet (see the module
+    /// documentation), so `_context` is not used.
+    // shortcut: the context is dropped; give it to the instance when the
+    // first registration import is added to the world `extension`.
+    fn activate(&self, _context: ExtensionContext) -> BoxFuture<'_, Result<()>> {
+        Box::pin(WasmInstance::activate(self))
+    }
+
+    fn deactivate(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(WasmInstance::deactivate(self))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{CommandBus, EventBus};
+    use crate::host::{
+        ActivationReport, ExtensionHost, ExtensionState, ExtensionStatus, HostConfig,
+        MANIFEST_FILE, Services,
+    };
+    use crate::jobs::JobScheduler;
     use crate::logging::{Capture, Level, LogConfig, LogFormat, Redactor, dispatch};
+    use crate::registry::ServiceRegistry;
+    use crate::resolve::ActivationTrigger;
     use rivet_sdk::error::ErrorCategory;
+    use rivet_sdk::manifest::Version;
     use rivet_sdk::secret::Secret;
     use std::future::Future;
+    use std::num::{NonZeroU16, NonZeroUsize};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};
 
@@ -1334,6 +1432,221 @@ mod tests {
             assert_eq!(error.category(), ErrorCategory::User, "{error}");
             assert!(error.message().contains("larger than the limit"), "{error}");
         }
+    }
+
+    /// An extension host with one discovery directory.
+    struct Hosted {
+        host: Arc<ExtensionHost>,
+        root: tempfile::TempDir,
+    }
+
+    /// A host that runs its extensions on `runtime`. It plans the automatic
+    /// restart of a failed extension one hour later: not in the time of a
+    /// test.
+    fn hosted(runtime: Arc<dyn ExtensionRuntime>) -> Hosted {
+        let services = Services {
+            registry: Arc::new(ServiceRegistry::new()),
+            commands: Arc::new(CommandBus::new()),
+            events: Arc::new(EventBus::new(NonZeroU16::MAX)),
+            jobs: JobScheduler::new(NonZeroUsize::MIN, 0),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let config = HostConfig {
+            backoff_initial: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(3600),
+            ..HostConfig::default()
+        };
+        let directories = vec![root.path().to_owned()];
+        let sdk = Version::new(0, 1, 0);
+        let host = ExtensionHost::new(runtime, services, sdk, directories, true, config);
+        Hosted { host, root }
+    }
+
+    impl Hosted {
+        /// Writes the package of the extension `name`: a manifest that
+        /// activates on the command `name`, and the component `bytes`.
+        fn install(&self, name: &str, version: &str, bytes: &[u8]) {
+            let directory = self.root.path().join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            let manifest = format!(
+                "id = \"{name}\"\nversion = \"{version}\"\nsdk = \"^0.1\"\n\
+                 [[activation]]\non = \"command\"\ncommand = \"{name}\"\n"
+            );
+            std::fs::write(directory.join(MANIFEST_FILE), manifest).unwrap();
+            std::fs::write(directory.join(COMPONENT_FILE), bytes).unwrap();
+        }
+
+        /// Discovers the packages, then invokes the command `name`.
+        async fn start(&self, name: &str) -> ActivationReport {
+            self.host.discover().await.unwrap();
+            self.host.trigger(ActivationTrigger::Command(name)).await
+        }
+
+        fn status(&self, name: &str) -> Option<ExtensionStatus> {
+            let mut all = self.host.extensions().into_iter();
+            all.find(|status| status.id.as_str() == name)
+        }
+
+        fn state(&self, name: &str) -> Option<ExtensionState> {
+            self.status(name).map(|status| status.state)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_activates_deactivates_unloads_and_reloads_a_component() {
+        let capture = Capture::default();
+        let _guard =
+            capture_logs(&capture.dispatch(Level::INFO, LogFormat::Human, &Redactor::new()));
+        let hosted = hosted(Arc::new(runtime()));
+        let name = id("acme.hello");
+        hosted.install("acme.hello", "1.0.0", &logging_guest("version one"));
+
+        let report = hosted.start("acme.hello").await;
+        assert_eq!(report.activated, std::slice::from_ref(&name));
+        assert_eq!(hosted.state("acme.hello"), Some(ExtensionState::Active));
+        assert_eq!(capture.text().matches("version one").count(), 1);
+
+        hosted.host.deactivate(&name).await.unwrap();
+        assert_eq!(hosted.state("acme.hello"), Some(ExtensionState::Inactive));
+        hosted.host.unload(&name).await.unwrap();
+        assert_eq!(hosted.state("acme.hello"), None);
+
+        // Loaded again after the unload.
+        let report = hosted.start("acme.hello").await;
+        assert_eq!(report.activated, std::slice::from_ref(&name));
+        assert_eq!(capture.text().matches("version one").count(), 2);
+
+        // Hot reload: the host runs the new component file.
+        hosted.install("acme.hello", "2.0.0", &logging_guest("version two"));
+        let report = hosted.host.reload(&name).await.unwrap();
+        assert_eq!(report.activated, [name]);
+        assert_eq!(hosted.state("acme.hello"), Some(ExtensionState::Active));
+        let text = capture.text();
+        assert_eq!(text.matches("version one").count(), 2, "{text}");
+        assert_eq!(text.matches("version two").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_package_without_a_valid_component_file_is_failed_with_a_user_error() {
+        let hosted = hosted(Arc::new(runtime()));
+        hosted.install("acme.invalid", "1.0.0", b"not wasm");
+        hosted.install("acme.missing", "1.0.0", b"");
+        let missing = hosted.root.path().join("acme.missing");
+        std::fs::remove_file(missing.join(COMPONENT_FILE)).unwrap();
+
+        for name in ["acme.invalid", "acme.missing"] {
+            let report = hosted.start(name).await;
+            let error = &report.not_activated[&id(name)];
+            assert_eq!(error.category(), ErrorCategory::User, "{error}");
+            assert_eq!(hosted.state(name), Some(ExtensionState::Failed));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_component_file_that_is_a_symbolic_link_is_refused() {
+        // The link points to a valid component outside the package directory.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("other.wasm");
+        std::fs::write(&target, logging_guest("hello")).unwrap();
+
+        let hosted = hosted(Arc::new(runtime()));
+        hosted.install("acme.link", "1.0.0", b"");
+        let file = hosted.root.path().join("acme.link").join(COMPONENT_FILE);
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+
+        let report = hosted.start("acme.link").await;
+        let error = &report.not_activated[&id("acme.link")];
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        assert!(error.message().contains("not a regular file"), "{error}");
+        assert_eq!(hosted.state("acme.link"), Some(ExtensionState::Failed));
+    }
+
+    /// `activate` of one extension has the body `activate` and fails with
+    /// `reason`. The host must put that extension in `Failed`; a second
+    /// extension stays `Active`.
+    async fn failure_puts_the_extension_in_failed(limits: Limits, activate: &str, reason: &str) {
+        let hosted = hosted(Arc::new(runtime_with(limits, &Redactor::new())));
+        hosted.install("acme.broken", "1.0.0", &guest("", activate));
+        hosted.install("acme.healthy", "1.0.0", &logging_guest("hello"));
+        hosted.start("acme.healthy").await;
+
+        let report = hosted.start("acme.broken").await;
+        let error = &report.not_activated[&id("acme.broken")];
+        assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
+        assert!(error.message().contains(reason), "{error}");
+
+        let status = hosted.status("acme.broken").unwrap();
+        assert_eq!(status.state, ExtensionState::Failed);
+        assert!(status.reason.unwrap().contains(reason));
+        assert_eq!(hosted.state("acme.healthy"), Some(ExtensionState::Active));
+        // The healthy instance still takes calls.
+        hosted.host.deactivate(&id("acme.healthy")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_trap_puts_the_extension_in_failed() {
+        failure_puts_the_extension_in_failed(SMALL, "unreachable", "trapped").await;
+    }
+
+    #[tokio::test]
+    async fn a_fuel_limit_violation_puts_the_extension_in_failed() {
+        let endless = "(loop $l (br $l)) unreachable";
+        failure_puts_the_extension_in_failed(SMALL, endless, "CPU limit").await;
+    }
+
+    #[tokio::test]
+    async fn a_memory_limit_violation_puts_the_extension_in_failed() {
+        let greedy = "(drop (memory.grow (i32.const 2))) (i32.const 0)";
+        failure_puts_the_extension_in_failed(SMALL, greedy, "memory limit").await;
+    }
+
+    #[tokio::test]
+    async fn a_time_limit_violation_puts_the_extension_in_failed() {
+        let endless = "(loop $l (br $l)) unreachable";
+        failure_puts_the_extension_in_failed(HURRIED, endless, "time limit").await;
+    }
+
+    /// The WASM runtime, plus a weak reference to each instance it loaded.
+    struct Watched {
+        runtime: WasmRuntime,
+        instances: Mutex<Vec<std::sync::Weak<Mutex<Inner>>>>,
+    }
+
+    impl ExtensionRuntime for Watched {
+        fn load<'a>(
+            &'a self,
+            manifest: &'a Manifest,
+            directory: &'a Path,
+        ) -> BoxFuture<'a, Result<Box<dyn ExtensionInstance>>> {
+            Box::pin(async move {
+                let instance = self.runtime.load_package(manifest, directory).await?;
+                let weak = Arc::downgrade(&instance.inner);
+                self.instances.lock().unwrap().push(weak);
+                Ok(Box::new(instance) as Box<dyn ExtensionInstance>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unload_frees_the_instance() {
+        let watched = Arc::new(Watched {
+            runtime: runtime(),
+            instances: Mutex::default(),
+        });
+        let hosted = hosted(Arc::clone(&watched) as Arc<dyn ExtensionRuntime>);
+        hosted.install("acme.hello", "1.0.0", &logging_guest("hello"));
+        hosted.start("acme.hello").await;
+        hosted.host.deactivate(&id("acme.hello")).await.unwrap();
+
+        // The store and the memory of the instance live in `Inner`.
+        let instances = watched.instances.lock().unwrap().clone();
+        assert_eq!(instances.len(), 1);
+        assert!(instances[0].upgrade().is_some());
+
+        hosted.host.unload(&id("acme.hello")).await.unwrap();
+        assert!(instances[0].upgrade().is_none());
     }
 
     #[test]
