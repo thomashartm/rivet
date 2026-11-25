@@ -27,6 +27,7 @@ Behaviour:
 - A call that exceeds the timeout gives an `internal` error and the state `Failed`. The host drops the instance.
 - A job above the limit is refused with a `policy` error.
 - When an extension fails, its active dependents are deactivated first. After a successful restart they are activated again. If the extension ends in `Disabled`, they stay `Inactive`.
+- The automatic restart applies to a failed activation, a call timeout of load or activate, and a reported crash. A failure in a `deactivate` call starts no automatic restart: the extension stays `Failed` until a manual restart or disable, because the caller asked to stop it.
 - A failed restart keeps the state `Failed`. It is no state change (see ADR-0017 b).
 - The host publishes an event when it schedules a restart, with the attempt number, the delay and the reason.
 - Unload, disable, a manual restart and shutdown cancel the pending restarts that they make useless.
