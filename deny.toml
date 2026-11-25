@@ -17,6 +17,12 @@ allow = [
     "Zlib",
 ]
 
+# tiny-keccak comes in through arrow-array -> ahash -> const-random on wasm32 only.
+# CC0-1.0 is a public-domain dedication and is compatible with the AGPL.
+[[licenses.exceptions]]
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
 
