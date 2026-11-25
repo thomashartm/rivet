@@ -5,7 +5,7 @@
 
 ## Context
 
-The extension host was merged with PR #109 (`crates/rivet-core/src/host.rs`). It differs from the diagram of ARCHITECTURE.md §4.4 in two points (rows b and c), and it fixes three things that §4.4 leaves open (rows a, d and e). The signature check (#12) does not exist yet.
+The extension host was merged with PR #109 (`crates/rivet-core/src/host.rs`). It differs from the diagram of ARCHITECTURE.md §4.4 in three points (rows b, c and, since PR #131, f: six transitions in the code that the diagram does not have), and it fixes three things that §4.4 leaves open (rows a, d and e). The signature check (#12) does not exist yet.
 
 As built (read in the code on 2026-11-25):
 
@@ -35,4 +35,8 @@ As built (read in the code on 2026-11-25):
 - e: the precedence bundled < user < workspace itself stays. A user can still override a bundled extension with a package from the same publisher.
 - e: a package with an invalid manifest never replaces a valid package with the same id from an earlier directory. It is listed as invalid. As built in PR #109 it does replace it; this is a defect.
 - b: since PR #121 the code follows this position: `transition` in `host.rs` has `Resolved`, `Inactive` and `Active` → `Failed`. The table "As built" above shows the state of PR #109.
+- f, reload and pending restart (review finding R-74, not on `main` on this date): a reload request cancels the pending automatic restart of this extension first. If the reload is refused, the extension stays `Failed` with the reason of the refusal, and the host does not restart it by itself. Without this, a restart can load the old manifest with the new files.
+- Reload of a broken package (review finding R-72, not on `main` on this date): if the directory of the current package now holds an invalid package, or a later directory holds an invalid package with this id, the reload returns the reason as a `user` error and changes nothing. It never changes the running extension to a package of an earlier directory.
+- Same id two times in one directory (review finding R-73, not on `main` on this date): the folder whose name is equal to the id wins; the other folder is listed as invalid with a reason. If no folder has the name of the id, each of them is listed as invalid. The installer always uses the id as the folder name (ADR-0023).
+- Symbolic links in a discovery directory (review finding R-74): a link is never followed. As built, each link is listed as an invalid package. Decision (not on `main` on this date): only a link to a directory is listed as invalid, with the reason that links are not read; a link to a file and a link without a target are ignored, like a file.
 - The diagram in §4.4 is not changed until the maintainer accepts this ADR.
