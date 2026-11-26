@@ -86,6 +86,9 @@ pub trait SecretBackend: Send + Sync {
 ///   name of the keychain entry. It can contain `/`.
 /// - Both parts must not be empty. The parts are used as written; there is
 ///   no percent-decoding, so a service name cannot contain `/`.
+/// - On Windows only, `<service>` must not contain `.`: the Windows store
+///   names the entry `<account>.<service>`, so `keychain://b.c/a` and
+///   `keychain://c/a.b` would read the same entry. Such a URI is refused.
 ///
 /// Example: `keychain://rivet/prod-db` reads the entry with the service
 /// `rivet` and the account `prod-db`. On macOS,
@@ -99,6 +102,9 @@ impl SecretBackend for KeychainBackend {
     fn resolve<'a>(&'a self, path: &'a str) -> SecretFuture<'a> {
         Box::pin(async move {
             let (service, account) = keychain_entry(path)?;
+            if cfg!(windows) {
+                windows_service_is_not_ambiguous(service, account)?;
+            }
             let (service, account) = (service.to_owned(), account.to_owned());
             // The keychain call blocks, and it can wait for the user (§5.1).
             tokio::task::spawn_blocking(move || {
@@ -125,6 +131,23 @@ fn keychain_entry(path: &str) -> Result<(&str, &str)> {
                 shown(path)
             ))
         })
+}
+
+/// Refuses a service name that makes the name of a Windows entry ambiguous.
+///
+/// The Windows store names an entry `<account>.<service>`. With a `.` in
+/// the service, `keychain://b.c/a` and `keychain://c/a.b` name the same
+/// entry `a.b.c`. Without it, the last `.` divides the two parts.
+fn windows_service_is_not_ambiguous(service: &str, account: &str) -> Result<()> {
+    if !service.contains('.') {
+        return Ok(());
+    }
+    Err(Error::user(format!(
+        "the secret URI {} is refused on Windows: the service name must not \
+         contain `.`, because Windows names the entry `<account>.<service>` \
+         and cannot tell this entry apart from the entry of a different URI",
+        shown(&format!("{KEYCHAIN_SCHEME}://{service}/{account}"))
+    )))
 }
 
 /// Turns a keychain failure into an SDK error that contains no secret data.
@@ -949,6 +972,20 @@ mod tests {
         for path in ["rivet", "rivet/", "/prod-db", "/"] {
             let error = keychain_entry(path).unwrap_err();
             assert_eq!(error.category(), ErrorCategory::User, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_windows_service_name_with_a_dot_is_refused() {
+        // R-78 g: both URIs would name the Windows entry `a.b.c`.
+        assert!(windows_service_is_not_ambiguous("c", "a.b").is_ok());
+        assert!(windows_service_is_not_ambiguous("rivet", "prod-db").is_ok());
+        for service in ["b.c", ".", "c.", ".c"] {
+            let error = windows_service_is_not_ambiguous(service, "a").unwrap_err();
+            assert_eq!(error.category(), ErrorCategory::User, "{service}");
+            let uri = format!("keychain://{service}/a");
+            assert!(error.message().contains(&uri), "{error}");
+            assert!(error.message().contains("Windows"), "{error}");
         }
     }
 

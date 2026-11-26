@@ -1,6 +1,6 @@
 # ADR-0022: Secrets shorter than 4 bytes are not redacted in logs
 
-- Status: Proposed
+- Status: Accepted (maintainer, 2026-11-25). The points that the text marks as open or as a proposal stay open.
 - Date: 2026-11-25
 
 ## Context
@@ -13,7 +13,7 @@ ARCHITECTURE.md §7.4 says secrets MUST be redacted in logs, traces, errors and 
 - The secret store does not refuse short secrets. Development and test databases use them.
 - When the secret store resolves a value shorter than 4 bytes, it writes one `warn` log event with the secret URI and without the value. Implemented since PR #170 (`secrets.rs`, in the read path of the store; the event has the URI and the reader, never the value). The event is written at each such read, not one time per secret.
 - Text replacement is the second line of defence. The first line stays a MUST: a secret value is carried only in the `Secret` type, which has no `Display` and no `Serialize`, so code cannot write it to a log by accident.
-- §7.4 gets the words "of 4 bytes or more" when the maintainer accepts this ADR.
+- §7.4 has the words "of 4 bytes or more" since the maintainer accepted this ADR (2026-11-25). A short secret gives the warning only; it is not refused (decided by the maintainer on 2026-11-25; review finding R-3).
 
 ## Consequences
 

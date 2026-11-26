@@ -59,6 +59,14 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The child process: speaks the protocol on its standard input and output.
 fn child(directory: &Path) -> ! {
     let behaviour = std::fs::read_to_string(directory.join("behaviour")).unwrap();
+    // `<behaviour>+second`: the child first starts a second process (R-87).
+    let behaviour = match behaviour.strip_suffix("+second") {
+        Some(behaviour) => {
+            second(directory, true);
+            behaviour.to_owned()
+        }
+        None => behaviour,
+    };
     // One extension has one process at a time: the file `overlap` says that
     // an older process of this package directory exists.
     #[cfg(unix)]
@@ -151,6 +159,21 @@ fn child(directory: &Path) -> ! {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 reply(json!({"type": "ok"}));
+                std::process::exit(0);
+            }
+            ("activate", "exit-grandchild-answers") => {
+                // Known limit: the answer comes from a process that is not
+                // the child, after the child has exited.
+                grandchild_answers();
+                std::process::exit(3);
+            }
+            ("activate", "no-line-end-exit" | "no-line-end-exit-held") => {
+                if behaviour == "no-line-end-exit-held" {
+                    second(directory, true);
+                }
+                // A complete message, but without the line end.
+                print!("{{\"type\":\"ok\"}}");
+                std::io::stdout().flush().unwrap();
                 std::process::exit(0);
             }
             ("activate", "half-exit" | "half-exit-held") => {
@@ -246,6 +269,21 @@ fn second(directory: &Path, output: bool) {
     std::fs::write(directory.join("second"), second.id().to_string()).unwrap();
 }
 
+/// Starts a process that has the output of the child and writes a complete
+/// answer after 0.1 s. The process ends after that.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the process must live longer than the child"
+)]
+fn grandchild_answers() {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 0.1; echo '{\"type\":\"ok\"}'"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+}
+
 // ------------------------------------------------------------- fixtures
 
 /// A package directory `<root>/acme.native` with a manifest and the
@@ -277,7 +315,11 @@ impl Drop for Package {
     /// Ends the process that the child started with `second`.
     fn drop(&mut self) {
         if let Ok(pid) = std::fs::read_to_string(self.directory.join("second")) {
-            let _ = std::process::Command::new("kill").arg(pid).status();
+            // The runtime can have ended it already.
+            let _ = std::process::Command::new("kill")
+                .arg(pid)
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 }
@@ -290,6 +332,13 @@ impl Package {
             .lines()
             .map(|line| line.parse().unwrap())
             .collect()
+    }
+
+    /// The process id of the process that the child started with `second`.
+    #[cfg(unix)]
+    fn second(&self) -> u32 {
+        let pid = std::fs::read_to_string(self.directory.join("second")).unwrap();
+        pid.parse().unwrap()
     }
 
     #[cfg(unix)]
@@ -315,7 +364,7 @@ fn redactor() -> Redactor {
 /// A runtime whose crash callback sends each report to the receiver.
 fn runtime(config: NativeConfig) -> (NativeRuntime, mpsc::UnboundedReceiver<(ExtensionId, Error)>) {
     let (sender, crashes) = mpsc::unbounded_channel();
-    let on_crash: CrashCallback = Arc::new(move |id, error| {
+    let on_crash: CrashCallback = Arc::new(move |id, error, _| {
         let _ = sender.send((id, error));
     });
     let runtime = NativeRuntime::new(config, redactor(), on_crash).unwrap();
@@ -355,9 +404,9 @@ fn host(package: &Package, services: Services) -> Arc<ExtensionHost> {
     let slot: Arc<OnceLock<Weak<ExtensionHost>>> = Arc::default();
     let on_crash: CrashCallback = Arc::new({
         let slot = Arc::clone(&slot);
-        move |id, error| {
+        move |id, error, failed_at| {
             if let Some(host) = slot.get().and_then(Weak::upgrade) {
-                tokio::spawn(async move { host.report_crash(&id, error).await });
+                tokio::spawn(async move { host.report_crash(&id, error, failed_at).await });
             }
         }
     });
@@ -494,7 +543,7 @@ async fn a_program_that_cannot_start_is_an_error() {
 
 /// A limit of 0 lets no handshake and no message pass.
 async fn a_limit_of_zero_is_refused() {
-    let on_crash: CrashCallback = Arc::new(|_, _| {});
+    let on_crash: CrashCallback = Arc::new(|_, _, _| {});
     let mut no_time = config();
     no_time.handshake_timeout = Duration::ZERO;
     let mut no_bytes = config();
@@ -517,7 +566,7 @@ async fn a_limit_of_zero_is_refused() {
 
 /// Criterion 2 (ADR-0024): no search in `PATH`.
 async fn a_relative_program_path_is_refused() {
-    let on_crash: CrashCallback = Arc::new(|_, _| {});
+    let on_crash: CrashCallback = Arc::new(|_, _, _| {});
     let config = NativeConfig::new("sh");
     let error = NativeRuntime::new(config, redactor(), on_crash)
         .err()
@@ -662,6 +711,63 @@ async fn an_exit_during_a_call_ends_the_call_while_the_output_stays_open() {
     let reason = "ended or closed its output during the call";
     assert!(error.message().contains(reason), "{error}");
     assert!(!alive(package.pid()));
+}
+
+/// Criterion 4 (R-117): another process holds the output, so a failed call
+/// ends after the grace time: not before, and not much later.
+///
+/// Limits: at least 250 ms (the grace is 300 ms). At most 2 s, so a margin
+/// of 1.7 s for a loaded machine. A grace time 10 times longer (3 s) fails
+/// the upper limit; the wait of the test itself (20 s) is no limit here.
+#[cfg(unix)]
+async fn a_failed_call_with_a_held_output_ends_after_the_grace_time() {
+    let package = package("exit-held");
+    let mut config = config();
+    config.grace = Duration::from_millis(300);
+    let (runtime, _crashes) = runtime(config);
+    let instance = load(&runtime, &package).await.unwrap();
+    let start = std::time::Instant::now();
+    let error = within(instance.activate(context())).await.unwrap_err();
+    let elapsed = start.elapsed();
+    internal(&error);
+    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+/// Criterion 4 (R-117, ADR-0024): a complete message without the line end
+/// is not an answer, also if the process then exits.
+#[cfg(unix)]
+async fn an_answer_without_a_line_end_before_an_exit_is_an_end_of_the_process() {
+    for behaviour in ["no-line-end-exit", "no-line-end-exit-held"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, mut crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        let error = within(instance.activate(context())).await.unwrap_err();
+        internal(&error);
+        let reason = "ended or closed its output during the call";
+        assert!(error.message().contains(reason), "{behaviour}: {error}");
+        assert!(crashes.try_recv().is_err(), "{behaviour}");
+    }
+}
+
+/// Criterion 4 (R-117, ADR-0024). KNOWN LIMIT, not a wanted behaviour: the
+/// child exits without an answer, and another process that holds the output
+/// writes a line within the grace time. The runtime takes the line as the
+/// answer of the child.
+///
+/// The other process writes after 0.1 s; the grace time is the default of
+/// 2 s, so a margin of 1.9 s on a loaded machine.
+#[cfg(unix)]
+async fn known_limit_a_line_of_another_process_within_the_grace_time_is_the_answer() {
+    let package = package("exit-grandchild-answers");
+    let (runtime, mut crashes) = runtime(config());
+    let instance = load(&runtime, &package).await.unwrap();
+    within(instance.activate(context())).await.unwrap();
+    // The exit of the child is then a crash while no call runs.
+    let (_, error) = within(crashes.recv()).await.unwrap();
+    assert!(error.message().contains("the process ended"), "{error}");
 }
 
 /// Criterion 4 (R-88): the answer of a process that exits directly after
@@ -1004,6 +1110,63 @@ async fn a_dropped_call_kills_the_process() {
     assert_eq!(error.category(), ErrorCategory::Internal);
 }
 
+/// R-87 (ADR-0024): a process that the child started ends with the child.
+/// The child fails the handshake, or exits before it.
+#[cfg(unix)]
+async fn a_failed_load_ends_the_processes_that_the_child_started() {
+    for behaviour in ["wrong-version+second", "gone+second"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, _crashes) = runtime(config);
+        load(&runtime, &package).await.err().expect(behaviour);
+        until(|| !alive(package.second())).await;
+    }
+}
+
+/// R-87 (ADR-0024): to drop the instance ends the processes that the child
+/// started. The child exits on its closed input, or it is killed after the
+/// grace time.
+#[cfg(unix)]
+async fn to_drop_the_instance_ends_the_processes_that_the_child_started() {
+    for behaviour in ["ok+second", "stubborn+second"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, _crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        assert!(alive(package.second()), "{behaviour}");
+        drop(instance);
+        until(|| !alive(package.second())).await;
+    }
+}
+
+/// R-87 (ADR-0024): a dropped call ends the processes that the child
+/// started.
+#[cfg(unix)]
+async fn a_dropped_call_ends_the_processes_that_the_child_started() {
+    let package = package("hang+second");
+    let instance = loaded(&package).await;
+    let hanging = package.directory.join("hanging");
+    tokio::select! {
+        result = instance.activate(context()) => panic!("the call returned: {result:?}"),
+        () = until(|| hanging.exists()) => {}
+    }
+    until(|| !alive(package.second())).await;
+}
+
+/// R-87 (ADR-0024): after a crash the runtime ends the processes that the
+/// child started.
+#[cfg(unix)]
+async fn a_crash_ends_the_processes_that_the_child_started() {
+    let package = package("crash+second");
+    let (runtime, mut crashes) = runtime(config());
+    let _instance = load(&runtime, &package).await.unwrap();
+    std::fs::write(package.directory.join("crash"), "").unwrap();
+    within(crashes.recv()).await.unwrap();
+    until(|| !alive(package.second())).await;
+}
+
 /// Criterion 7.
 async fn the_process_gets_only_the_allowed_environment() {
     // Cargo gives this variable to the test program, so the test program
@@ -1179,6 +1342,12 @@ const TESTS: &[Test] = tests![
     #[cfg(unix)]
     an_answer_before_an_exit_is_kept,
     #[cfg(unix)]
+    a_failed_call_with_a_held_output_ends_after_the_grace_time,
+    #[cfg(unix)]
+    an_answer_without_a_line_end_before_an_exit_is_an_end_of_the_process,
+    #[cfg(unix)]
+    known_limit_a_line_of_another_process_within_the_grace_time_is_the_answer,
+    #[cfg(unix)]
     an_answer_in_the_pipe_is_kept_when_the_exit_is_seen_first,
     #[cfg(unix)]
     answers_before_exits_are_kept_under_load,
@@ -1202,6 +1371,14 @@ const TESTS: &[Test] = tests![
     a_process_that_is_killed_after_the_grace_time_is_not_left_defunct,
     #[cfg(unix)]
     a_dropped_call_kills_the_process,
+    #[cfg(unix)]
+    a_failed_load_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    to_drop_the_instance_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    a_dropped_call_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    a_crash_ends_the_processes_that_the_child_started,
     the_process_gets_only_the_allowed_environment,
     error_output_goes_to_the_log_as_untrusted_text,
     error_output_past_the_budget_is_dropped_and_counted,

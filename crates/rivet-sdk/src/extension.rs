@@ -155,6 +155,22 @@ impl ConnectRequest {
 
 /// The contract of [`ExtensionPoint::Driver`]: connects to a database and
 /// describes its dialect.
+///
+/// # Errors
+///
+/// A driver MUST use these categories (§5.6). The conformance suite of
+/// `rivet-testkit` checks them.
+///
+/// | Case | Category |
+/// | --- | --- |
+/// | A statement that the database refuses because of its text, for example a syntax error | [`User`](crate::error::ErrorCategory::User) |
+/// | A wrong user or password | [`Auth`](crate::error::ErrorCategory::Auth) |
+/// | The endpoint is not reachable, or the connection is lost | [`Connectivity`](crate::error::ErrorCategory::Connectivity) |
+/// | A statement that [`Connection::cancel`] stops | [`Cancelled`](crate::error::ErrorCategory::Cancelled) |
+/// | The driver is wrong, or the database sends data the driver does not understand | [`Internal`](crate::error::ErrorCategory::Internal) |
+///
+/// No message and no source of an error contains a secret: not the
+/// password, not a token, not a private key.
 pub trait Driver: Send + Sync {
     /// Describes the SQL dialect of the database.
     fn dialect(&self) -> Dialect;
@@ -168,7 +184,12 @@ pub trait Driver: Send + Sync {
 pub trait Connection: Send + Sync {
     /// Runs one statement. The rows arrive as a stream of Arrow record
     /// batches. The driver reads from the database only as fast as the
-    /// caller reads the stream (§5.5).
+    /// caller reads the stream (§5.5): its buffer has a fixed size.
+    ///
+    /// The future is ready when the schema is known, before the first batch.
+    /// A connection runs one statement at a time. To drop the
+    /// [`ResultSet`] stops the statement in the database and frees the
+    /// connection: the next call of `execute` works.
     fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>>;
 
     /// Cancels the statement that runs on this connection, in the database

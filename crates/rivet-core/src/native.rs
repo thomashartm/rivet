@@ -105,10 +105,13 @@
 //!   protocol has no message for a registration.
 //! - Bulk data (Arrow IPC over a local socket, §6.6).
 //! - Memory and CPU limits of the process, and OS sandboxing (§4.3).
-//! - A process that the process of the extension starts itself. The runtime
-//!   does not end it, and it does not wait for it: a pipe that such a
-//!   process holds open delays a call by [`NativeConfig::grace`] at most
-//!   (ADR-0024).
+//! - A process that the process of the extension starts itself, on Windows.
+//!   On Unix the process starts in its own process group, and the runtime
+//!   kills the group when it ends the process or sees its end, before it
+//!   reads the exit status (ADR-0024, R-87). A process that leaves the group
+//!   is not ended. The runtime does not wait for the processes of the group:
+//!   a pipe that such a process holds open delays a call by
+//!   [`NativeConfig::grace`] at most.
 
 use crate::host::{ExtensionContext, ExtensionInstance, ExtensionRuntime};
 use crate::logging::Redactor;
@@ -122,7 +125,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -166,12 +169,14 @@ const ERROR_OUTPUT_LINE_BYTES: usize = 8 * 1024;
 
 /// What the runtime calls when a process ends, closes its output or sends a
 /// message while no call runs. The runtime calls it only for a process whose
-/// handshake was successful. The arguments are the extension and the
-/// reason. The reason contains no text from the process.
+/// handshake was successful. The arguments are the extension, the reason
+/// and the time of the failure. The reason contains no text from the
+/// process. With the time, the host ignores a report that is older than
+/// the instance that it has now (ADR-0024).
 ///
 /// The runtime calls it from a task of the Tokio runtime. It must not
 /// block.
-pub type CrashCallback = Arc<dyn Fn(ExtensionId, Error) + Send + Sync>;
+pub type CrashCallback = Arc<dyn Fn(ExtensionId, Error, Instant) + Send + Sync>;
 
 /// How the runtime starts and limits a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,7 +338,8 @@ impl ExtensionRuntime for NativeRuntime {
             let environment = ENVIRONMENT
                 .iter()
                 .filter_map(|name| std::env::var_os(name).map(|value| (name, value)));
-            let mut child = Command::new(&self.config.program)
+            let mut command = Command::new(&self.config.program);
+            command
                 .args(&self.config.arguments)
                 .arg(directory)
                 .current_dir(directory)
@@ -344,14 +350,17 @@ impl ExtensionRuntime for NativeRuntime {
                 .stderr(Stdio::piped())
                 // The backstop when the Tokio runtime ends before the
                 // supervisor task.
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|error| {
-                    failure(&id, "the extension host program did not start").with_source(error)
-                })?;
+                .kill_on_drop(true);
+            // Its own process group: the runtime ends the group, so also each
+            // process that the child starts (ADR-0024, R-87).
+            #[cfg(unix)]
+            command.process_group(0);
+            let mut child = command.spawn().map_err(|error| {
+                failure(&id, "the extension host program did not start").with_source(error)
+            })?;
             let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
             let (Some(input), Some(output), Some(errors)) = pipes else {
-                let _ = child.kill().await;
+                let _ = kill(&mut child).await;
                 return Err(failure(&id, "the process has no pipes"));
             };
             let log = Arc::new(LogBudget::new(id.clone()));
@@ -468,15 +477,16 @@ async fn supervise(
                     }
                     Err(error) => {
                         // The state of the process is not known.
-                        let _ = process.child.kill().await;
+                        let _ = kill(&mut process.child).await;
                         let _ = answer.send(Err(error));
                         break;
                     }
                 }
             }
             error = process.unexpected(), if handshake_done => {
-                let _ = process.child.kill().await;
-                on_crash(process.id.clone(), error);
+                let failed_at = Instant::now();
+                let _ = kill(&mut process.child).await;
+                on_crash(process.id.clone(), error, failed_at);
                 break;
             }
         }
@@ -492,13 +502,13 @@ async fn supervise(
     // The closed input tells the process to exit. A process that was killed
     // above has its exit status already.
     drop(input);
-    if tokio::time::timeout(config.grace, child.wait())
+    if tokio::time::timeout(config.grace, wait(&mut child))
         .await
         .is_err()
     {
         // Kills and reads the exit status. `kill_on_drop` kills also, but it
         // does not wait.
-        let _ = child.kill().await;
+        let _ = kill(&mut child).await;
     }
     // The error output ends with the process, and the task with it. The
     // wait ends only if another process holds the error output open.
@@ -558,7 +568,7 @@ impl Process {
                 // has ended after it.
                 biased;
                 answer = &mut read => answer,
-                _ = self.child.wait() => {
+                () = ended(&mut self.child) => {
                     // The exit can be known before Tokio says that the pipe
                     // has bytes, so one poll of the read is not sufficient.
                     // Another process can hold the output open, so the end
@@ -569,6 +579,7 @@ impl Process {
                 }
             }
         }
+        // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
         .map_err(|error| {
             failure(&self.id, "the output of the process cannot be read").with_source(error)
         })?;
@@ -627,8 +638,9 @@ impl Process {
     async fn unexpected(&mut self) -> Error {
         let id = &self.id;
         tokio::select! {
-            status = self.child.wait() => match status {
+            status = wait(&mut self.child) => match status {
                 Ok(status) => failure(id, &format!("the process ended ({status})")),
+                // No test: `wait` fails only if another party has taken the exit status of the child (ECHILD); a test cannot do that without `unsafe` or a new crate.
                 Err(error) => {
                     failure(id, "the state of the process cannot be read").with_source(error)
                 }
@@ -638,12 +650,72 @@ impl Process {
             bytes = self.output.fill_buf() => match bytes {
                 Ok([]) => failure(id, "the process ended or closed its output"),
                 Ok(_) => failure(id, "the process sent a message that answers no request"),
+                // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
                 Err(error) => {
                     failure(id, "the output of the process cannot be read").with_source(error)
                 }
             },
         }
     }
+}
+
+/// Completes when the child has ended. On Unix it does not read the exit
+/// status, so the number of the process group stays with the extension
+/// (ADR-0024).
+async fn ended(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        let Some(pid) = pid(child) else {
+            return;
+        };
+        // shortcut: polls, because Tokio has no wait that keeps the exit status; upgrade if the poll cost shows in a profile.
+        while let Ok(None) = waitid(WaitId::Pid(pid), options) {
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.wait().await;
+}
+
+/// The interval of [`ended`].
+#[cfg(unix)]
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Waits for the end of the child, kills its process group, and then reads
+/// the exit status.
+async fn wait(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    ended(child).await;
+    kill_group(child);
+    child.wait().await
+}
+
+/// Kills the process group of the child and the child, and reads the exit
+/// status of the child.
+async fn kill(child: &mut Child) -> std::io::Result<()> {
+    kill_group(child);
+    child.kill().await
+}
+
+/// Kills the process group of the child (Unix only). Does nothing after the
+/// exit status of the child was read (`Child::id` is then `None`): after
+/// that read, the number of the group can belong to other processes.
+fn kill_group(child: &Child) {
+    #[cfg(unix)]
+    if let Some(pid) = pid(child) {
+        // An error is no failure: the group can have ended already.
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+/// The process id of the child, also the id of its process group. `None`
+/// after its exit status was read.
+#[cfg(unix)]
+fn pid(child: &Child) -> Option<rustix::process::Pid> {
+    rustix::process::Pid::from_raw(i32::try_from(child.id()?).ok()?)
 }
 
 /// Reads to the end of the line, but `most` bytes at most. The result is
@@ -716,6 +788,7 @@ async fn log_error_output(errors: ChildStderr, log: Arc<LogBudget>, redactor: Re
         let chunk = match read_chunk(&mut errors, ERROR_OUTPUT_LINE_BYTES).await {
             Ok(chunk) if chunk.is_empty() => break,
             Ok(chunk) => chunk,
+            // No test: a read error on a pipe needs a failure of the operating system (for example EIO); a child process cannot make one.
             Err(error) => {
                 tracing::warn!(extension, %error, "the error output of the process cannot be read");
                 break;
@@ -745,7 +818,7 @@ mod tests {
         NativeRuntime::new(
             NativeConfig::new(program),
             Redactor::new(),
-            Arc::new(|_, _| {}),
+            Arc::new(|_, _, _| {}),
         )
         .unwrap()
     }

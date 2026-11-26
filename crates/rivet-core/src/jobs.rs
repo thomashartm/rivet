@@ -334,6 +334,8 @@ impl JobScheduler {
 
     /// Creates a scheduler with the limits of `config`, for example from
     /// [`JobConfig::from_settings`].
+    /// The values are used as given and are not checked; only
+    /// [`JobConfig::from_settings`] checks the ranges (ADR-0021).
     pub fn with_config(config: JobConfig) -> Self {
         let slots = config.max_concurrent.get().min(Semaphore::MAX_PERMITS);
         Self {
@@ -1186,6 +1188,9 @@ mod tests {
              cancel_grace_ms = 250\n",
         )
         .unwrap();
+        assert_eq!(config.max_concurrent, NonZeroUsize::MIN);
+        assert_eq!(config.max_per_extension, NonZeroUsize::new(2));
+        assert_eq!(config.retain_finished, 1);
         assert_eq!(config.cancel_grace, Duration::from_millis(250));
 
         // The settings limit the jobs of the scheduler.

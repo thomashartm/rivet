@@ -5,6 +5,7 @@
 //! | --- | --- |
 //! | [`TestEngine`] | The real core services and the real extension host in a temporary directory. |
 //! | [`Behaviour`], [`manifest`] | An extension written as Rust test code. |
+//! | [`conformance`] | The conformance suite of the `Driver` contract. |
 //! | [`database`] | PostgreSQL and MySQL containers: profile, test credentials, reachability check. |
 //!
 //! This crate is for tests only. Use it as a dev-dependency (ADR-0016). An
@@ -21,6 +22,7 @@
 //! ```
 #![warn(missing_docs)]
 
+pub mod conformance;
 pub mod database;
 mod engine;
 

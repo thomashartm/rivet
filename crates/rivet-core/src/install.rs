@@ -66,8 +66,10 @@
 //! 0600, whatever the umask is, so a kept package is verified again in a
 //! private directory. The owner of a directory and the mode of a file that
 //! exists are not checked. On Unix a lock file with a second hard link is
-//! refused too. Windows has none of these checks. A `<data>/store/<id>`
-//! that is a symbolic link is refused on each platform.
+//! refused too. Windows has none of these checks. A `<data>/store`,
+//! `<data>/store/<id>`, `<data>/extensions` or `<data>/extensions/<id>`
+//! that is a symbolic link is refused on each platform; `<data>` itself may
+//! be one.
 //! `<data>/extensions` is the user discovery directory of the host
 //! ([`Installer::extensions_dir`]). The host does not scan `<data>/store`.
 //!
@@ -126,13 +128,14 @@
 //! version. The same applies to a journal whose old version has no
 //! directory. The recovery then reads the directories: an active directory
 //! stays; if there is none, the one retired directory in the store goes
-//! back. A symbolic link is never moved back. `pending` is then deleted, a
+//! back. A journal that is valid and has no old version (a first install)
+//! puts nothing back. A symbolic link is never moved back. `pending` is then deleted, a
 //! directory with its content. With two or more retired
 //! directories the recovery changes nothing and returns an `internal` error.
 //! `previous` is not written in this case.
 //!
-//! An active version whose manifest is missing, cannot be read or is invalid
-//! cannot be updated or rolled back. [`Installer::install`] replaces it with a verified package and
+//! An active version whose manifest is missing, cannot be read, is invalid
+//! or is for another id cannot be updated or rolled back. [`Installer::install`] replaces it with a verified package and
 //! deletes it. A stop between the two renames of this change leaves no
 //! active version.
 //!
@@ -195,9 +198,10 @@
 //! # Ok::<(), rivet_sdk::error::Error>(())
 //! ```
 
-use crate::host::MANIFEST_FILE;
+use crate::host::{MANIFEST_FILE, MAX_MANIFEST_BYTES};
 use crate::package::{
     Origin, PACKAGE_MAX_BYTES, PROJECT_PUBLISHER, PublicKey, TrustStore, open_regular,
+    read_text_file,
 };
 use crate::permissions::added_capabilities;
 use crate::settings::user_settings_path;
@@ -324,7 +328,8 @@ impl Installer {
     /// # Errors
     ///
     /// Returns a `user` error that names the file if the manifest of the
-    /// active version is missing, cannot be read or is invalid.
+    /// active version is missing, cannot be read, is invalid or is for
+    /// another id.
     pub fn installed(&self, id: &ExtensionId) -> Result<Option<Manifest>> {
         let active = self.active(id);
         match fs::symlink_metadata(&active) {
@@ -340,24 +345,30 @@ impl Installer {
                 path.display()
             ))
         };
-        let text = fs::read_to_string(&path)
+        // A regular file within the limit of the host: a FIFO would block.
+        let text = read_text_file(&path, "extension manifest", MAX_MANIFEST_BYTES)
             .map_err(|error| broken("cannot read the manifest").with_source(error))?;
-        Manifest::parse(&text)
-            .map(Some)
-            .map_err(|error| broken(error.message()))
+        let manifest = Manifest::parse(&text).map_err(|error| broken(error.message()))?;
+        if manifest.id != *id {
+            return Err(broken(&format!("the manifest is for `{}`", manifest.id)));
+        }
+        Ok(Some(manifest))
     }
 
     /// Installs `version` of `id` from the registry and activates it. An
-    /// active version whose manifest is missing, cannot be read or is
-    /// invalid is replaced and deleted.
+    /// active version whose manifest is missing, cannot be read, is
+    /// invalid or is for another id is replaced and deleted.
     ///
     /// # Errors
     ///
     /// - `user`: a directory of the installer can be written by the group
-    ///   or by other users (Unix), or the extension is installed already
+    ///   or by other users (Unix) or is a symbolic link (`<data>` may be
+    ///   one), or the extension is installed already
     ///   (use [`update`](Self::update)), or the package or the signature is not
     ///   in the registry or cannot be read, or the package is not a tar
-    ///   archive, or its manifest is invalid.
+    ///   archive, or its manifest is invalid, or the active directory with
+    ///   a manifest that cannot be read cannot be moved because its owner
+    ///   has no write permission (Unix).
     /// - `policy`: the signature does not verify, the publisher has no
     ///   pinned key, or the package breaks a rule of the
     ///   [package format](self#hostile-content).
@@ -424,7 +435,8 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// - `user`: there is no previous version.
+    /// - `user`: there is no previous version, or the file `previous` is a
+    ///   symbolic link, is not a regular file or is larger than 16 KiB.
     /// - See [`install`](Self::install).
     ///
     /// Each error before the second rename leaves the active version as it
@@ -436,11 +448,12 @@ impl Installer {
         self.repair(id)?;
         let path = self.store(id).join(PREVIOUS_FILE);
         let none = || Error::user(format!("extension `{id}` has no previous version"));
-        let previous = match fs::read_to_string(&path) {
-            Ok(text) => text.trim().parse::<Version>().map_err(|_| none())?,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Err(none()),
-            Err(error) => return Err(io_error(&path, "cannot read the file", error)),
-        };
+        if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == ErrorKind::NotFound) {
+            return Err(none());
+        }
+        // A version is shorter than a journal, which holds two.
+        let text = read_text_file(&path, "previous version", JOURNAL_MAX_BYTES)?;
+        let previous = text.trim().parse::<Version>().map_err(|_| none())?;
         self.activate(id, &previous, Source::Store, true, false)
     }
 
@@ -460,7 +473,13 @@ impl Installer {
         let _lock = self.lock(id)?;
         self.repair(id)?;
         // A record that cannot be read or is for another version is no review.
-        let record = fs::read_to_string(self.store(id).join(REVIEW_FILE)).unwrap_or_default();
+        // A regular file within the limit: a FIFO would block with the lock held.
+        let record = read_text_file(
+            &self.store(id).join(REVIEW_FILE),
+            "review record",
+            JOURNAL_MAX_BYTES,
+        )
+        .unwrap_or_default();
         if record.trim().parse::<Version>().ok().as_ref() != Some(version) {
             return Err(Error::policy(format!(
                 "extension `{id}`: no review waits for version {version}; update to it first"
@@ -480,7 +499,8 @@ impl Installer {
     ///
     /// - `user`: a file cannot be read, moved or written, or a directory
     ///   of the installer can be written by the group or by other users
-    ///   (Unix). The error names the file or the directory.
+    ///   (Unix) or is a symbolic link. The error names the file or the
+    ///   directory.
     /// - `internal`: the journal does not name the version that was
     ///   active, no version is active and the store has two or more
     ///   retired directories. Nothing changes.
@@ -691,8 +711,29 @@ impl Installer {
         // the staging directory and is deleted with it.
         let discarded = staging.path().join("broken");
         let retired = if broken {
-            fs::rename(self.active(id), &discarded)
-                .map_err(|error| io_error(&discarded, "cannot move the broken version", error))
+            let active = self.active(id);
+            fs::rename(&active, &discarded).map_err(|error| {
+                // Mode 000 or another mode without the write of the owner:
+                // the installer does not change a mode that it finds
+                // (ADR-0023, R-118).
+                #[cfg(unix)]
+                let owner_cannot_write = {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::symlink_metadata(&active)
+                        .is_ok_and(|meta| meta.permissions().mode() & 0o200 == 0)
+                };
+                #[cfg(not(unix))]
+                let owner_cannot_write = false;
+                if error.kind() == ErrorKind::PermissionDenied && owner_cannot_write {
+                    return io_error(
+                        &active,
+                        "the directory cannot be moved; permit the write for the owner \
+                         (`chmod 700`) or remove the directory, then install again",
+                        error,
+                    );
+                }
+                io_error(&discarded, "cannot move the broken version", error)
+            })
         } else {
             self.retire(id, old.as_ref())
         };
@@ -789,6 +830,7 @@ impl Installer {
     }
 
     /// Takes the lock of `id`. Refuses first, with a `user` error, a
+    /// directory below `<data>` that is a symbolic link, and a
     /// directory of the installer that the group or other users can write
     /// (Unix): they could put another file in the place of a verified one.
     /// The rule and the category are those of the trust store file
@@ -796,12 +838,20 @@ impl Installer {
     /// checked. There is no check on Windows.
     fn lock(&self, id: &ExtensionId) -> Result<IdLock> {
         let store = self.store(id);
-        // A link could point out of `<data>` or to the store of another id.
-        if fs::symlink_metadata(&store).is_ok_and(|meta| meta.is_symlink()) {
-            return Err(Error::user(format!(
-                "{}: the directory must not be a symbolic link; remove the link",
-                store.display()
-            )));
+        // A link could point out of `<data>`, to the store of another id or
+        // to another filesystem. `<data>` itself may be a link (ADR-0023).
+        for dir in [
+            self.data.join("store"),
+            store.clone(),
+            self.extensions_dir(),
+            self.active(id),
+        ] {
+            if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_symlink()) {
+                return Err(Error::user(format!(
+                    "{}: the directory must not be a symbolic link; remove the link",
+                    dir.display()
+                )));
+            }
         }
         let dirs = [
             self.data.clone(),
@@ -1026,13 +1076,7 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 /// read: a symbolic link, a directory, more than [`JOURNAL_MAX_BYTES`], a
 /// text that is not UTF-8 or that [`parse_journal`] refuses.
 fn read_journal(path: &Path) -> Option<(Option<Version>, Version)> {
-    let mut text = String::new();
-    open_regular(path, "journal", JOURNAL_MAX_BYTES)
-        .ok()?
-        .take(JOURNAL_MAX_BYTES)
-        .read_to_string(&mut text)
-        .ok()?;
-    parse_journal(&text)
+    parse_journal(&read_text_file(path, "journal", JOURNAL_MAX_BYTES).ok()?)
 }
 
 /// Returns `true` if `path` is a directory and not a symbolic link to one.
@@ -1106,16 +1150,23 @@ fn copy_regular(from: &Path, to: &Path, max_bytes: u64) -> Result<()> {
 // (ADR-0023 accepts this).
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
     let write = || {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let mut file = tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .tempfile_in(dir)?;
+        let mut file = temp_file(path)?;
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(path).map_err(|error| error.error)?;
         Ok(())
     };
     write().map_err(|error| io_error(path, "cannot write the file", error))
+}
+
+/// Creates the temporary file of [`write_atomic`] next to `path`. Its name
+/// starts with [`TEMP_PREFIX`], so the recovery removes it when a stopped
+/// process left it.
+fn temp_file(path: &Path) -> io::Result<tempfile::NamedTempFile> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)
 }
 
 /// Removes a file. A file that does not exist is not an error.
@@ -1228,19 +1279,18 @@ mod tests {
     impl Fixture {
         /// Puts `package` in the registry as `version`, signed for `version`.
         fn publish(&self, version: &str, package: &[u8]) {
-            let dir = self.installer.registry.join("acme.postgres").join(version);
+            self.publish_as("acme.postgres", &self.key, version, package);
+        }
+
+        /// Puts `package` in the registry as `version` of `id`, signed with `key`.
+        fn publish_as(&self, id: &str, key: &minisign::KeyPair, version: &str, package: &[u8]) {
+            let dir = self.installer.registry.join(id).join(version);
             fs::create_dir_all(&dir).unwrap();
-            let name = format!("acme.postgres-{version}.rivetpkg");
-            let comment = format!("rivet-package id=acme.postgres version={version}");
-            let signature = minisign::sign(
-                Some(&self.key.pk),
-                &self.key.sk,
-                package,
-                Some(&comment),
-                None,
-            )
-            .unwrap()
-            .into_string();
+            let name = format!("{id}-{version}.rivetpkg");
+            let comment = format!("rivet-package id={id} version={version}");
+            let signature = minisign::sign(Some(&key.pk), &key.sk, package, Some(&comment), None)
+                .unwrap()
+                .into_string();
             fs::write(dir.join(&name), package).unwrap();
             fs::write(dir.join(format!("{name}.minisig")), signature).unwrap();
         }
@@ -1317,18 +1367,37 @@ mod tests {
             fs::read(active.join(COMPONENT_FILE)).unwrap(),
             b"\0asm component"
         );
+        // The archive says mode 0777. The installer does not apply it.
+        #[cfg(unix)]
+        for name in names {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(active.join(&name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0, "{name}: {mode:o}");
+        }
     }
 
     #[test]
-    fn a_package_without_a_licence_is_refused() {
-        let f = fixture();
-        let package = package_with(&manifest("acme.postgres", "1.0.0", ""), &[]);
-        assert_error(
-            f.install("1.0.0", &package),
-            ErrorCategory::Policy,
-            "the entry `LICENSE` is missing",
-        );
-        f.assert_nothing_installed();
+    fn a_package_without_one_of_the_three_entries_is_refused() {
+        let text = manifest("acme.postgres", "1.0.0", "");
+        let entries = [
+            (MANIFEST_FILE, EntryType::Regular, text.as_bytes()),
+            (COMPONENT_FILE, EntryType::Regular, &b"\0asm component"[..]),
+            (LICENCE_FILE, EntryType::Regular, &b"MIT"[..]),
+        ];
+        for missing in 0..entries.len() {
+            let f = fixture();
+            let mut present = entries.to_vec();
+            let (name, ..) = present.remove(missing);
+            assert_error(
+                f.install("1.0.0", &archive(&present)),
+                ErrorCategory::Policy,
+                &format!("the entry `{name}` is missing"),
+            );
+            f.assert_nothing_installed();
+        }
     }
 
     #[test]
@@ -1361,6 +1430,11 @@ mod tests {
         let kept = f.store().join("acme.postgres-1.0.0.rivetpkg");
         assert_eq!(fs::read(&kept).unwrap(), package);
         assert!(kept.with_extension("rivetpkg.minisig").is_file());
+        // The kept package is a copy: the registry still has its files.
+        let registry = f.installer.registry.join("acme.postgres/1.0.0");
+        let published = registry.join("acme.postgres-1.0.0.rivetpkg");
+        assert_eq!(fs::read(&published).unwrap(), package);
+        assert!(published.with_extension("rivetpkg.minisig").is_file());
         // No staging directory and no journal stay: only the lock file.
         assert!(!f.store().join(PENDING_FILE).exists());
         assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3);
@@ -1666,7 +1740,7 @@ mod tests {
         let f = fixture();
         f.install("1.0.0", &package("1.0.0", "")).unwrap();
         f.publish("1.1.0", &package("1.1.0", ""));
-        let held = lock(&f.store(), &id()).unwrap();
+        let held = f.installer.lock(&id()).unwrap();
 
         // Each operation opens the lock file again and does not get the lock.
         let part = "another install operation";
@@ -1689,9 +1763,14 @@ mod tests {
             part,
         );
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
-        // An operation on another id is not stopped.
+        // An operation on another id is not stopped: it gets its own lock
+        // and then fails because the registry has no such package.
         let other: ExtensionId = "acme.mysql".parse().unwrap();
-        f.installer.recover(&other).unwrap();
+        assert_error(
+            f.installer.install(&other, &new),
+            ErrorCategory::User,
+            "cannot read the registry file",
+        );
 
         drop(held);
         assert_eq!(f.installer.update(&id, &new).unwrap(), Outcome::Activated);
@@ -1767,6 +1846,11 @@ mod tests {
             Outcome::NeedsReview { .. }
         ));
         assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+
+        f.installer
+            .activate_after_review(&id(), &v("1.0.0"))
+            .unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
     }
 
     #[test]
@@ -1779,6 +1863,16 @@ mod tests {
             ErrorCategory::User,
             "the store has no package of version 1.0.0",
         );
+
+        // A record for the active version activates nothing.
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        fs::write(f.store().join(REVIEW_FILE), "1.0.0").unwrap();
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("1.0.0")),
+            ErrorCategory::User,
+            "version 1.0.0 is active already",
+        );
+        assert!(!f.store().join(PENDING_FILE).exists());
     }
 
     // Criterion 5: hostile package content.
@@ -1813,34 +1907,64 @@ mod tests {
     }
 
     #[test]
-    fn a_symbolic_link_entry_is_refused() {
-        let f = fixture();
-        let hostile = package_with(
-            &manifest("acme.postgres", "1.0.0", ""),
-            &[(LICENCE_FILE, EntryType::Symlink, b"/etc/passwd")],
-        );
-        assert_error(
-            f.install("1.0.0", &hostile),
-            ErrorCategory::Policy,
-            "the entry `LICENSE` is not a regular file",
-        );
-        f.assert_nothing_installed();
+    fn an_entry_that_is_not_a_regular_file_is_refused() {
+        let kinds = [
+            (EntryType::Symlink, &b"/etc/passwd"[..]),
+            (EntryType::Link, b""),
+            (EntryType::Directory, b""),
+            (EntryType::Fifo, b""),
+            (EntryType::Char, b""),
+            (EntryType::Block, b""),
+            (EntryType::Continuous, b"MIT"),
+            (EntryType::XHeader, b""),
+        ];
+        for (kind, data) in kinds {
+            let f = fixture();
+            let hostile = package_with(
+                &manifest("acme.postgres", "1.0.0", ""),
+                &[(LICENCE_FILE, kind, data)],
+            );
+            assert_error(
+                f.install("1.0.0", &hostile),
+                ErrorCategory::Policy,
+                "the entry `LICENSE` is not a regular file",
+            );
+            f.assert_nothing_installed();
+        }
     }
 
     #[test]
     fn an_entry_above_the_size_limit_is_refused() {
-        let f = fixture();
         let large = vec![b'x'; TEXT_ENTRY_MAX_BYTES as usize + 1];
-        let hostile = package_with(
-            &manifest("acme.postgres", "1.0.0", ""),
-            &[(LICENCE_FILE, EntryType::Regular, &large)],
-        );
-        assert_error(
-            f.install("1.0.0", &hostile),
-            ErrorCategory::Policy,
-            "the entry `LICENSE` is larger than 1048576 bytes",
-        );
-        f.assert_nothing_installed();
+        let text = manifest("acme.postgres", "1.0.0", "");
+        for name in [MANIFEST_FILE, LICENCE_FILE] {
+            let f = fixture();
+            let hostile = archive(
+                &[
+                    (MANIFEST_FILE, EntryType::Regular, text.as_bytes()),
+                    (COMPONENT_FILE, EntryType::Regular, b"\0asm component"),
+                    (LICENCE_FILE, EntryType::Regular, b"MIT"),
+                ]
+                .map(|entry| {
+                    if entry.0 == name {
+                        (name, entry.1, &large[..])
+                    } else {
+                        entry
+                    }
+                }),
+            );
+            assert_error(
+                f.install("1.0.0", &hostile),
+                ErrorCategory::Policy,
+                &format!("the entry `{name}` is larger than 1048576 bytes"),
+            );
+            f.assert_nothing_installed();
+        }
+
+        // An entry that has the size of the limit is permitted.
+        let f = fixture();
+        let at_limit = package_with(&text, &[(LICENCE_FILE, EntryType::Regular, &large[1..])]);
+        assert_eq!(f.install("1.0.0", &at_limit).unwrap(), Outcome::Activated);
     }
 
     #[test]
@@ -1874,25 +1998,38 @@ mod tests {
     // R-84: raw entries, the end of the archive, the entry name in an error.
 
     #[test]
-    fn a_gnu_long_name_entry_is_refused() {
-        let f = fixture();
-        // The long name entry gives the next entry the name `extension.toml`.
-        let hostile = archive(&[
-            ("././@LongLink", EntryType::GNULongName, b"extension.toml\0"),
+    fn a_gnu_long_name_entry_and_a_pax_entry_are_refused() {
+        // Each gives the next entry the name `extension.toml`.
+        for (name, kind, data) in [
             (
-                "../..",
-                EntryType::Regular,
-                manifest("acme.postgres", "1.0.0", "").as_bytes(),
+                "././@LongLink",
+                EntryType::GNULongName,
+                &b"extension.toml\0"[..],
             ),
-            (COMPONENT_FILE, EntryType::Regular, b"\0asm component"),
-            (LICENCE_FILE, EntryType::Regular, b"MIT"),
-        ]);
-        assert_error(
-            f.install("1.0.0", &hostile),
-            ErrorCategory::Policy,
-            "`././@LongLink` is not permitted",
-        );
-        f.assert_nothing_installed();
+            (
+                "PaxHeaders/x",
+                EntryType::XHeader,
+                b"23 path=extension.toml\n",
+            ),
+        ] {
+            let f = fixture();
+            let hostile = archive(&[
+                (name, kind, data),
+                (
+                    "../..",
+                    EntryType::Regular,
+                    manifest("acme.postgres", "1.0.0", "").as_bytes(),
+                ),
+                (COMPONENT_FILE, EntryType::Regular, b"\0asm component"),
+                (LICENCE_FILE, EntryType::Regular, b"MIT"),
+            ]);
+            assert_error(
+                f.install("1.0.0", &hostile),
+                ErrorCategory::Policy,
+                &format!("`{name}` is not permitted"),
+            );
+            f.assert_nothing_installed();
+        }
     }
 
     #[test]
@@ -2033,6 +2170,7 @@ mod tests {
             f.installer.registry.join("acme.postgres"),
             f.installer.registry.join("acme.postgres/1.0.0"),
             f.installer.data.clone(),
+            f.installer.data.join("store"),
             f.installer.extensions_dir(),
             f.installer.store(&id()),
         ] {
@@ -2100,17 +2238,20 @@ mod tests {
         set_mode(&data, 0o755);
         f.installer.update(&id(), &v("1.1.0")).unwrap();
         // The kept package of a rollback is in a directory of the group.
+        // The group only, then other users only.
         for dir in [
             f.store(),
             data.join("store"),
             f.installer.extensions_dir(),
             f.installer.active(&id()),
         ] {
-            set_mode(&dir, 0o770);
-            let error = f.installer.rollback(&id()).unwrap_err();
-            assert_eq!(error.category(), ErrorCategory::User, "{error}");
-            let part = format!("{}: the directory can be written", dir.display());
-            assert!(error.to_string().contains(&part), "{error}");
+            for mode in [0o770, 0o702] {
+                set_mode(&dir, mode);
+                let error = f.installer.rollback(&id()).unwrap_err();
+                assert_eq!(error.category(), ErrorCategory::User, "{error}");
+                let part = format!("{}: the directory can be written", dir.display());
+                assert!(error.to_string().contains(&part), "{error}");
+            }
             set_mode(&dir, 0o700);
         }
         assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
@@ -2348,22 +2489,42 @@ mod tests {
             .write_pending(&id(), Some(&v("1.0.0")), &v("2.0.0"))
             .unwrap();
         f.installer.retire(&id(), Some(&v("1.0.0"))).unwrap();
-        // A second id whose recovery fails, and a name that is not an id.
-        let other = f.installer.data.join("store/acme.mysql");
-        fs::create_dir_all(other.join("1.0.0")).unwrap();
-        fs::create_dir(other.join("2.0.0")).unwrap();
-        fs::write(other.join(PENDING_FILE), "").unwrap();
-        fs::write(f.installer.data.join("store/Not An Id"), "").unwrap();
+        // Three more ids with a journal, and a name that is not an id. The
+        // recovery fails for the first and the last id that the directory
+        // lists, so the test does not depend on the order of the file system.
+        let store = f.installer.data.join("store");
+        for name in ["acme.mysql", "acme.sqlite", "acme.redis"] {
+            fs::create_dir_all(store.join(name).join("1.0.0")).unwrap();
+            fs::write(store.join(name).join(PENDING_FILE), "not toml [").unwrap();
+        }
+        fs::write(store.join("Not An Id"), "").unwrap();
+        let listed: Vec<_> = fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| !path.ends_with("acme.postgres") && path.is_dir())
+            .collect();
+        let [first, recovers, last] = &listed[..] else {
+            panic!("three more ids: {listed:?}");
+        };
+        // Two directories of retired versions: the journal cannot say which
+        // one was active, so the recovery fails.
+        for fails in [first, last] {
+            fs::write(fails.join(PENDING_FILE), "").unwrap();
+            fs::create_dir(fails.join("2.0.0")).unwrap();
+        }
 
         assert_error(
             f.installer.recover_all(),
             ErrorCategory::Internal,
-            "2 directories of retired versions",
+            &format!("{} has 2 directories of retired versions", first.display()),
         );
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
         assert!(!f.store().join(PENDING_FILE).exists());
+        assert!(!recovers.join(PENDING_FILE).exists());
 
-        fs::remove_dir(other.join("2.0.0")).unwrap();
+        for fails in [first, last] {
+            fs::remove_dir(fails.join("2.0.0")).unwrap();
+        }
         f.installer.recover_all().unwrap();
     }
 
@@ -2524,9 +2685,24 @@ mod tests {
                 fs::remove_file(path).unwrap();
                 fs::create_dir(path).unwrap();
             }),
+            ("another id", |path| {
+                fs::write(path, manifest("acme.mysql", "1.1.0", "")).unwrap();
+            }),
+            ("above the size limit", |path| {
+                let mut text = manifest("acme.postgres", "1.1.0", "");
+                text.push_str(&"#".repeat(MAX_MANIFEST_BYTES as usize));
+                fs::write(path, text).unwrap();
+            }),
         ];
         #[cfg(unix)]
         shapes.push(("mode 000", |path| set_mode(path, 0o000)));
+        #[cfg(unix)]
+        shapes.push(("a symbolic link", |path| {
+            // A valid manifest out of the active directory.
+            let outside = path.parent().unwrap().with_extension("outside");
+            fs::rename(path, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, path).unwrap();
+        }));
         for (shape, damage) in shapes {
             let f = fixture();
             f.install("1.0.0", &package("1.0.0", "")).unwrap();
@@ -2551,6 +2727,141 @@ mod tests {
             // Only the lock file and the package and signature of 1.2.0 stay.
             assert_eq!(fs::read_dir(f.store()).unwrap().count(), 3, "{shape}");
         }
+    }
+
+    /// Runs `operation` on another thread. Fails the test if it does not
+    /// return in 10 seconds: an open of a FIFO without a writer blocks.
+    fn within_10_seconds<T: Send + 'static>(
+        f: &std::sync::Arc<Fixture>,
+        operation: fn(&Installer) -> Result<T>,
+    ) -> Result<T> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let f = std::sync::Arc::clone(f);
+        std::thread::spawn(move || {
+            let _ = send.send(operation(&f.installer));
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the operation must return")
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_active_manifest_that_is_a_fifo_is_not_read() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let manifest = f.installer.active(&id()).join(MANIFEST_FILE);
+        fs::remove_file(&manifest).unwrap();
+        mkfifo(&manifest);
+
+        let way_out = "install a version of `acme.postgres` to replace it";
+        let installed = within_10_seconds(&f, |installer| installer.installed(&id()));
+        assert_error(installed, ErrorCategory::User, way_out);
+        let rollback = within_10_seconds(&f, |installer| installer.rollback(&id()));
+        assert_error(rollback, ErrorCategory::User, way_out);
+        let update = within_10_seconds(&f, |installer| installer.update(&id(), &v("1.2.0")));
+        assert_error(update, ErrorCategory::User, way_out);
+        let install = within_10_seconds(&f, |installer| installer.install(&id(), &v("1.2.0")));
+        assert_eq!(install.unwrap(), Outcome::Activated);
+        assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_previous_file_that_is_a_fifo_or_too_large_is_refused() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        let previous = f.store().join(PREVIOUS_FILE);
+        fs::remove_file(&previous).unwrap();
+        mkfifo(&previous);
+        let rollback = within_10_seconds(&f, |installer| installer.rollback(&id()));
+        assert_error(rollback, ErrorCategory::User, "is not a regular file");
+
+        fs::remove_file(&previous).unwrap();
+        let mut text = "1.0.0\n".to_owned();
+        text.push_str(&" ".repeat(JOURNAL_MAX_BYTES as usize));
+        fs::write(&previous, text).unwrap();
+        assert_error(
+            f.installer.rollback(&id()),
+            ErrorCategory::User,
+            "too large",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+
+        fs::write(&previous, "1.0.0\n").unwrap();
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_review_record_that_is_a_fifo_is_no_review() {
+        let f = std::sync::Arc::new(fixture());
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        mkfifo(&f.store().join(REVIEW_FILE));
+        let result = within_10_seconds(&f, |installer| {
+            installer.activate_after_review(&id(), &v("1.0.0"))
+        });
+        assert_error(result, ErrorCategory::Policy, "no review waits");
+    }
+
+    /// `true` if the tests run as root: root ignores the mode of a directory.
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        let output = std::process::Command::new("id").arg("-u").output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim() == "0"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_active_directory_that_cannot_be_moved_is_not_repaired() {
+        if is_root() {
+            return;
+        }
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let active = f.installer.active(&id());
+        set_mode(&active, 0o000);
+
+        let result = f.installer.install(&id(), &v("1.2.0"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&active).unwrap().permissions().mode() & 0o777;
+        set_mode(&active, 0o700);
+        assert_eq!(mode, 0o000, "the installer must not change the mode");
+        let part = format!(
+            "{}: the directory cannot be moved; permit the write for the owner \
+             (`chmod 700`) or remove the directory, then install again",
+            active.display()
+        );
+        assert_error(result, ErrorCategory::User, &part);
+        // Nothing is pending and the old version stays.
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+        assert!(!f.store().join(PENDING_FILE).exists());
+
+        // Another cause of the same system error keeps its error: here the
+        // parent directory cannot be written.
+        fs::remove_file(active.join(MANIFEST_FILE)).unwrap();
+        let extensions = f.installer.extensions_dir();
+        set_mode(&extensions, 0o500);
+        let result = f.installer.install(&id(), &v("1.2.0"));
+        set_mode(&extensions, 0o700);
+        assert_error(
+            result,
+            ErrorCategory::User,
+            "cannot move the broken version",
+        );
     }
 
     // R-110: symbolic links, the lock file, temporary files, a journal
@@ -2578,6 +2889,49 @@ mod tests {
 
         fs::remove_file(f.store()).unwrap();
         f.installer.install(&id(), &v("1.0.0")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_the_installer_that_is_a_symbolic_link_is_refused() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        f.publish("1.2.0", &package("1.2.0", ""));
+        let outside = f.dir.path().join("outside");
+        for dir in [
+            f.installer.data.join("store"),
+            f.installer.extensions_dir(),
+            f.installer.active(&id()),
+        ] {
+            fs::rename(&dir, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+            let part = format!("{}: the directory must not be", dir.display());
+            let installer = &f.installer;
+            assert_error(
+                installer.install(&id(), &v("1.2.0")),
+                ErrorCategory::User,
+                &part,
+            );
+            assert_error(
+                installer.update(&id(), &v("1.2.0")),
+                ErrorCategory::User,
+                &part,
+            );
+            assert_error(installer.rollback(&id()), ErrorCategory::User, &part);
+            let review = installer.activate_after_review(&id(), &v("1.0.0"));
+            assert_error(review, ErrorCategory::User, &part);
+            assert_error(installer.recover(&id()), ErrorCategory::User, &part);
+            assert_error(installer.recover_all(), ErrorCategory::User, &part);
+            fs::remove_file(&dir).unwrap();
+            fs::rename(&outside, &dir).unwrap();
+        }
+        // `<data>` itself may be a link.
+        fs::rename(&f.installer.data, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &f.installer.data).unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.1.0"));
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+        f.installer.recover_all().unwrap();
     }
 
     #[cfg(unix)]
@@ -2655,6 +3009,19 @@ mod tests {
     }
 
     #[test]
+    fn the_temporary_file_of_write_atomic_is_one_that_the_recovery_removes() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        // A process that stops after the create leaves the file.
+        let (_, left) = temp_file(&f.store().join(PREVIOUS_FILE))
+            .unwrap()
+            .keep()
+            .unwrap();
+        f.installer.recover(&id()).unwrap();
+        assert!(!left.exists(), "{}", left.display());
+    }
+
+    #[test]
     fn a_journal_that_names_no_directory_puts_the_one_retired_version_back() {
         let pending = |f: &Fixture| f.store().join(PENDING_FILE);
         // The journal names an old version that has no directory: the one
@@ -2690,5 +3057,210 @@ mod tests {
         fs::write(pending(&f), "old = \"1.0.0\"\nnew = \"2.0.0\"").unwrap();
         f.installer.recover(&id()).unwrap();
         assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    // Close-out audit: criteria that had no test.
+
+    #[test]
+    fn a_built_in_extension_verifies_with_the_project_key_only() {
+        let mut f = fixture();
+        let project = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        f.installer.project_key = project.pk.to_base64().parse().unwrap();
+        let built_in: ExtensionId = "rivet.sample".parse().unwrap();
+        let package = package_with(
+            &manifest("rivet.sample", "1.0.0", ""),
+            &[(LICENCE_FILE, EntryType::Regular, b"MIT")],
+        );
+
+        // The pinned key of a publisher does not sign a built-in extension.
+        f.publish_as("rivet.sample", &f.key, "1.0.0", &package);
+        assert_error(
+            f.installer.install(&built_in, &v("1.0.0")),
+            ErrorCategory::Policy,
+            "must be signed with the project key",
+        );
+        assert!(!f.installer.active(&built_in).exists());
+
+        f.publish_as("rivet.sample", &project, "1.0.0", &package);
+        assert_eq!(
+            f.installer.install(&built_in, &v("1.0.0")).unwrap(),
+            Outcome::Activated
+        );
+    }
+
+    #[test]
+    fn a_registry_file_of_the_wrong_size_or_shape_is_refused() {
+        let f = fixture();
+        f.publish("1.0.0", &package("1.0.0", ""));
+        let dir = f.installer.registry.join("acme.postgres/1.0.0");
+        let package = dir.join("acme.postgres-1.0.0.rivetpkg");
+        let signature = dir.join("acme.postgres-1.0.0.rivetpkg.minisig");
+
+        // A symbolic link in the registry is not followed.
+        #[cfg(unix)]
+        {
+            let target = f.dir.path().join("target");
+            fs::rename(&package, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &package).unwrap();
+            assert_error(
+                f.installer.install(&id(), &v("1.0.0")),
+                ErrorCategory::User,
+                "the registry file must not be a symbolic link",
+            );
+            fs::remove_file(&package).unwrap();
+            fs::rename(&target, &package).unwrap();
+        }
+
+        // The size is checked before a byte is read, so the length is enough.
+        for (file, limit) in [
+            (&signature, SIGNATURE_MAX_BYTES),
+            (&package, PACKAGE_MAX_BYTES),
+        ] {
+            let longer = File::options().write(true).open(file).unwrap();
+            longer.set_len(limit + 1).unwrap();
+            assert_error(
+                f.installer.install(&id(), &v("1.0.0")),
+                ErrorCategory::User,
+                &format!("too large for a registry file: the limit is {limit} bytes"),
+            );
+        }
+        f.assert_nothing_installed();
+    }
+
+    #[test]
+    fn an_update_whose_first_rename_fails_keeps_the_installed_version() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        assert!(matches!(
+            f.update("1.1.0", &package("1.1.0", NETWORK)).unwrap(),
+            Outcome::NeedsReview { .. }
+        ));
+        // The active directory cannot move to its name in the store: a file
+        // has that name.
+        let retired = f.store().join("1.0.0");
+        fs::write(&retired, "").unwrap();
+
+        assert_error(
+            f.update("1.2.0", &package("1.2.0", "")),
+            ErrorCategory::User,
+            "cannot move the active version",
+        );
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+        assert!(f.installer.active(&id()).join(COMPONENT_FILE).is_file());
+        assert!(!f.store().join(PENDING_FILE).exists());
+        // The package of 1.2.0 passed each check, so the older review is void.
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("1.1.0")),
+            ErrorCategory::Policy,
+            "no review waits",
+        );
+
+        // A directory that an earlier change left does not stop the update.
+        fs::remove_file(&retired).unwrap();
+        fs::create_dir(&retired).unwrap();
+        fs::write(retired.join("left"), "").unwrap();
+        assert_eq!(
+            f.installer.update(&id(), &v("1.2.0")).unwrap(),
+            Outcome::Activated
+        );
+        assert!(!retired.exists());
+        assert_eq!(f.installer.rollback(&id()).unwrap(), Outcome::Activated);
+        assert_eq!(f.active_version().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn the_package_of_a_version_whose_review_waits_is_kept_in_each_path() {
+        let f = fixture();
+        f.install("1.0.0", &package("1.0.0", "")).unwrap();
+        f.update("1.1.0", &package("1.1.0", "")).unwrap();
+        assert!(matches!(
+            f.update("1.2.0", &package("1.2.0", NETWORK)).unwrap(),
+            Outcome::NeedsReview { .. }
+        ));
+        // The review record, the package and the signature of 1.2.0.
+        let waits = |path: &str| {
+            let package = f.store().join("acme.postgres-1.2.0.rivetpkg");
+            let record = fs::read_to_string(f.store().join(REVIEW_FILE)).unwrap_or_default();
+            assert_eq!(record, "1.2.0", "{path}");
+            assert!(package.is_file(), "{path}");
+            assert!(
+                package.with_extension("rivetpkg.minisig").is_file(),
+                "{path}"
+            );
+            assert_eq!(f.active_version().as_deref(), Some("1.1.0"), "{path}");
+        };
+        waits("update that needs a review");
+
+        assert_error(
+            f.update("1.0.1", &package("1.0.1", "")),
+            ErrorCategory::User,
+            "is not newer",
+        );
+        waits("update that is refused");
+        assert_error(
+            f.update("1.3.0", &package("1.3.1", "")),
+            ErrorCategory::Policy,
+            "the manifest is for",
+        );
+        waits("update that fails");
+
+        assert_error(
+            f.installer.activate_after_review(&id(), &v("1.0.0")),
+            ErrorCategory::Policy,
+            "no review waits",
+        );
+        waits("activate_after_review of another version");
+
+        f.installer.recover(&id()).unwrap();
+        f.installer.recover_all().unwrap();
+        waits("recover without a journal");
+        // `activate_after_review` stopped after the journal, then after the
+        // first rename: the recovery goes back and the review still waits.
+        let (old, new) = (v("1.1.0"), v("1.2.0"));
+        f.installer.write_pending(&id(), Some(&old), &new).unwrap();
+        f.installer.recover(&id()).unwrap();
+        waits("recover after the journal");
+        f.installer.write_pending(&id(), Some(&old), &new).unwrap();
+        f.installer.retire(&id(), Some(&old)).unwrap();
+        f.installer.recover_all().unwrap();
+        waits("recover after the first rename");
+
+        // An install over a broken active version, with a refused package.
+        let active = f.installer.active(&id()).join(MANIFEST_FILE);
+        let text = fs::read_to_string(&active).unwrap();
+        fs::write(&active, "id = 1").unwrap();
+        assert_error(
+            f.install("1.4.0", &package("1.4.1", "")),
+            ErrorCategory::Policy,
+            "the manifest is for",
+        );
+        fs::write(&active, text).unwrap();
+        waits("install that fails");
+
+        fs::write(
+            f.store().join("acme.postgres-1.0.0.rivetpkg"),
+            package("1.0.0", NETWORK),
+        )
+        .unwrap();
+        assert_error(
+            f.installer.rollback(&id()),
+            ErrorCategory::Policy,
+            "does not verify",
+        );
+        waits("rollback that fails");
+
+        // The first rename fails: a file has the name of the retired directory.
+        let retired = f.store().join("1.1.0");
+        fs::write(&retired, "").unwrap();
+        assert_error(
+            f.installer.activate_after_review(&id(), &new),
+            ErrorCategory::User,
+            "cannot move the active version",
+        );
+        fs::remove_file(&retired).unwrap();
+        waits("activate_after_review that fails");
+
+        f.installer.activate_after_review(&id(), &new).unwrap();
+        assert_eq!(f.active_version().as_deref(), Some("1.2.0"));
     }
 }
