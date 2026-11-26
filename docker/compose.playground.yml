@@ -7,11 +7,34 @@
 # The credentials come from the generated .env; it is never committed.
 # Ports are on loopback only and differ from the defaults (5432, 3306), so
 # local servers keep working.
+#
+# Both servers use TLS with the throwaway certificate of docker/test-certs.sh
+# (host name `localhost`, CA docker/test-certs/ca.pem), the same files as the
+# TLS container tests. Plaintext is still accepted, for `?tls=off`.
 name: rivet-playground
 
 services:
+  # Writes the TLS files once; the servers start after it.
+  tls-certs:
+    image: postgres:18.7
+    entrypoint: ["sh", "/test-certs.sh"]
+    volumes:
+      - ./test-certs.sh:/test-certs.sh:ro
+      - ./test-certs:/certs
+
   postgres:
     image: postgres:18.7
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+    # PostgreSQL wants its key private to its user: a copy, owned by postgres.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        install -o postgres -m 600 /certs/server.key /tmp/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/certs/server.pem -c ssl_key_file=/tmp/server.key
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?run docker/playground.sh}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run docker/playground.sh}
@@ -21,6 +44,7 @@ services:
     volumes:
       - playground-data:/var/lib/postgresql
       - ./playground/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./test-certs:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready --host=127.0.0.1 --username=$${POSTGRES_USER} --dbname=$${POSTGRES_DB}"]
       interval: 2s
@@ -29,6 +53,10 @@ services:
 
   mysql:
     image: mysql:8.4.13
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+    command: ["--ssl-cert=/certs/server.pem", "--ssl-key=/certs/server.key"]
     environment:
       MYSQL_USER: ${MYSQL_USER:?run docker/playground.sh}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?run docker/playground.sh}
@@ -39,6 +67,7 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
       - ./playground/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./test-certs:/certs:ro
     healthcheck:
       # TCP, not the socket: the setup server has no network.
       test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=$${MYSQL_USER} --password=$${MYSQL_PASSWORD}"]
