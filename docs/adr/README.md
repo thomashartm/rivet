@@ -28,6 +28,7 @@
 | [0024](0024-native-process-runtime.md) | Native process runtime: protocol and supervision | Accepted |
 | [0025](0025-first-database-drivers.md) | First database drivers | Proposed |
 | [0026](0026-project-licence-apache-2.0.md) | Project licence is Apache-2.0 | Accepted |
+| [0027](0027-rows-affected-in-result-set.md) | Changed-row count in `ResultSet` | Accepted |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
