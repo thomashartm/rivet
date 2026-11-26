@@ -17,7 +17,7 @@ Same content on GitHub: Epic #14, comments
 | Epic 2 (first drivers, execution, guard) | Started. All of it is in draft pull requests (section 3). |
 | Records | ADR-0016 to ADR-0024 are Accepted (#193). ADR-0025 "First database drivers" is Proposed. |
 | Open tickets with work | Label `in progress`: #4, #7, #9, #11, #12, #13, #15, #20, #27, #95 |
-| New tickets, not started | #191 Store permission grants on disk, #192 Uninstall an extension |
+| New tickets, not started | #191 Store permission grants on disk, #192 Uninstall an extension, #204 Memory and CPU limits for a native process, #205 MySQL through a tunnel |
 
 Note: the local `main` checkout in `/Users/thomas/projects/rivet` is far behind `origin/main`. Read code in a worktree or after `git pull`.
 
@@ -50,11 +50,11 @@ Delivered by agents. NOT rebased, NOT read, NOT gated by the orchestrator. The a
 | #202 | `fix/review-wasm-5` / `fix-review-wasm-5` | R-114 (major), R-115, R-116 | The agent sent no final report: full gate. |
 | #200 | `feat/27-execute` / `feat-27-execute` | #27 slice 1: `rivet_core::execute::execute(...)` runs a statement as a job | Rebase, read, gate. Open decision: a dropped result ends the job as `Cancelled`. |
 | #201 | `feat/20-guard` / `feat-20-guard` | #20 slice 1: `rivet_core::guard::decide(...)`, 70 classifier cases | Rebase, read, gate. |
-| #198 | `feat/15-postgres` / `feat-15-postgres` | Crate `rivet-ext-postgres` on `tokio-postgres` 0.7.18, 32 new packages | Maintainer answers 79, 80. Open work: with a transport, a dropped unfinished result must close the connection and the next `execute` must refuse with `connectivity`. |
-| #199 | `feat/15-mysql` / `feat-15-mysql` | Crate `rivet-ext-mysql` on `mysql_async` 0.37.1, 50 new packages | Maintainer answers 79, 80, 82. Cannot run through a tunnel. Multi-statements on, no connect timeout. |
+| #198 | `feat/15-postgres` / `feat-15-postgres` | Crate `rivet-ext-postgres` on `tokio-postgres` 0.7.18, 32 new packages | Rebase, read, gate. Open work: with a transport, a dropped unfinished result must close the connection and the next `execute` must refuse with `connectivity`. |
+| #199 | `feat/15-mysql` / `feat-15-mysql` | Crate `rivet-ext-mysql` on `mysql_async` 0.37.1, 50 new packages | Rebase, read, gate. Open work: block more than one statement in one call (decision 83). Cannot run through a tunnel (accepted, #205). No connect timeout. |
 
 - #198 and #199 both change `crates/rivet-testkit/src/conformance.rs` (different lines): merge one, rebase the other.
-- No driver pull request is merged before the maintainer answers 79, 80 and 82.
+- The maintainer accepted the libraries and the new packages on 2026-11-26 (section 5): the merge block on the driver pull requests is lifted.
 
 ---
 
@@ -64,7 +64,7 @@ The reviewer is a separate session (`rivet-e0`). Last pass: 15. Findings are R-n
 
 | Level | Open | Fix state |
 |---|---|---|
-| blocker | R-17 b | Waits for maintainer question 75. `ARCHITECTURE.md:219` stays unchanged until then. |
+| blocker | R-17 b | Maintainer accepted the limit (decision 75.1). Open: the architect records it (`ARCHITECTURE.md:219`), then report to the reviewer. |
 | major | R-109 rest, R-118 | Fixed in #189, under review |
 | major | R-114 | Draft #202 |
 | major | R-121, R-122, R-123, R-124 | Draft #197 |
@@ -77,19 +77,23 @@ The reviewer is a separate session (`rivet-e0`). Last pass: 15. Findings are R-n
 
 ---
 
-## 5. Open maintainer questions
+## 5. Maintainer decisions and open questions
 
-- 75. Code that cannot be stopped can run on after an unload (R-17 b).
-  - 75.1 Accept the limit, second release plus warning (suggested for now, not decided).
-  - 75.2 Only jobs that can be stopped.
-  - 75.3 Blocking code only in a killable process (suggested for later, not decided).
-- 79. Drivers on `tokio-postgres` / `mysql_async` (79.1, in use) or own protocol code (79.2).
-- 80. Accept the new packages (32 PostgreSQL, 50 MySQL).
-- 81. Small first type mapping, the rest as text.
-- 82. MySQL through a tunnel: accept the limit now with a later ticket (82.1) or own connection code on `mysql_common` now (82.2).
-- 83. Must the MySQL driver block more than one statement in one call.
-- 72. Ticket for memory / CPU limits of a native process.
-- 74. Config types open for new fields.
+Decided by the maintainer on 2026-11-26:
+
+| Question | Decision |
+|---|---|
+| 75 (R-17 b: code that cannot be stopped runs on after an unload) | 75.1: accept the limit, with the second release and the warning |
+| 79 (driver base) | 79.1: the libraries `tokio-postgres` and `mysql_async` |
+| 80 (new packages) | Both accepted: 32 for PostgreSQL, 50 for MySQL |
+| 81 (type mapping) | Small first type set, the rest as text |
+| 82 (MySQL through a tunnel) | 82.1: accept the limit now; later ticket #205 |
+| 83 (MySQL, more than one statement in one call) | The driver must block it |
+| 72 (memory / CPU limits of a native process) | Ticket #204 created |
+| 74 (config types) | Open for new fields (not implemented yet) |
+
+Still open:
+
 - From the architect for #27 and #20: parameter binding needs a contract change; who splits a script; keyword list or parser; environment tag as free text; read-only also in the database session.
 - Two readings to confirm: the "Amended by ADR-0024" lines in ADR-0003 / §6.6 are covered by the acceptance; "workspace wins" is the rule and the signature condition stays open with #138.
 - Questions 1 to 59 are only in the session transcript.
@@ -101,9 +105,10 @@ The reviewer is a separate session (`rivet-e0`). Last pass: 15. Findings are R-n
 1. Verify R-127 and R-128, answer the reviewer.
 2. Gate and merge #197, #202, #200, #201.
 3. #27 slice 2: the execution path calls the guard (after #200 and #201).
-4. #198: tunnel rule for a dropped result. #198 and #199 merge after the maintainer answers.
-5. Architect records as `docs/architecture-decisions-28`: "on main" notes for #189, #190, #194, #195, #196, later #197; ADR-0025 equal to the driver code (wrong password = `auth`, type name in `ColumnMetadata::source_type`); R-130.
-6. Not started: #138 (signature check on load), R-78 a (extensions get the secret service), start-up call of `Installer::recover_all()` (it also stops on a directory read error although its doc says otherwise), test close-out of #7 and #9, #191, #192, #5, #95 parts 2 to 4.
+4. #198: tunnel rule for a dropped result. #199: block more than one statement in one call. Then gate and merge both.
+5. Config types open for new fields (decision 74): `non_exhaustive` with a constructor.
+6. Architect records as `docs/architecture-decisions-28`: the accepted limit of R-17 b; "on main" notes for #189, #190, #194, #195, #196, later #197; ADR-0025 equal to the driver code (wrong password = `auth`, type name in `ColumnMetadata::source_type`); R-130.
+7. Not started: #204, #205, #138 (signature check on load), R-78 a (extensions get the secret service), start-up call of `Installer::recover_all()` (it also stops on a directory read error although its doc says otherwise), test close-out of #7 and #9, #191, #192, #5, #95 parts 2 to 4.
 
 ---
 
