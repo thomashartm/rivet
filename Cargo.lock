@@ -2076,6 +2076,8 @@ dependencies = [
  "rivet-ext-postgres",
  "rivet-sdk",
  "rustyline",
+ "serde",
+ "serde_json",
  "tokio",
  "url",
 ]

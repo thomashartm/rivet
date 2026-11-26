@@ -14,8 +14,10 @@
 //! `rivet <name>` looks in this order:
 //!
 //! 1. The user settings file (`rivet_core::settings::user_settings_path`):
-//!    `[connections.<name>]` with `url` (no password in it) and an optional
-//!    `password` secret URI, for example `keychain://rivet/prod`.
+//!    `[connections.<name>]` with `url` (no password in it), an optional
+//!    `password` secret URI (for example `keychain://rivet/prod`), and the
+//!    optional guard flags `read_only`, `confirm_on_write` and the label
+//!    `environment`.
 //! 2. `RIVET_DATABASE_URL_<NAME>` in the environment, then in `./.env`
 //!    (the playground; `docker/playground.sh` writes it).
 //!
@@ -24,20 +26,16 @@
 //! A statement ends with `;` at the end of a line. Ctrl-C cancels the
 //! running statement; at the prompt it clears the input. `\q` or Ctrl-D
 //! quits. At a terminal the prompt has line editing and a history file
-//! next to the user settings file.
+//! next to the user settings file. `\d` lists tables, `\?` the commands.
+//!
+//! Each statement passes the guard of the profile first
+//! (`rivet_core::guard`): `read_only` refuses a write, `confirm_on_write`
+//! asks at the prompt and refuses in a file or a pipe.
 
 use std::collections::BTreeMap;
-use std::future::poll_fn;
-use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
-use std::pin::pin;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::DataType;
-use futures_core::Stream;
 use rivet_core::secrets::SecretStore;
 use rivet_core::settings::{Layer, Settings, user_settings_path};
 use rivet_ext_mysql::MysqlDriver;
@@ -46,20 +44,28 @@ use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{ConnectRequest, Connection, Credential, Credentials, Driver};
 use rivet_sdk::model::{ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
 use rivet_sdk::secret::{Secret, SecretUri};
-use rustyline::error::ReadlineError;
+use serde::Deserialize;
 use url::Url;
 
+use crate::output::Format;
+use crate::repl::{Mode, Session, lines, prompt, repl};
+
+mod output;
+mod repl;
+
 const USAGE: &str = "\
-usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>]
+usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format table|csv|json]
 
   <name>      a saved connection: [connections.<name>] in the user settings
               file, or RIVET_DATABASE_URL_<NAME> in the environment or ./.env
   no target   RIVET_DATABASE_URL from the environment or ./.env
-  -f <file>   run the statements of <file>, stop at the first error";
+  -f <file>   run the statements of <file>, stop at the first error
+  --format    table (default), csv, or json (one object per row)";
 
 fn main() -> ExitCode {
     let mut target = None;
     let mut file = None;
+    let mut format = Format::Table;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -70,6 +76,11 @@ fn main() -> ExitCode {
             "-f" | "--file" => match args.next() {
                 Some(path) => file = Some(path),
                 None => return usage("-f needs a file"),
+            },
+            "--format" => match args.next().map(|name| name.parse()) {
+                Some(Ok(chosen)) => format = chosen,
+                Some(Err(error)) => return usage(&error.to_string()),
+                None => return usage("--format needs table, csv or json"),
             },
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return usage(&format!("unexpected argument `{arg}`")),
@@ -91,33 +102,32 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let connection = match runtime.block_on(connect(target.as_deref())) {
-        Ok(connection) => connection,
+    let (connection, profile) = match runtime.block_on(connect(target.as_deref())) {
+        Ok(connected) => connected,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let session = Session {
+        runtime: &runtime,
+        connection: connection.as_ref(),
+        profile: &profile,
+        format,
+    };
     let mut stdout = io::stdout().lock();
     let ok = if let Some(file) = file {
         repl(
-            &runtime,
-            connection.as_ref(),
+            &session,
             lines(io::BufReader::new(file)),
             &mut stdout,
-            true,
+            Mode::Script,
         )
     } else if io::stdin().is_terminal() {
-        eprintln!("End a statement with `;`. Ctrl-C cancels it. `\\q` or Ctrl-D quits.");
-        prompt(&runtime, connection.as_ref(), &mut stdout)
+        eprintln!("End a statement with `;`. Ctrl-C cancels it. `\\?` lists the commands.");
+        prompt(&session, &mut stdout)
     } else {
-        repl(
-            &runtime,
-            connection.as_ref(),
-            lines(io::stdin().lock()),
-            &mut stdout,
-            false,
-        )
+        repl(&session, lines(io::stdin().lock()), &mut stdout, Mode::Pipe)
     };
     if ok {
         ExitCode::SUCCESS
@@ -131,37 +141,51 @@ fn usage(problem: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Finds the address of `target`, connects and prints where to.
-async fn connect(target: Option<&str>) -> Result<Box<dyn Connection>> {
+/// Finds the address of `target`, connects and prints where to. Returns the
+/// connection and its profile.
+async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, ConnectionProfile)> {
     let dotenv = std::fs::read_to_string(".env").unwrap_or_default();
     let lookup = |key: &str| {
         std::env::var(key)
             .ok()
             .or_else(|| from_dotenv(&dotenv, key))
     };
-    let (address, password) = match target {
-        Some(address) if address.contains("://") => (address.to_owned(), None),
+    let from_url = |url: String| SavedConnection {
+        url,
+        ..SavedConnection::default()
+    };
+    let saved = match target {
+        Some(address) if address.contains("://") => from_url(address.to_owned()),
         Some(name) => match saved(&user_settings()?, name)? {
             Some(saved) => saved,
-            None => (
-                lookup(&key_of(name)).ok_or_else(|| unknown(name, &dotenv))?,
-                None,
-            ),
+            None => from_url(lookup(&key_of(name)).ok_or_else(|| unknown(name, &dotenv))?),
         },
-        None => (
-            lookup(ADDRESS_KEY).ok_or_else(|| {
-                Error::user(format!(
-                    "no target and no {ADDRESS_KEY}; run docker/playground.sh or see --help"
-                ))
-            })?,
-            None,
-        ),
+        None => from_url(lookup(ADDRESS_KEY).ok_or_else(|| {
+            Error::user(format!(
+                "no target and no {ADDRESS_KEY}; run docker/playground.sh or see --help"
+            ))
+        })?),
     };
-    let (mut request, driver) = parse(&address)?;
-    if let Some(uri) = password {
-        let secret = SecretStore::new().resolve(&uri).await?;
+    let (mut request, driver) = parse(&saved.url)?;
+    if let Some(uri) = &saved.password {
+        let secret = SecretStore::new()
+            .resolve(&uri.parse::<SecretUri>()?)
+            .await?;
         request.credentials.credential = Credential::Password(secret);
     }
+    let profile = &mut request.profile;
+    profile.read_only = saved.read_only;
+    profile.confirm_on_write = saved.confirm_on_write;
+    profile.environment = saved.environment;
+    let profile = profile.clone();
+    let flags: Vec<&str> = [
+        profile.environment.as_deref(),
+        profile.read_only.then_some("read-only"),
+        profile.confirm_on_write.then_some("confirm writes"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let endpoint = &request.profile.endpoint;
     let shown = format!(
         "{} {}:{}/{}",
@@ -173,8 +197,13 @@ async fn connect(target: Option<&str>) -> Result<Box<dyn Connection>> {
         endpoint.database.as_deref().unwrap_or("")
     );
     let connection = driver.connect(request).await?;
-    eprintln!("connected to {shown} (plaintext, no TLS)");
-    Ok(connection)
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", flags.join(", "))
+    };
+    eprintln!("connected to {shown}{flags} (plaintext, no TLS)");
+    Ok((connection, profile))
 }
 
 /// The user settings, or empty settings if the platform has no user
@@ -187,12 +216,24 @@ fn user_settings() -> Result<Settings> {
     Ok(settings)
 }
 
-/// One `[connections.<name>]` table of the settings: `url` and `password`.
-type SavedConnection = BTreeMap<String, String>;
+/// One `[connections.<name>]` table of the settings.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedConnection {
+    /// The address, without a password (the settings check refuses one).
+    url: String,
+    /// A secret URI, for example `keychain://rivet/prod`.
+    password: Option<String>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    confirm_on_write: bool,
+    /// A free label such as `prod` (decision 86.4).
+    environment: Option<String>,
+}
 
-/// The address and the password URI of the saved connection `name` in
-/// `settings`, or `None` if there is none.
-fn saved(settings: &Settings, name: &str) -> Result<Option<(String, Option<SecretUri>)>> {
+/// The saved connection `name` in `settings`, or `None` if there is none.
+fn saved(settings: &Settings, name: &str) -> Result<Option<SavedConnection>> {
     if name.is_empty()
         || !name
             .chars()
@@ -202,17 +243,12 @@ fn saved(settings: &Settings, name: &str) -> Result<Option<(String, Option<Secre
             "`{name}` is not a connection name: use letters, digits, `-` and `_`"
         )));
     }
-    let Some(saved) = settings.get::<SavedConnection>(&format!("connections.{name}"))? else {
-        return Ok(None);
-    };
-    let url = saved
-        .get("url")
-        .ok_or_else(|| Error::user(format!("connections.{name} has no `url`")))?;
-    let password = saved
-        .get("password")
-        .map(|uri| uri.parse::<SecretUri>())
-        .transpose()?;
-    Ok(Some((url.clone(), password)))
+    let saved = settings.get::<SavedConnection>(&format!("connections.{name}"))?;
+    if let Some(uri) = saved.as_ref().and_then(|saved| saved.password.as_deref()) {
+        // Fails early on a bad URI, before the address is parsed.
+        uri.parse::<SecretUri>()?;
+    }
+    Ok(saved)
 }
 
 /// The error for a connection name that is nowhere.
@@ -329,258 +365,6 @@ fn decode(part: &str) -> Result<String> {
         .map_err(|_| Error::user("the address is not valid UTF-8 after decoding"))
 }
 
-/// One input of the statement loop.
-enum Input {
-    Line(String),
-    /// Ctrl-C at the prompt: drop the statement typed so far.
-    Clear,
-    /// The input cannot be read.
-    Failed,
-    End,
-}
-
-/// The lines of `input`, without a prompt.
-fn lines(input: impl BufRead) -> impl FnMut(&str) -> Input {
-    let mut lines = input.lines();
-    move |_| match lines.next() {
-        Some(Ok(line)) => Input::Line(line),
-        Some(Err(error)) => {
-            eprintln!("error: cannot read the input: {error}");
-            Input::Failed
-        }
-        None => Input::End,
-    }
-}
-
-/// The interactive prompt: line editing and a history file.
-fn prompt(
-    runtime: &tokio::runtime::Runtime,
-    connection: &dyn Connection,
-    output: &mut impl Write,
-) -> bool {
-    let mut editor = match rustyline::DefaultEditor::new() {
-        Ok(editor) => editor,
-        Err(error) => {
-            eprintln!("error: cannot start the line editor: {error}");
-            return false;
-        }
-    };
-    let history: Option<PathBuf> = user_settings_path()
-        .ok()
-        .map(|path| path.with_file_name("history"));
-    if let Some(path) = &history {
-        // No history yet is normal.
-        let _ = editor.load_history(path);
-    }
-    let ok = repl(
-        runtime,
-        connection,
-        |prompt| match editor.readline(prompt) {
-            Ok(line) => {
-                let _ = editor.add_history_entry(line.as_str());
-                Input::Line(line)
-            }
-            Err(ReadlineError::Interrupted) => Input::Clear,
-            Err(ReadlineError::Eof) => Input::End,
-            Err(error) => {
-                eprintln!("error: cannot read the input: {error}");
-                Input::Failed
-            }
-        },
-        output,
-        false,
-    );
-    if let Some(path) = &history {
-        let saved = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .map_err(ReadlineError::from)
-            .and_then(|()| editor.save_history(path));
-        if let Err(error) = saved {
-            eprintln!(
-                "warning: cannot save the history to {}: {error}",
-                path.display()
-            );
-        }
-    }
-    ok
-}
-
-/// Runs the statements that `next` gives and writes their results to
-/// `output`; errors go to stderr. `next` gets the prompt to show.
-///
-/// A `script` stops at the first failed statement and also runs a last
-/// statement without `;`. Returns `false` if a statement or the input failed.
-fn repl(
-    runtime: &tokio::runtime::Runtime,
-    connection: &dyn Connection,
-    mut next: impl FnMut(&str) -> Input,
-    output: &mut impl Write,
-    script: bool,
-) -> bool {
-    // shortcut: a statement ends at a line that ends with `;`, so a `;` at a
-    // line end inside a function body splits it; the driver splits scripts
-    // later (decision 86.2).
-    let mut statement = String::new();
-    let mut ok = true;
-    loop {
-        let line = match next(if statement.is_empty() {
-            "sql> "
-        } else {
-            "...> "
-        }) {
-            Input::Line(line) => line,
-            Input::Clear => {
-                statement.clear();
-                continue;
-            }
-            Input::Failed => return false,
-            Input::End => break,
-        };
-        if statement.is_empty() && line.trim() == "\\q" {
-            return ok;
-        }
-        if statement.is_empty() && line.trim().is_empty() {
-            continue;
-        }
-        statement.push_str(&line);
-        statement.push('\n');
-        if !line.trim_end().ends_with(';') {
-            continue;
-        }
-        if !execute(runtime, connection, &std::mem::take(&mut statement), output) {
-            ok = false;
-            if script {
-                return false;
-            }
-        }
-    }
-    if script && !statement.trim().is_empty() {
-        ok &= execute(runtime, connection, &statement, output);
-    }
-    ok
-}
-
-/// Runs one statement; Ctrl-C cancels it. Returns `false` if it failed.
-fn execute(
-    runtime: &tokio::runtime::Runtime,
-    connection: &dyn Connection,
-    statement: &str,
-    output: &mut impl Write,
-) -> bool {
-    let statement = statement.trim().trim_end_matches(';').to_owned();
-    let result = runtime.block_on(async {
-        let mut query = pin!(run(connection, statement));
-        tokio::select! {
-            result = &mut query => result,
-            _ = tokio::signal::ctrl_c() => {
-                // The query then ends with a `cancelled` error.
-                if let Err(error) = connection.cancel().await {
-                    eprintln!("error: cancel failed: {error}");
-                }
-                query.await
-            }
-        }
-    });
-    match result {
-        Ok(text) => {
-            let _ = output.write_all(text.as_bytes());
-            let _ = output.flush();
-            true
-        }
-        Err(error) => {
-            eprintln!("error: {error}");
-            false
-        }
-    }
-}
-
-/// Runs one statement and returns its result as a text table.
-async fn run(connection: &dyn Connection, statement: String) -> Result<String> {
-    let result = connection.execute(statement).await?;
-    let header: Vec<String> = result
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    let mut result = pin!(result);
-    // shortcut: the whole result is held in memory to align the columns;
-    // page or stream it when large results matter.
-    let mut rows = Vec::new();
-    while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
-        rows.extend(format_batch(&batch?));
-    }
-    Ok(table(&header, &rows))
-}
-
-fn format_batch(batch: &RecordBatch) -> Vec<Vec<String>> {
-    (0..batch.num_rows())
-        .map(|row| {
-            batch
-                .columns()
-                .iter()
-                .map(|column| cell(column.as_ref(), row))
-                .collect()
-        })
-        .collect()
-}
-
-/// Formats one value of the type set of the drivers (ADR-0025).
-fn cell(column: &dyn Array, row: usize) -> String {
-    if column.is_null(row) {
-        return "NULL".to_owned();
-    }
-    match column.data_type() {
-        DataType::Boolean => column.as_boolean().value(row).to_string(),
-        DataType::Int8 => column.as_primitive::<Int8Type>().value(row).to_string(),
-        DataType::Int16 => column.as_primitive::<Int16Type>().value(row).to_string(),
-        DataType::Int32 => column.as_primitive::<Int32Type>().value(row).to_string(),
-        DataType::Int64 => column.as_primitive::<Int64Type>().value(row).to_string(),
-        DataType::Float32 => column.as_primitive::<Float32Type>().value(row).to_string(),
-        DataType::Float64 => column.as_primitive::<Float64Type>().value(row).to_string(),
-        DataType::Utf8 => column.as_string::<i32>().value(row).to_owned(),
-        DataType::Binary => column
-            .as_binary::<i32>()
-            .value(row)
-            .iter()
-            .fold("\\x".to_owned(), |hex, byte| hex + &format!("{byte:02x}")),
-        other => format!("<{other}>"),
-    }
-}
-
-/// Aligns `header` and `rows` into columns, with a row count at the end.
-fn table(header: &[String], rows: &[Vec<String>]) -> String {
-    let widths: Vec<usize> = (0..header.len())
-        .map(|i| {
-            rows.iter()
-                .map(|row| row[i].chars().count())
-                .chain([header[i].chars().count()])
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let line = |cells: &[String]| {
-        let padded: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| format!("{cell:<width$}"))
-            .collect();
-        padded.join(" | ").trim_end().to_owned() + "\n"
-    };
-    let mut text = String::new();
-    if !header.is_empty() {
-        text += &line(header);
-        let rule: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
-        text += &rule.join("-+-");
-        text += "\n";
-        for row in rows {
-            text += &line(row);
-        }
-    }
-    text + &format!("({} rows)\n", rows.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,10 +421,17 @@ mod tests {
             "schema_version = 1\n[connections.prod]\nurl = \"postgres://app@db/x\"\n\
              password = \"keychain://rivet/prod\"\n[connections.local]\nurl = \"mysql://root@h/y\"\n",
         );
-        let (url, password) = saved(&settings, "prod").unwrap().unwrap();
-        assert_eq!(url, "postgres://app@db/x");
-        assert_eq!(password.unwrap().as_str(), "keychain://rivet/prod");
-        assert!(saved(&settings, "local").unwrap().unwrap().1.is_none());
+        let prod = saved(&settings, "prod").unwrap().unwrap();
+        assert_eq!(prod.url, "postgres://app@db/x");
+        assert_eq!(prod.password.as_deref(), Some("keychain://rivet/prod"));
+        assert!(!prod.read_only && !prod.confirm_on_write);
+        assert!(
+            saved(&settings, "local")
+                .unwrap()
+                .unwrap()
+                .password
+                .is_none()
+        );
         assert!(saved(&settings, "other").unwrap().is_none());
     }
 
@@ -652,6 +443,21 @@ mod tests {
         let no_url =
             settings("schema_version = 1\n[connections.x]\npassword = \"keychain://rivet/x\"\n");
         assert!(saved(&no_url, "x").is_err());
+        let typo = settings(
+            "schema_version = 1\n[connections.x]\nurl = \"mysql://h/d\"\nread_onyl = true\n",
+        );
+        assert!(saved(&typo, "x").is_err());
+    }
+
+    #[test]
+    fn saved_reads_the_guard_flags() {
+        let settings = settings(
+            "schema_version = 1\n[connections.prod]\nurl = \"postgres://app@db/x\"\n\
+             read_only = true\nconfirm_on_write = true\nenvironment = \"prod\"\n",
+        );
+        let prod = saved(&settings, "prod").unwrap().unwrap();
+        assert!(prod.read_only && prod.confirm_on_write);
+        assert_eq!(prod.environment.as_deref(), Some("prod"));
     }
 
     #[test]
@@ -661,18 +467,5 @@ mod tests {
         assert_eq!(driver.dialect().name, MysqlDriver.dialect().name);
         assert!(parse("sqlite://localhost/x").is_err());
         assert!(parse("not an address").is_err());
-    }
-
-    #[test]
-    fn table_aligns_columns_and_counts_rows() {
-        let header = ["id".to_owned(), "name".to_owned()];
-        let rows = [
-            vec!["1".to_owned(), "alice".to_owned()],
-            vec!["22".to_owned(), "NULL".to_owned()],
-        ];
-        assert_eq!(
-            table(&header, &rows),
-            "id | name\n---+------\n1  | alice\n22 | NULL\n(2 rows)\n"
-        );
     }
 }
