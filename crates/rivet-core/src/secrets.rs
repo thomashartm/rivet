@@ -120,6 +120,33 @@ impl SecretBackend for KeychainBackend {
     }
 }
 
+impl KeychainBackend {
+    /// Writes `secret` to the entry that `path` identifies (the part of a
+    /// `keychain://` URI after `://`), and replaces an existing value. The
+    /// path rules are the same as for a read.
+    ///
+    /// # Errors
+    ///
+    /// A `user` error for a bad path, otherwise the error of the keychain.
+    /// No error contains the secret.
+    pub async fn store(&self, path: &str, secret: Secret) -> Result<()> {
+        let (service, account) = keychain_entry(path)?;
+        if cfg!(windows) {
+            windows_service_is_not_ambiguous(service, account)?;
+        }
+        let (service, account) = (service.to_owned(), account.to_owned());
+        // The keychain call blocks, and it can wait for the user (§5.1).
+        tokio::task::spawn_blocking(move || {
+            keyring::Entry::new(&service, &account)
+                .and_then(|entry| entry.set_password(secret.expose()))
+                .map_err(|error| keychain_error(&service, &account, error))
+        })
+        .await
+        // No source: a panic message has unknown content.
+        .unwrap_or_else(|_| Err(Error::internal("the keychain task did not complete")))
+    }
+}
+
 /// Splits a `keychain://` path into the service and the account.
 fn keychain_entry(path: &str) -> Result<(&str, &str)> {
     path.split_once('/')
@@ -172,7 +199,7 @@ fn keychain_error(service: &str, account: &str, error: keyring::Error) -> Error 
             Error::connectivity("the keychain of the operating system is not available")
                 .with_source(error)
         }
-        _ => Error::internal(format!("the keychain failed to read {uri}")).with_source(error),
+        _ => Error::internal(format!("the keychain failed to access {uri}")).with_source(error),
     }
 }
 

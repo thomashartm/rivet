@@ -35,43 +35,38 @@ impl FromStr for Format {
     }
 }
 
-/// The text of one result with the column names `header`.
+/// The text of one whole result with the column names `header`.
 pub fn render(format: Format, header: &[String], batches: &[RecordBatch]) -> String {
-    let rows = || {
-        batches
-            .iter()
-            .flat_map(|batch| (0..batch.num_rows()).map(move |row| (batch, row)))
-    };
-    let texts = |null: &str| -> Vec<Vec<String>> {
-        rows()
-            .map(|(batch, row)| {
-                batch
-                    .columns()
-                    .iter()
-                    .map(|column| text(column.as_ref(), row).unwrap_or_else(|| null.to_owned()))
-                    .collect()
-            })
-            .collect()
-    };
     match format {
-        Format::Table => table(header, &texts("NULL")),
-        Format::Csv => {
-            let line = |cells: &[String]| {
-                cells
-                    .iter()
-                    .map(|cell| csv_field(cell))
-                    .collect::<Vec<_>>()
-                    .join(",")
-                    + "\n"
-            };
-            let mut out = line(header);
-            for row in texts("") {
-                out += &line(&row);
-            }
-            out
+        Format::Table => {
+            let rows: Vec<Vec<String>> = batches
+                .iter()
+                .flat_map(|batch| texts(batch, "NULL"))
+                .collect();
+            table(header, &rows)
         }
-        Format::Json => rows()
-            .map(|(batch, row)| {
+        Format::Csv | Format::Json => batches.iter().fold(start(format, header), |out, batch| {
+            out + &rows(format, header, batch)
+        }),
+    }
+}
+
+/// The text before the first row: the CSV header line. Empty for JSON.
+/// The table is not streamed: it needs all rows to align them.
+pub fn start(format: Format, header: &[String]) -> String {
+    match format {
+        Format::Csv => csv_line(header),
+        Format::Table | Format::Json => String::new(),
+    }
+}
+
+/// The CSV or JSON text of the rows of one batch. Empty for the table.
+pub fn rows(format: Format, header: &[String], batch: &RecordBatch) -> String {
+    match format {
+        Format::Table => String::new(),
+        Format::Csv => texts(batch, "").iter().map(|row| csv_line(row)).collect(),
+        Format::Json => (0..batch.num_rows())
+            .map(|row| {
                 let pairs: Vec<String> = header
                     .iter()
                     .zip(batch.columns())
@@ -87,6 +82,28 @@ pub fn render(format: Format, header: &[String], batches: &[RecordBatch]) -> Str
             })
             .collect(),
     }
+}
+
+/// The rows of `batch` as text, with `null` for NULL.
+fn texts(batch: &RecordBatch, null: &str) -> Vec<Vec<String>> {
+    (0..batch.num_rows())
+        .map(|row| {
+            batch
+                .columns()
+                .iter()
+                .map(|column| text(column.as_ref(), row).unwrap_or_else(|| null.to_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+fn csv_line(cells: &[String]) -> String {
+    cells
+        .iter()
+        .map(|cell| csv_field(cell))
+        .collect::<Vec<_>>()
+        .join(",")
+        + "\n"
 }
 
 /// One value as text, `None` for NULL. Covers the type set of the drivers
