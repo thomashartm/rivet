@@ -52,7 +52,8 @@ Run every command from the repository root: rivet reads `./.env` there.
    - PostgreSQL starts on 127.0.0.1:55432.
    - MySQL starts on 127.0.0.1:53306.
    - Both get the sample tables `customers`, `products`, `orders`, `order_items`.
-2. Run `make run`. The PostgreSQL prompt `sql>` opens.
+   - Both use TLS with a throwaway certificate for `localhost`. `.env` trusts only its CA, `docker/test-certs/ca.pem`.
+2. Run `make run`. The PostgreSQL prompt `sql>` opens. The connect line ends with `(TLS)`.
 3. Type `select * from customers;` and press Enter.
 4. Type `\q` to quit.
 5. Run `make run-mysql` for MySQL.
@@ -83,7 +84,7 @@ Run every command from the repository root: rivet reads `./.env` there.
 |---|---|
 | nothing | TLS. The server certificate and the host name are checked against the system trust store. |
 | `?tls_ca=/path/ca.pem` | TLS. Only the CA in that file is trusted. |
-| `?tls=off` | Plain text. The connect line says `plaintext, no TLS`. The playground uses this. |
+| `?tls=off` | Plain text. The connect line says `plaintext, no TLS`. Use it only for a local server. |
 | `?tls_cert=/path/client.pem&tls_key=keychain://rivet/<name>-key` | TLS with a client certificate: the PEM file and its PEM key from the secret URI. It replaces the password. The connect line says `TLS, client certificate`. |
 
 - Any other parameter in the address is refused.
