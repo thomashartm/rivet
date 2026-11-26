@@ -5,6 +5,9 @@
 //! sql> select 1 as one;
 //! ```
 //!
+//! Without an argument the address comes from `RIVET_DATABASE_URL`: first
+//! the environment, then a `.env` file in the current directory.
+//!
 //! A statement ends with `;` at the end of a line. `\q` or end of input
 //! (Ctrl-D) quits.
 
@@ -26,8 +29,15 @@ use rivet_sdk::secret::Secret;
 use url::Url;
 
 fn main() -> ExitCode {
-    let Some(address) = std::env::args().nth(1) else {
-        eprintln!("usage: rivet postgres://user:password@host:port/database");
+    let address = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var(ADDRESS_KEY).ok())
+        .or_else(|| from_dotenv(&std::fs::read_to_string(".env").ok()?));
+    let Some(address) = address else {
+        eprintln!(
+            "usage: rivet postgres://user:password@host:port/database\n       \
+             or set {ADDRESS_KEY} in the environment or in ./.env (docker/playground.sh writes one)"
+        );
         return ExitCode::from(2);
     };
     let runtime = match tokio::runtime::Runtime::new() {
@@ -54,6 +64,26 @@ fn main() -> ExitCode {
         io::stdout().lock(),
     );
     ExitCode::SUCCESS
+}
+
+/// The variable that holds the database address.
+const ADDRESS_KEY: &str = "RIVET_DATABASE_URL";
+
+/// Returns the value of [`ADDRESS_KEY`] in the text of a `.env` file.
+/// Reads `KEY=value` lines; `#` comments, `export` and quotes are allowed.
+fn from_dotenv(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let (key, value) = line
+            .strip_prefix("export ")
+            .unwrap_or(line)
+            .split_once('=')?;
+        let value = value.trim();
+        let unquoted = ['"', '\'']
+            .iter()
+            .find_map(|quote| value.strip_prefix(*quote)?.strip_suffix(*quote));
+        (key.trim() == ADDRESS_KEY).then(|| unquoted.unwrap_or(value).to_owned())
+    })
 }
 
 /// Builds the connect request from a `postgres://` address.
@@ -235,6 +265,17 @@ mod tests {
             panic!("not a password");
         };
         assert_eq!(password.expose(), "p+w d");
+    }
+
+    #[test]
+    fn from_dotenv_finds_the_address() {
+        let text = "# comment\nPOSTGRES_USER=rivet\n\nexport RIVET_DATABASE_URL = \"postgres://a:b@h/d\"\n";
+        assert_eq!(from_dotenv(text).as_deref(), Some("postgres://a:b@h/d"));
+        assert_eq!(
+            from_dotenv("RIVET_DATABASE_URL=postgres://x@h/d").as_deref(),
+            Some("postgres://x@h/d")
+        );
+        assert_eq!(from_dotenv("# RIVET_DATABASE_URL=x\nOTHER=y"), None);
     }
 
     #[test]

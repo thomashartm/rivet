@@ -1,0 +1,30 @@
+# A local PostgreSQL to try rivet with. Not for tests (see compose.test.yml).
+#
+#   Start: docker/playground.sh   (writes .env in the repository root on the first run)
+#   Stop:  docker compose --env-file .env -f docker/compose.playground.yml down
+#   Reset: the same with `down -v` (deletes the data), then delete .env
+#
+# The credentials come from the generated .env; it is never committed.
+name: rivet-playground
+
+services:
+  postgres:
+    image: postgres:18.7
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?run docker/playground.sh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run docker/playground.sh}
+      POSTGRES_DB: ${POSTGRES_DB:?run docker/playground.sh}
+    ports:
+      # Loopback only; 55432 so a local PostgreSQL on 5432 keeps working.
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - playground-data:/var/lib/postgresql
+      - ./playground/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --host=127.0.0.1 --username=$${POSTGRES_USER} --dbname=$${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  playground-data:
