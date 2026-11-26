@@ -16,7 +16,7 @@ futures-util = { version = "0.3.34", default-features = false }
 # Pure-Rust compression backend: `minimal` links the C zlib. No TLS (#19).
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
 rivet-sdk = { path = "../rivet-sdk" }
-tokio = { version = "1.54.1", features = ["rt", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 rivet-testkit = { path = "../rivet-testkit" }

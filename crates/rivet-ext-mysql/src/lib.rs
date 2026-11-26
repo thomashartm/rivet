@@ -7,6 +7,7 @@
 //! | --- | --- |
 //! | Bounded reads (§5.5) | The result set reads [`BATCH_ROWS`] rows from the socket for each batch it gives. |
 //! | Drop of a result set | `KILL QUERY` on a second connection, then the rest of the result is read and discarded. An endless result is not read to its end. |
+//! | Drop of a result set, the kill fails | For example when the server refuses the second connection. The socket is closed without a read of the rest of the result, at most [`CLOSE_TIMEOUT`] later, and the lock is freed. The next `execute` gives a `connectivity` error. The server stops the statement when it next writes to the closed socket: a statement that sends no rows (for example a long `count(*)`) runs to its end. |
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
 //! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295, for example `LOCK TABLES`) is run as it is: the server had parsed it as one statement. |
@@ -17,6 +18,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -36,6 +38,13 @@ pub const BATCH_ROWS: usize = 1024;
 
 /// The port of a profile that does not set one.
 const DEFAULT_PORT: u16 = 3306;
+
+/// The longest wait for the `KILL QUERY` of a dropped result.
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest wait for a polite close (`COM_QUIT`) of a connection that is
+/// given up. After it, the socket is closed without one.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// MySQL error codes (`ER_*`) with their own error category.
 mod code {
@@ -305,7 +314,10 @@ impl Drop for Lease {
 /// rest of the result. If the kill fails, it closes the connection: to read
 /// an endless result to its end would never finish.
 async fn stop(slot: &mut Option<Conn>, killer: &Killer) {
-    let killed = killer.kill().await.is_ok();
+    let killed = matches!(
+        tokio::time::timeout(KILL_TIMEOUT, killer.kill()).await,
+        Ok(Ok(()))
+    );
     if killed && let Some(conn) = slot.as_mut() {
         let rest = QueryResult::<'_, '_, TextProtocol>::new(conn);
         // `KILL QUERY` ends the result with an error: the connection is good.
@@ -316,8 +328,13 @@ async fn stop(slot: &mut Option<Conn>, killer: &Killer) {
         }
     }
     if let Some(conn) = slot.take() {
-        // The connection is given up; a failed close changes nothing.
-        let _ = conn.disconnect().await;
+        // shortcut: in mysql_async 0.37 `disconnect` marks the `Conn` as closed before it
+        // reads the rest of the result; dropped at the timeout, the `Conn` then closes its
+        // socket and reads nothing. A plain drop would read the rest in a spawned task,
+        // forever for an endless result. Check it when mysql_async is updated (test
+        // `failed_kill_frees_the_lock_and_closes_the_socket`).
+        // The connection is given up; a failed or late close changes nothing.
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.disconnect()).await;
     }
 }
 
@@ -507,6 +524,56 @@ mod tests {
         let error = connect_error(request(port, false)).await;
         assert_eq!(error.category(), ErrorCategory::Connectivity, "{error:?}");
         assert_no_password(&error);
+    }
+
+    /// A dropped endless result whose `KILL QUERY` fails (the killer points
+    /// at a closed port): the lock is freed, the next `execute` fails with
+    /// `connectivity`, and the server sees the socket closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_kill_frees_the_lock_and_closes_the_socket() {
+        use futures_util::StreamExt;
+        use rivet_testkit::{conformance::Sql, database};
+        if !database::containers_enabled() {
+            return;
+        }
+        let fixture = database::mysql();
+        let password = Credential::Password(Secret::from(fixture.password.expose().to_owned()));
+        let credentials = Credentials::new(password).with_user(fixture.user.clone());
+        let opts = opts(&ConnectRequest::new(fixture.profile.clone(), credentials)).unwrap();
+        let conn = Conn::new(opts.clone()).await.unwrap();
+        let id = conn.id();
+        let (closed, port) = listener().await;
+        drop(closed);
+        let connection = MysqlConnection {
+            conn: Arc::new(Mutex::new(Some(conn))),
+            busy: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Killer {
+                opts: OptsBuilder::from_opts(opts.clone()).tcp_port(port).into(),
+                id,
+            }),
+        };
+
+        let mut result = connection.execute(Sql::mysql().endless).await.unwrap();
+        result.next().await.unwrap().unwrap();
+        drop(result);
+        let next = connection.execute("select 1".to_owned());
+        let error = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("the lock must be freed")
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Connectivity, "{error:?}");
+
+        let mut observer = Conn::new(opts).await.unwrap();
+        let alive = format!("select count(*) from information_schema.processlist where id = {id}");
+        for _ in 0..50 {
+            let count: Option<u64> = observer.query_first(alive.as_str()).await.unwrap();
+            if count == Some(0) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the server still runs connection {id}");
     }
 
     #[test]
