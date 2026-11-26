@@ -1,6 +1,6 @@
 # ADR-0023: Package format and install layout
 
-- Status: Proposed
+- Status: Accepted (maintainer, 2026-11-25). The points that the text marks as open or as a proposal stay open.
 - Date: 2026-11-25
 
 ## Context
@@ -38,7 +38,7 @@ Directories:
 
 - No decompression code and no decompression bomb. A package is larger than a compressed one.
 - Two new crates: `tar` and `filetime`.
-- The same code runs on Windows, macOS and Linux. No symbolic link is used. Proposed rule for links that the installer finds (review finding R-119; on `main` on this date only for `store/<id>`): `<data>` itself can be a symbolic link, because users link data directories. Each directory below it that the installer uses (`store`, `extensions`, `store/<id>`, `extensions/<id>`) MUST be a real directory; a symbolic link in one of these places is refused with a `user` error that names it, on each platform. Reason: the two renames of a change must stay on one filesystem, and a link can lead out of the directories whose modes are checked.
+- The code is written for Windows, macOS and Linux and has no path that is only for one platform, except the mode checks on Unix. No installer test ran on Windows (fact given by the orchestrator); CI runs on Linux. No symbolic link is used. Proposed rule for links that the installer finds (review finding R-119; on `main` on this date only for `store/<id>`): `<data>` itself can be a symbolic link, because users link data directories. Each directory below it that the installer uses (`store`, `extensions`, `store/<id>`, `extensions/<id>`) MUST be a real directory; a symbolic link in one of these places is refused with a `user` error that names it, on each platform. Reason: the two renames of a change must stay on one filesystem, and a link can lead out of the directories whose modes are checked.
 - Between the two renames an extension id has no active directory. A load in that time fails and the host retries it (ADR-0021).
 - Gap: the host does not verify a signature when it loads an extension. §7.7 and ADR-0006 require it ("on install and on load"). This ADR does not change that rule. The gap is tracked in ticket #138. The owner decides the design: check the extracted files against the kept signed package, or store digests at install. The store keeps the package and the signature for this.
 - Limits of the first version (`install.rs`, on `main` since PR #134):
