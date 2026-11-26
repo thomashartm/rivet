@@ -35,15 +35,23 @@ impl FromStr for Format {
     }
 }
 
-/// The text of one whole result with the column names `header`.
+/// The text of one whole result with the column names `header`. For tests;
+/// the prompt streams with `start`, `rows` and `TablePages`.
+#[cfg(test)]
 pub fn render(format: Format, header: &[String], batches: &[RecordBatch]) -> String {
     match format {
         Format::Table => {
-            let rows: Vec<Vec<String>> = batches
-                .iter()
-                .flat_map(|batch| texts(batch, "NULL"))
-                .collect();
-            table(header, &rows)
+            let mut out = String::new();
+            let mut write = |text: String| -> Result<(), Error> {
+                out += &text;
+                Ok(())
+            };
+            let mut pages = TablePages::new(header);
+            for batch in batches {
+                pages.push(batch, &mut write).expect("writing to a String");
+            }
+            pages.finish(&mut write).expect("writing to a String");
+            out
         }
         Format::Csv | Format::Json => batches.iter().fold(start(format, header), |out, batch| {
             out + &rows(format, header, batch)
@@ -51,8 +59,8 @@ pub fn render(format: Format, header: &[String], batches: &[RecordBatch]) -> Str
     }
 }
 
-/// The text before the first row: the CSV header line. Empty for JSON.
-/// The table is not streamed: it needs all rows to align them.
+/// The text before the first row: the CSV header line. Empty for JSON and
+/// the table (see [`TablePages`]).
 pub fn start(format: Format, header: &[String]) -> String {
     match format {
         Format::Csv => csv_line(header),
@@ -164,13 +172,77 @@ fn csv_field(field: &str) -> String {
     }
 }
 
-/// Aligns `header` and `rows` into columns, with a row count at the end.
-fn table(header: &[String], rows: &[Vec<String>]) -> String {
+/// The most rows of one table block.
+const PAGE_ROWS: usize = 1000;
+
+/// A table printed in blocks of [`PAGE_ROWS`] rows, so memory is bounded by
+/// one block. The header comes once at the top; each block aligns by its own
+/// widths, like psql with `FETCH_COUNT`.
+// shortcut: columns can be misaligned between blocks, since a block does not
+// know the widths of later rows; align globally if that hurts readers.
+pub struct TablePages<'a> {
+    header: &'a [String],
+    rows: Vec<Vec<String>>,
+    total: usize,
+    started: bool,
+}
+
+impl<'a> TablePages<'a> {
+    pub fn new(header: &'a [String]) -> Self {
+        Self {
+            header,
+            rows: Vec::new(),
+            total: 0,
+            started: false,
+        }
+    }
+
+    /// Buffers the rows of `batch` and passes each full block to `write`.
+    pub fn push(
+        &mut self,
+        batch: &RecordBatch,
+        write: &mut impl FnMut(String) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for row in texts(batch, "NULL") {
+            self.rows.push(row);
+            if self.rows.len() == PAGE_ROWS {
+                self.flush(write)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Passes the last block and the total row count to `write`.
+    pub fn finish(
+        mut self,
+        write: &mut impl FnMut(String) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.flush(write)?;
+        write(format!("({} rows)\n", self.total))
+    }
+
+    fn flush(&mut self, write: &mut impl FnMut(String) -> Result<(), Error>) -> Result<(), Error> {
+        if self.started && self.rows.is_empty() {
+            return Ok(());
+        }
+        let text = block(self.header, &self.rows, !self.started);
+        self.started = true;
+        self.total += self.rows.len();
+        self.rows.clear();
+        if text.is_empty() { Ok(()) } else { write(text) }
+    }
+}
+
+/// Aligns `rows` into columns; `with_header` adds the header and rule line.
+fn block(header: &[String], rows: &[Vec<String>], with_header: bool) -> String {
+    if header.is_empty() {
+        return String::new();
+    }
     let widths: Vec<usize> = (0..header.len())
         .map(|i| {
             rows.iter()
                 .map(|row| row[i].chars().count())
-                .chain([header[i].chars().count()])
+                .chain(with_header.then(|| header[i].chars().count()))
                 .max()
                 .unwrap_or(0)
         })
@@ -184,16 +256,16 @@ fn table(header: &[String], rows: &[Vec<String>]) -> String {
         padded.join(" | ").trim_end().to_owned() + "\n"
     };
     let mut text = String::new();
-    if !header.is_empty() {
+    if with_header {
         text += &line(header);
         let rule: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
         text += &rule.join("-+-");
         text += "\n";
-        for row in rows {
-            text += &line(row);
-        }
     }
-    text + &format!("({} rows)\n", rows.len())
+    for row in rows {
+        text += &line(row);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -254,5 +326,47 @@ mod tests {
     fn format_parses_its_names() {
         assert_eq!("csv".parse::<Format>().unwrap(), Format::Csv);
         assert!("xml".parse::<Format>().is_err());
+    }
+
+    #[test]
+    fn table_pages_of_1000_rows_with_one_header() {
+        let header = vec!["n".to_owned()];
+        let mut next = 0;
+        let mut blocks = Vec::new();
+        let mut write = |text: String| -> Result<(), Error> {
+            blocks.push(text);
+            Ok(())
+        };
+        let mut pages = TablePages::new(&header);
+        for _ in 0..4 {
+            let values: Vec<i32> = (next..next + 700).collect();
+            next += 700;
+            let batch =
+                RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(values)) as ArrayRef)])
+                    .unwrap();
+            pages.push(&batch, &mut write).unwrap();
+        }
+        let batch = RecordBatch::try_from_iter([(
+            "n",
+            Arc::new(Int32Array::from(vec![9999; 200])) as ArrayRef,
+        )])
+        .unwrap();
+        pages.push(&batch, &mut write).unwrap();
+        pages.finish(&mut write).unwrap();
+        // 3000 rows: three full blocks, then only the count.
+        assert_eq!(blocks.len(), 4);
+        assert!(blocks[0].starts_with("n\n---\n0\n"));
+        assert_eq!(blocks[0].lines().count(), 1002);
+        assert!(blocks[1].starts_with("1000\n"));
+        assert_eq!(blocks[1].lines().count(), 1000);
+        assert!(blocks[2].ends_with("9999\n"));
+        assert_eq!(blocks[3], "(3000 rows)\n");
+        assert_eq!(blocks.iter().filter(|b| b.contains("---\n")).count(), 1);
+    }
+
+    #[test]
+    fn table_without_rows_prints_header_and_count() {
+        let header = vec!["id".to_owned()];
+        assert_eq!(render(Format::Table, &header, &[]), "id\n--\n(0 rows)\n");
     }
 }

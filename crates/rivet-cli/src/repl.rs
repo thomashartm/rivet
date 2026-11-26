@@ -14,7 +14,7 @@ use rivet_sdk::extension::Connection;
 use rivet_sdk::model::ConnectionProfile;
 use rustyline::error::ReadlineError;
 
-use crate::output::{Format, render, rows, start};
+use crate::output::{Format, TablePages, rows, start};
 
 /// What the loop works with.
 pub struct Session<'a> {
@@ -343,13 +343,11 @@ async fn run(
             .map_err(|error| Error::user(format!("cannot write the result: {error}")))
     };
     if format == Format::Table {
-        // shortcut: the table holds the whole result to align its columns;
-        // page it when large results at the prompt matter.
-        let mut batches = Vec::new();
+        let mut pages = TablePages::new(&header);
         while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
-            batches.push(batch?);
+            pages.push(&batch?, &mut write)?;
         }
-        return write(render(format, &header, &batches));
+        return pages.finish(&mut write);
     }
     write(start(format, &header))?;
     while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
