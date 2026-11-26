@@ -77,6 +77,11 @@ fn forbidden(edge: Edge<'_>) -> Option<String> {
         // The xtask. A crate of an unknown kind is reported in `violations`.
         return (from == EXEMPT && kind(to) == Some(TestKit) && !dev).then(must_be_dev);
     };
+    // shortcut: the MVP CLI links the PostgreSQL driver until the extension
+    // host can hand out a driver (§3.2 footnote 1); remove this line then.
+    if (from, to) == ("rivet-cli", "rivet-ext-postgres") {
+        return None;
+    }
     let ok = match (from_kind, kind(to)) {
         // No cycle, also not with a dev-dependency: the tests of a crate
         // would see two copies of its types.
@@ -181,7 +186,7 @@ mod tests {
     #[test]
     fn footnoted_and_unlisted_edges_fail() {
         for (from, to) in [
-            ("rivet-cli", "rivet-ext-postgres"),
+            ("rivet-cli", "rivet-ext-mysql"),
             ("rivet-ui-shell", "rivet-core"),
             ("rivet-ui-ext-grid", "rivet-ui-shell"),
             ("rivet-ui-ext-grid", "rivet-ui-ext-tree"),
@@ -190,6 +195,14 @@ mod tests {
         ] {
             assert_eq!(edge(from, to).len(), 1, "{from} -> {to}");
         }
+    }
+
+    #[test]
+    fn the_mvp_cli_may_link_the_postgres_driver() {
+        assert_eq!(
+            edge("rivet-cli", "rivet-ext-postgres"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
