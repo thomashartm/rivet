@@ -10,6 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+arrow-array = { version = "60.2.0", default-features = false }
+arrow-schema = { version = "60.2.0", default-features = false }
+futures-core = "0.3.34"
 rivet-core = { path = "../rivet-core" }
 rivet-sdk = { path = "../rivet-sdk" }
 tempfile = "3.27.0"
