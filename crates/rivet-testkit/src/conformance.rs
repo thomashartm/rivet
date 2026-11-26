@@ -173,7 +173,9 @@ impl Sql {
                 .to_owned(),
             type_columns,
             empty: "select 1 where false".to_owned(),
-            endless: "select g from generate_series(1::bigint, 1000000000000::bigint) g".to_owned(),
+            // In the select list the set streams. In `from` PostgreSQL first
+            // writes the whole set to a temporary file.
+            endless: "select generate_series(1::bigint, 1000000000000::bigint) as g".to_owned(),
             slow: "select pg_sleep(30)".to_owned(),
             syntax_error: "this is not sql".to_owned(),
         }
