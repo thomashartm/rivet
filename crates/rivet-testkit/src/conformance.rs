@@ -29,6 +29,7 @@
 //! | [`reads_slowly`] | A result that never ends is read slowly, then dropped: the statement stops and the connection runs the next statement. |
 //! | [`cancels`] | `cancel` of a running statement gives `cancelled`; the connection works again. |
 //! | [`survives_sql_error`] | A wrong statement gives `user`; the connection works again. |
+//! | [`counts_changed_rows`] | An `insert` and an `update` of 2 rows give `rows_affected` 2; a `select` gives none. |
 //! | [`reports_dialect`] | `dialect()` has the expected name and identifier quote. |
 //!
 //! The suite cannot measure the memory of a driver. A driver that reads
@@ -92,6 +93,15 @@ pub struct Sql {
     pub slow: String,
     /// A statement that the database refuses because of its text.
     pub syntax_error: String,
+    /// Statements that make the empty temporary table of `count_insert`.
+    pub count_setup: Vec<String>,
+    /// A statement that inserts 2 rows into that table.
+    pub count_insert: String,
+    /// A statement that changes both rows to values that differ from the old
+    /// ones. MySQL counts only rows whose values change.
+    pub count_update: String,
+    /// A statement that selects the rows of that table.
+    pub count_select: String,
 }
 
 /// One column that `Sql::type_query` gives.
@@ -178,6 +188,13 @@ impl Sql {
             endless: "select generate_series(1::bigint, 1000000000000::bigint) as g".to_owned(),
             slow: "select pg_sleep(30)".to_owned(),
             syntax_error: "this is not sql".to_owned(),
+            count_setup: vec![
+                "create temporary table conformance_count (id integer primary key, v integer)"
+                    .to_owned(),
+            ],
+            count_insert: "insert into conformance_count values (1, 10), (2, 20)".to_owned(),
+            count_update: "update conformance_count set v = v + 1".to_owned(),
+            count_select: "select id from conformance_count order by id".to_owned(),
         }
     }
 
@@ -239,6 +256,12 @@ impl Sql {
             // KILL QUERY stops it with an error. `sleep()` would return 1.
             slow: format!("{numbers} select /*+ NO_BNL() */ count(*) {rows}"),
             syntax_error: "this is not sql".to_owned(),
+            count_setup: vec![
+                "create temporary table conformance_count (id int primary key, v int)".to_owned(),
+            ],
+            count_insert: "insert into conformance_count values (1, 10), (2, 20)".to_owned(),
+            count_update: "update conformance_count set v = v + 1".to_owned(),
+            count_select: "select id from conformance_count order by id".to_owned(),
         }
     }
 }
@@ -257,7 +280,8 @@ pub async fn run_all(driver: &dyn Driver, fixture: &DatabaseFixture, sql: &Sql) 
     returns_empty_result(driver, fixture, sql).await?;
     reads_slowly(driver, fixture, sql).await?;
     cancels(driver, fixture, sql).await?;
-    survives_sql_error(driver, fixture, sql).await
+    survives_sql_error(driver, fixture, sql).await?;
+    counts_changed_rows(driver, fixture, sql).await
 }
 
 fn fail(case: &str, message: impl Display) -> Error {
@@ -609,4 +633,40 @@ pub async fn survives_sql_error(
     }
     check_no_secret(CASE, &error, &[fixture.password.expose()])?;
     check_usable(CASE, &*connection, sql).await
+}
+
+/// On one connection: `sql.count_insert` and `sql.count_update` each give
+/// `rows_affected` 2; `sql.count_select` gives `None`.
+///
+/// # Errors
+///
+/// An `internal` error that names the statement and the count it gave.
+pub async fn counts_changed_rows(
+    driver: &dyn Driver,
+    fixture: &DatabaseFixture,
+    sql: &Sql,
+) -> Result<()> {
+    const CASE: &str = "counts_changed_rows";
+    let connection = open(CASE, driver, fixture).await?;
+    for statement in &sql.count_setup {
+        let mut result = run(CASE, &*connection, statement).await?;
+        read_all(CASE, &mut result).await?;
+    }
+    let checks = [
+        (&sql.count_insert, Some(2)),
+        (&sql.count_update, Some(2)),
+        (&sql.count_select, None),
+    ];
+    for (statement, want) in checks {
+        let mut result = run(CASE, &*connection, statement).await?;
+        let got = result.rows_affected();
+        read_all(CASE, &mut result).await?;
+        if got != want {
+            return Err(fail(
+                CASE,
+                format!("`{statement}` gave rows_affected {got:?}, not {want:?}"),
+            ));
+        }
+    }
+    Ok(())
 }

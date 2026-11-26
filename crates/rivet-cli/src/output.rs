@@ -50,7 +50,7 @@ pub fn render(format: Format, header: &[String], batches: &[RecordBatch]) -> Str
             for batch in batches {
                 pages.push(batch, &mut write).expect("writing to a String");
             }
-            pages.finish(&mut write).expect("writing to a String");
+            pages.finish(None, &mut write).expect("writing to a String");
             out
         }
         Format::Csv | Format::Json => batches.iter().fold(start(format, header), |out, batch| {
@@ -172,6 +172,27 @@ fn csv_field(field: &str) -> String {
     }
 }
 
+/// The first keywords of a statement that changes rows.
+const WRITES: [&str; 6] = ["insert", "update", "delete", "merge", "replace", "with"];
+
+/// The line for a statement that reports `rows` changed rows (ADR-0027):
+/// `(n rows changed)` after a write, `ok` after any other statement, for
+/// example DDL, which reports 0.
+// shortcut: only the first word counts, so a write that starts with a comment
+// or `(` prints `ok`; skip comments here if users miss the count.
+pub fn changed(statement: &str, rows: u64) -> String {
+    let first = statement
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    if WRITES.iter().any(|write| first.eq_ignore_ascii_case(write)) {
+        format!("({rows} rows changed)\n")
+    } else {
+        "ok\n".to_owned()
+    }
+}
+
 /// The most rows of one table block.
 const PAGE_ROWS: usize = 1000;
 
@@ -212,13 +233,15 @@ impl<'a> TablePages<'a> {
         Ok(())
     }
 
-    /// Passes the last block and the total row count to `write`.
+    /// Passes the last block and then `summary` to `write`; without a
+    /// summary, the total row count.
     pub fn finish(
         mut self,
+        summary: Option<String>,
         write: &mut impl FnMut(String) -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.flush(write)?;
-        write(format!("({} rows)\n", self.total))
+        write(summary.unwrap_or_else(|| format!("({} rows)\n", self.total)))
     }
 
     fn flush(&mut self, write: &mut impl FnMut(String) -> Result<(), Error>) -> Result<(), Error> {
@@ -352,7 +375,7 @@ mod tests {
         )])
         .unwrap();
         pages.push(&batch, &mut write).unwrap();
-        pages.finish(&mut write).unwrap();
+        pages.finish(None, &mut write).unwrap();
         // 3000 rows: three full blocks, then only the count.
         assert_eq!(blocks.len(), 4);
         assert!(blocks[0].starts_with("n\n---\n0\n"));
@@ -362,6 +385,45 @@ mod tests {
         assert!(blocks[2].ends_with("9999\n"));
         assert_eq!(blocks[3], "(3000 rows)\n");
         assert_eq!(blocks.iter().filter(|b| b.contains("---\n")).count(), 1);
+    }
+
+    #[test]
+    fn changed_rows_are_shown_only_after_a_write() {
+        for write in [
+            "insert into t",
+            "UPDATE t",
+            " Delete from t",
+            "merge into t",
+            "replace t",
+        ] {
+            assert_eq!(changed(write, 2), "(2 rows changed)\n", "{write}");
+        }
+        assert_eq!(
+            changed("with x as (select 1) delete from t", 0),
+            "(0 rows changed)\n"
+        );
+        for other in [
+            "create table t (a int)",
+            "-- c\ninsert into t",
+            "(insert)",
+            "",
+            "set x = 1",
+        ] {
+            assert_eq!(changed(other, 0), "ok\n", "{other}");
+        }
+    }
+
+    #[test]
+    fn table_summary_replaces_the_row_count() {
+        let mut out = String::new();
+        let mut write = |text: String| -> Result<(), Error> {
+            out += &text;
+            Ok(())
+        };
+        TablePages::new(&[])
+            .finish(Some("ok\n".to_owned()), &mut write)
+            .unwrap();
+        assert_eq!(out, "ok\n");
     }
 
     #[test]

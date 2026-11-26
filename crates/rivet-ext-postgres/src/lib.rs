@@ -12,6 +12,7 @@
 //! | Transport | If the request has a transport, the protocol runs over it and the driver opens no socket. |
 //! | Types | See the table on [`PostgresDriver`]. |
 //! | Rows | Read in batches of [`BATCH_ROWS`] rows, only as fast as the [`ResultSet`] is read. |
+//! | Changed rows | A statement without result columns is read to its end inside `execute`; the result has `rows_affected` from `CommandComplete`. `execute` stays cancellable during that wait. |
 //!
 //! # Cancel and drop
 //!
@@ -32,10 +33,11 @@
 mod transport;
 mod types;
 
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -524,19 +526,31 @@ impl Connection for PostgresConnection {
                 .simple_query_raw(&statement)
                 .await
                 .map_err(map_error)?;
-            let batches = Batches {
+            let no_columns = columns.is_empty();
+            let mut batches = Batches {
                 rows: Box::pin(rows),
                 schema: Arc::new(Schema::new(fields)),
                 type_names: columns.iter().map(|c| c.source_type.clone()).collect(),
                 builders,
                 count: 0,
+                rows_affected: None,
                 running: Some(Running {
                     _busy: busy,
                     cancel: self.cancel.clone(),
                     tunnel: self.tunnel.clone(),
                 }),
             };
-            ResultSet::new(Arc::clone(&batches.schema), columns, Box::pin(batches))
+            // A statement without columns is read to its end here, for its count.
+            // `batches` holds `Running`: a dropped future still sends the cancel.
+            if no_columns {
+                poll_fn(|cx| batches.poll_end(cx)).await?;
+            }
+            let rows_affected = batches.rows_affected;
+            let result = ResultSet::new(Arc::clone(&batches.schema), columns, Box::pin(batches))?;
+            Ok(match rows_affected {
+                Some(rows) => result.with_rows_affected(rows),
+                None => result,
+            })
         })
     }
 
@@ -578,6 +592,8 @@ struct Batches {
     builders: Vec<ColumnBuilder>,
     /// The rows in the builders.
     count: usize,
+    /// The count of `CommandComplete`, set only by [`Batches::poll_end`].
+    rows_affected: Option<u64>,
     /// `None` when the statement has ended.
     running: Option<Running>,
 }
@@ -595,6 +611,28 @@ impl Batches {
         RecordBatch::try_new_with_options(Arc::clone(&self.schema), columns, &options).map_err(
             |error| Error::internal("the driver made a wrong record batch").with_source(error),
         )
+    }
+
+    /// Reads a statement without result columns until it ends, and keeps its
+    /// count. Stops early, with no count, at a `RowDescription`: a row result
+    /// with zero columns (`select;`) is then read as batches.
+    fn poll_end(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        while self.running.is_some() {
+            match ready!(self.rows.as_mut().poll_next(cx)) {
+                Some(Ok(SimpleQueryMessage::RowDescription(_))) => return Poll::Ready(Ok(())),
+                Some(Ok(SimpleQueryMessage::CommandComplete(rows))) => {
+                    self.rows_affected = Some(rows);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    // The statement failed: it has ended.
+                    self.running = None;
+                    return Poll::Ready(Err(map_error(error)));
+                }
+                None => self.running = None,
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn append(&mut self, row: &tokio_postgres::SimpleQueryRow) -> Result<()> {
