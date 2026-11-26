@@ -43,6 +43,8 @@ enum Plan {
 struct Seen {
     /// `true` after `Connection::execute` was called.
     executed: AtomicBool,
+    /// How often `Connection::execute` was called.
+    executions: AtomicUsize,
     /// How many batches the driver made.
     produced: AtomicUsize,
     /// `true` after the driver result set was dropped.
@@ -95,6 +97,7 @@ impl Stream for FakeBatches {
 impl Connection for FakeConnection {
     fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>> {
         self.seen.executed.store(true, Ordering::SeqCst);
+        self.seen.executions.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if let Plan::Refuse = self.plan {
                 return Err(Error::user(format!("syntax error in `{statement}`")));
@@ -154,7 +157,7 @@ async fn a_slow_reader_slows_the_driver() {
     const TOTAL: i64 = 50;
     let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
     let (connection, seen) = connection(Plan::Batches(TOTAL));
-    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
 
     let mut result = result.await.unwrap();
     assert_eq!(result.schema().field(0).name(), "n");
@@ -177,7 +180,7 @@ async fn a_slow_reader_slows_the_driver() {
 async fn cancel_calls_the_driver_and_ends_the_result() {
     let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
     let (connection, seen) = connection(Plan::Endless);
-    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
     let mut result = result.await.unwrap();
     next(&mut result).await.unwrap().unwrap();
     idle().await;
@@ -205,7 +208,7 @@ async fn cancel_calls_the_driver_and_ends_the_result() {
 async fn to_drop_the_result_stops_the_statement() {
     let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
     let (connection, seen) = connection(Plan::Endless);
-    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
     let mut result = result.await.unwrap();
     next(&mut result).await.unwrap().unwrap();
     idle().await;
@@ -224,7 +227,7 @@ async fn to_drop_the_result_stops_the_statement() {
 async fn a_driver_error_keeps_its_category_and_message() {
     let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
     let (connection, _) = connection(Plan::FailAfterTwo);
-    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
     let mut result = result.await.unwrap();
     assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 0);
     assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 1);
@@ -245,7 +248,7 @@ async fn a_driver_error_keeps_its_category_and_message() {
 async fn a_refused_statement_keeps_its_category_and_message() {
     let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
     let (connection, _) = connection(Plan::Refuse);
-    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
     let message = format!("syntax error in `{STATEMENT}`");
     let error = result.await.unwrap_err();
     assert_eq!(error.category(), ErrorCategory::User);
@@ -308,7 +311,8 @@ async fn no_log_event_contains_the_statement() {
         Plan::Endless,
     ] {
         let (connection, _) = connection(plan);
-        let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+        let (job, result, _) =
+            execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
         if let Ok(mut result) = result.await {
             next(&mut result).await.unwrap().unwrap();
             if let Plan::Endless = plan {
@@ -354,7 +358,7 @@ async fn the_guard_denies_a_write_on_a_read_only_profile() {
     let (connection, seen) = connection(Plan::Batches(1));
     let profile = profile(true, false);
     // `confirmed` does not change a deny.
-    let Err(error) = execute_guarded(
+    let Ok(Guarded::Denied { error, connection }) = execute_guarded(
         &scheduler,
         owner(),
         &profile,
@@ -367,6 +371,11 @@ async fn the_guard_denies_a_write_on_a_read_only_profile() {
     assert_eq!(error.category(), ErrorCategory::Policy);
     assert!(!seen.executed.load(Ordering::SeqCst));
     assert!(scheduler.jobs().is_empty());
+    // The connection comes back and runs the next statement (decision on #27).
+    let (job, result, _) = execute(&scheduler, owner(), connection, "select 1".to_owned()).unwrap();
+    drop(result.await.unwrap());
+    job.join().await.unwrap();
+    assert!(seen.executed.load(Ordering::SeqCst));
 
     let text = format!("{error} {error:?} {}", capture.text());
     for part in ["secret_table", "hunter2", "delete"] {
@@ -400,7 +409,7 @@ async fn the_guard_asks_to_confirm_a_write_then_runs_it() {
     assert!(!capture.text().contains("secret_table"));
 
     let guarded = execute_guarded(&scheduler, owner(), &profile, connection, statement, true);
-    let Ok(Guarded::Started(job, result)) = guarded else {
+    let Ok(Guarded::Started(job, result, _)) = guarded else {
         panic!("expected Started");
     };
     let mut result = result.await.unwrap();
@@ -425,7 +434,7 @@ async fn the_guard_allows_a_read_and_the_job_runs_as_before() {
         STATEMENT.to_owned(),
         false,
     );
-    let Ok(Guarded::Started(job, result)) = guarded else {
+    let Ok(Guarded::Started(job, result, _)) = guarded else {
         panic!("expected Started");
     };
     let mut result = result.await.unwrap();
@@ -438,4 +447,64 @@ async fn the_guard_allows_a_read_and_the_job_runs_as_before() {
     let error = job.join().await.unwrap_err();
     assert_eq!(error.category(), ErrorCategory::Cancelled);
     assert!(seen.cancelled_while_running.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_job_hands_the_connection_back_for_a_second_statement() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Batches(1));
+    let (job, result, back) =
+        execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let mut result = result.await.unwrap();
+    assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 0);
+    assert!(next(&mut result).await.is_none());
+    job.join().await.unwrap();
+
+    let connection = back.await.expect("the connection comes back");
+    let (job, result, back) =
+        execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    // The fake made its one batch in the first statement.
+    assert!(next(&mut result.await.unwrap()).await.is_none());
+    job.join().await.unwrap();
+    assert_eq!(seen.executions.load(Ordering::SeqCst), 2);
+    assert!(back.await.is_some());
+    assert!(
+        scheduler
+            .jobs()
+            .iter()
+            .all(|job| job.state == JobState::Succeeded)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_connection_comes_back_after_an_error_and_a_cancel() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    for plan in [Plan::Refuse, Plan::FailAfterTwo, Plan::Endless] {
+        let (connection, _) = connection(plan);
+        let (job, result, back) =
+            execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+        if let Ok(mut result) = result.await {
+            next(&mut result).await.unwrap().unwrap();
+            if let Plan::Endless = plan {
+                job.cancel();
+            }
+            while let Some(Ok(_)) = next(&mut result).await {}
+        }
+        assert!(job.join().await.is_err());
+        assert!(back.await.is_some());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_cancelled_in_the_queue_drops_the_connection() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (running, _) = connection(Plan::Endless);
+    let (first, _result, _) = execute(&scheduler, owner(), running, STATEMENT.to_owned()).unwrap();
+    let (queued, seen) = connection(Plan::Batches(1));
+    let (job, _result, back) = execute(&scheduler, owner(), queued, STATEMENT.to_owned()).unwrap();
+    idle().await;
+    job.cancel();
+    assert!(back.await.is_none());
+    assert!(!seen.executed.load(Ordering::SeqCst));
+    first.cancel();
 }

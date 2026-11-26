@@ -28,14 +28,18 @@
 //! quits. At a terminal the prompt has line editing and a history file
 //! next to the user settings file. `\d` lists tables, `\?` the commands.
 //!
-//! Each statement passes the guard of the profile first
-//! (`rivet_core::guard`): `read_only` refuses a write, `confirm_on_write`
-//! asks at the prompt and refuses in a file or a pipe.
+//! Each statement runs as a job of `rivet_core::execute::execute_guarded`
+//! and passes the guard of the profile first (`rivet_core::guard`):
+//! `read_only` refuses a write, `confirm_on_write` asks at the prompt and
+//! refuses in a file or a pipe. The job hands the connection back, so a
+//! transaction or a `SET` stays for the next statement.
 
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
+use rivet_core::jobs::JobScheduler;
 use rivet_core::secrets::SecretStore;
 use rivet_core::settings::{Layer, Settings, user_settings_path};
 use rivet_ext_mysql::MysqlDriver;
@@ -129,25 +133,32 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let session = Session {
+    let mut session = Session {
         runtime: &runtime,
-        connection: connection.as_ref(),
+        // One statement runs at a time; the CLI lists no finished jobs.
+        scheduler: JobScheduler::new(NonZeroUsize::MIN, 0),
+        connection: Some(connection),
         profile: &profile,
         format,
     };
     let mut stdout = io::stdout().lock();
     let ok = if let Some(file) = file {
         repl(
-            &session,
+            &mut session,
             lines(io::BufReader::new(file)),
             &mut stdout,
             Mode::Script,
         )
     } else if io::stdin().is_terminal() {
         eprintln!("End a statement with `;`. Ctrl-C cancels it. `\\?` lists the commands.");
-        prompt(&session, &mut stdout)
+        prompt(&mut session, &mut stdout)
     } else {
-        repl(&session, lines(io::stdin().lock()), &mut stdout, Mode::Pipe)
+        repl(
+            &mut session,
+            lines(io::stdin().lock()),
+            &mut stdout,
+            Mode::Pipe,
+        )
     };
     if ok {
         ExitCode::SUCCESS

@@ -1,5 +1,6 @@
-//! The statement loop: reads statements, checks them with the guard, runs
-//! them and writes their results.
+//! The statement loop: reads statements, runs them through the guarded job
+//! path of `rivet_core::execute` and writes their results. One connection
+//! serves the whole session: each job hands it back when it ends.
 
 use std::future::poll_fn;
 use std::io::{BufRead, Write};
@@ -7,11 +8,13 @@ use std::path::PathBuf;
 use std::pin::pin;
 
 use futures_core::Stream;
-use rivet_core::guard::{Decision, decide};
+use rivet_core::Owner;
+use rivet_core::execute::{Guarded, HandBack, execute_guarded};
+use rivet_core::jobs::{JobHandle, JobScheduler};
 use rivet_core::settings::user_settings_path;
 use rivet_sdk::error::{Error, Result};
-use rivet_sdk::extension::Connection;
-use rivet_sdk::model::ConnectionProfile;
+use rivet_sdk::extension::{BoxFuture, Connection};
+use rivet_sdk::model::{ConnectionProfile, ResultSet};
 use rustyline::error::ReadlineError;
 
 use crate::output::{Format, TablePages, rows, start};
@@ -19,7 +22,10 @@ use crate::output::{Format, TablePages, rows, start};
 /// What the loop works with.
 pub struct Session<'a> {
     pub runtime: &'a tokio::runtime::Runtime,
-    pub connection: &'a dyn Connection,
+    /// Runs each statement as a job.
+    pub scheduler: JobScheduler,
+    /// `None` while a job holds it, and after it was closed.
+    pub connection: Option<Box<dyn Connection>>,
     /// Its `read_only` and `confirm_on_write` flags drive the guard.
     pub profile: &'a ConnectionProfile,
     pub format: Format,
@@ -69,7 +75,7 @@ pub fn lines(input: impl BufRead) -> impl FnMut(&str) -> Input {
 }
 
 /// The interactive prompt: line editing and a history file.
-pub fn prompt(session: &Session<'_>, output: &mut impl Write) -> bool {
+pub fn prompt(session: &mut Session<'_>, output: &mut impl Write) -> bool {
     let mut editor = match rustyline::DefaultEditor::new() {
         Ok(editor) => editor,
         Err(error) => {
@@ -124,7 +130,7 @@ pub fn prompt(session: &Session<'_>, output: &mut impl Write) -> bool {
 /// `output`; errors go to stderr. `next` gets the prompt to show.
 /// Returns `false` if a statement or the input failed.
 pub fn repl(
-    session: &Session<'_>,
+    session: &mut Session<'_>,
     mut next: impl FnMut(&str) -> Input,
     output: &mut impl Write,
     mode: Mode,
@@ -192,52 +198,87 @@ pub fn repl(
 /// The end of the confirmation prompt.
 const CONFIRM_SUFFIX: &str = "[y/N] ";
 
-/// Asks the guard of the profile, then runs `statement`. A write on a
+/// The owner of the jobs of the CLI.
+fn owner() -> Owner {
+    "rivet.cli".parse().expect("a valid extension id")
+}
+
+/// Runs `statement` through the guard of the profile. A write on a
 /// `confirm_on_write` profile needs a "y" at the prompt; other modes cannot
 /// confirm, so it fails there. Returns `false` if it was refused or failed.
 fn guarded(
-    session: &Session<'_>,
+    session: &mut Session<'_>,
     statement: &str,
     mode: Mode,
     next: &mut impl FnMut(&str) -> Input,
     output: &mut impl Write,
 ) -> bool {
+    let Some(connection) = session.connection.take() else {
+        eprintln!("error: the connection is closed; restart rivet");
+        return false;
+    };
+    let statement = statement.trim().trim_end_matches(';').to_owned();
     let profile = session.profile;
-    let check = |confirmed| {
-        decide(
-            profile.read_only,
-            profile.confirm_on_write,
+    // A job starts only inside the runtime.
+    let _runtime = session.runtime.enter();
+    let check = |connection, statement, confirmed| {
+        execute_guarded(
+            &session.scheduler,
+            owner(),
+            profile,
+            connection,
             statement,
             confirmed,
         )
     };
-    let decision = match check(false) {
-        Decision::NeedsConfirmation if mode == Mode::Prompt => {
+    let started = match check(connection, statement, false) {
+        Ok(Guarded::NeedsConfirmation {
+            connection,
+            statement,
+        }) if mode == Mode::Prompt => {
             let place = profile.environment.as_deref().unwrap_or("this connection");
             match next(&format!(
                 "This statement may write on {place}. Run it? {CONFIRM_SUFFIX}"
             )) {
-                Input::Line(answer) if matches!(answer.trim(), "y" | "Y" | "yes") => check(true),
+                Input::Line(answer) if matches!(answer.trim(), "y" | "Y" | "yes") => {
+                    check(connection, statement, true)
+                }
                 _ => {
+                    session.connection = Some(connection);
                     eprintln!("not run");
                     return true;
                 }
             }
         }
-        Decision::NeedsConfirmation => Decision::Deny(Error::policy(
-            "the profile flag `confirm_on_write` is set and this input cannot confirm a write; \
-             run it at the prompt",
-        )),
-        decision => decision,
+        Ok(Guarded::NeedsConfirmation { connection, .. }) => {
+            session.connection = Some(connection);
+            eprintln!(
+                "error: {}",
+                Error::policy(
+                    "the profile flag `confirm_on_write` is set and this input cannot confirm \
+                     a write; run it at the prompt",
+                )
+            );
+            return false;
+        }
+        started => started,
     };
-    match decision {
-        Decision::Allow => execute(session, statement, output),
-        Decision::Deny(error) => {
+    match started {
+        Ok(Guarded::Started(job, result, back)) => execute(session, &job, result, back, output),
+        Ok(Guarded::NeedsConfirmation { connection, .. }) => {
+            session.connection = Some(connection);
+            eprintln!("error: the statement was not confirmed");
+            false
+        }
+        Ok(Guarded::Denied { error, connection }) => {
+            session.connection = Some(connection);
             eprintln!("error: {error}");
             false
         }
-        Decision::NeedsConfirmation => {
-            eprintln!("error: the statement was not confirmed");
+        Err(error) => {
+            // The job did not start: the scheduler dropped the connection.
+            eprintln!("error: {error}");
+            eprintln!("error: the connection is closed; restart rivet");
             false
         }
     }
@@ -293,23 +334,36 @@ fn meta(command: &str) -> Result<String> {
     }
 }
 
-/// Runs one statement; Ctrl-C cancels it. Returns `false` if it failed.
-fn execute(session: &Session<'_>, statement: &str, output: &mut impl Write) -> bool {
-    let connection = session.connection;
-    let statement = statement.trim().trim_end_matches(';').to_owned();
-    let result = session.runtime.block_on(async {
-        let mut query = pin!(run(connection, statement, session.format, &mut *output));
-        tokio::select! {
-            result = &mut query => result,
-            _ = tokio::signal::ctrl_c() => {
-                // The query then ends with a `cancelled` error.
-                if let Err(error) = connection.cancel().await {
-                    eprintln!("error: cancel failed: {error}");
+/// Writes the result of a started job; Ctrl-C cancels the job. Takes the
+/// connection back when the job ends. Returns `false` if it failed.
+fn execute(
+    session: &mut Session<'_>,
+    job: &JobHandle<()>,
+    result: BoxFuture<'static, Result<ResultSet>>,
+    back: HandBack,
+    output: &mut impl Write,
+) -> bool {
+    let format = session.format;
+    let (result, connection) = session.runtime.block_on(async {
+        let result = {
+            let mut query = pin!(run(result, format, &mut *output));
+            tokio::select! {
+                result = &mut query => result,
+                _ = tokio::signal::ctrl_c() => {
+                    // The job cancels the statement in the database; the
+                    // result then ends with a `cancelled` error.
+                    job.cancel();
+                    query.await
                 }
-                query.await
             }
-        }
+        };
+        // The result is read or dropped, so the job ends.
+        (result, back.await)
     });
+    if connection.is_none() {
+        eprintln!("error: the connection was closed; restart rivet");
+    }
+    session.connection = connection;
     match result {
         Ok(()) => true,
         Err(error) => {
@@ -319,16 +373,15 @@ fn execute(session: &Session<'_>, statement: &str, output: &mut impl Write) -> b
     }
 }
 
-/// Runs one statement and writes its result to `output`. CSV and JSON
+/// Waits for the result of one statement and writes it to `output`. CSV and JSON
 /// are written batch by batch, so memory stays flat and output starts at
 /// once. A failed write (for example a closed pipe) stops the statement.
 async fn run(
-    connection: &dyn Connection,
-    statement: String,
+    result: BoxFuture<'static, Result<ResultSet>>,
     format: Format,
     output: &mut impl Write,
 ) -> Result<()> {
-    let result = connection.execute(statement).await?;
+    let result = result.await?;
     let header: Vec<String> = result
         .schema()
         .fields()
@@ -359,6 +412,112 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use rivet_sdk::model::{ColumnMetadata, Endpoint, ProviderRef};
+
+    /// A connection whose statements return no rows. Counts the statements.
+    struct Counting(Arc<AtomicUsize>);
+
+    struct NoRows;
+
+    impl Stream for NoRows {
+        type Item = Result<RecordBatch>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    impl Connection for Counting {
+        fn execute(&self, _: String) -> BoxFuture<'_, Result<ResultSet>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+            let columns = vec![ColumnMetadata::new("bigint", false)];
+            Box::pin(async move { ResultSet::new(schema, columns, Box::pin(NoRows)) })
+        }
+
+        fn cancel(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Runs `input` in `mode` on a profile with the given flags. Returns
+    /// the result of the loop, how many statements reached the driver, and
+    /// whether the session still has its connection.
+    fn session(input: &str, mode: Mode, read_only: bool, confirm: bool) -> (bool, usize, bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let profile = ConnectionProfile::new(
+            ProviderRef::new("fake"),
+            Endpoint::new("localhost"),
+            ProviderRef::new("none"),
+        )
+        .with_read_only(read_only)
+        .with_confirm_on_write(confirm);
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut session = Session {
+            runtime: &runtime,
+            scheduler: JobScheduler::new(std::num::NonZeroUsize::MIN, 0),
+            connection: Some(Box::new(Counting(executed.clone()))),
+            profile: &profile,
+            format: Format::Csv,
+        };
+        let ok = repl(&mut session, lines(input.as_bytes()), &mut Vec::new(), mode);
+        let kept = session.connection.is_some();
+        (ok, executed.load(Ordering::SeqCst), kept)
+    }
+
+    #[test]
+    fn one_connection_serves_every_statement() {
+        assert_eq!(
+            session(
+                "select 1;\nselect 2;\nselect 3;\n",
+                Mode::Pipe,
+                false,
+                false
+            ),
+            (true, 3, true)
+        );
+    }
+
+    #[test]
+    fn a_write_waits_for_a_yes_at_the_prompt() {
+        let write = "delete from t;\n";
+        assert_eq!(
+            session(&format!("{write}y\nselect 1;\n"), Mode::Prompt, false, true),
+            (true, 2, true)
+        );
+        // "not run" keeps the connection for the next statement.
+        assert_eq!(
+            session(&format!("{write}n\nselect 1;\n"), Mode::Prompt, false, true),
+            (true, 1, true)
+        );
+    }
+
+    #[test]
+    fn a_write_that_needs_a_confirmation_is_refused_in_a_pipe() {
+        assert_eq!(
+            session("delete from t;\nselect 1;\n", Mode::Pipe, false, true),
+            (false, 1, true)
+        );
+    }
+
+    #[test]
+    fn a_write_on_a_read_only_profile_is_refused() {
+        // The connection is kept (decision on #27): the select after it runs.
+        assert_eq!(
+            session("delete from t;\nselect 1;\n", Mode::Pipe, true, false),
+            (false, 1, true)
+        );
+    }
 
     #[test]
     fn meta_lists_and_describes_tables() {
