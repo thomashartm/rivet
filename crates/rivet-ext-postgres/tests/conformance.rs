@@ -83,3 +83,50 @@ async fn bytea_reads_with_a_role_default_of_escape() {
         .unwrap();
     assert_eq!(bytes.value(0), [0u8, 1, 255]);
 }
+
+/// A statement without result columns waits inside `execute` for its end.
+/// `cancel` stops that wait with `cancelled`, and a dropped `execute` future
+/// stops the statement too. Each time the connection runs the next statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_a_statement_without_columns_stays_cancellable() {
+    use std::time::Duration;
+
+    use rivet_sdk::error::ErrorCategory;
+    use rivet_sdk::extension::{ConnectRequest, Connection, Credential, Credentials, Driver};
+    use rivet_sdk::secret::Secret;
+
+    const SLOW: &str = "do $$ begin perform pg_sleep(30); end $$";
+    const LIMIT: Duration = Duration::from_secs(10);
+    if !database::containers_enabled() {
+        return;
+    }
+    let fixture = database::postgres();
+    fixture.ensure_reachable().await.unwrap();
+    let credential = Credential::Password(Secret::from(fixture.password.expose().to_owned()));
+    let credentials = Credentials::new(credential).with_user(fixture.user.clone());
+    let connection = PostgresDriver
+        .connect(ConnectRequest::new(fixture.profile.clone(), credentials))
+        .await
+        .unwrap();
+    async fn ping(connection: &dyn Connection) {
+        let result = tokio::time::timeout(LIMIT, connection.execute("select 1".to_owned()));
+        assert!(result.await.unwrap().unwrap().rows_affected().is_none());
+    }
+
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        connection.cancel().await.unwrap();
+    };
+    let both = async { tokio::join!(connection.execute(SLOW.to_owned()), cancel) };
+    let (outcome, ()) = tokio::time::timeout(LIMIT, both).await.unwrap();
+    assert_eq!(outcome.unwrap_err().category(), ErrorCategory::Cancelled);
+    ping(&*connection).await;
+
+    // The future is dropped after 300 ms: the cancel request goes in the background.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        connection.execute(SLOW.to_owned()),
+    );
+    assert!(dropped.await.is_err());
+    ping(&*connection).await;
+}

@@ -36,6 +36,8 @@ enum Plan {
     FailAfterTwo,
     /// `execute` fails with a `user` error.
     Refuse,
+    /// Returns no batches and this count of changed rows.
+    Changed(u64),
 }
 
 /// What the fake connection saw. The test reads it.
@@ -78,6 +80,7 @@ impl Stream for FakeBatches {
         let number = self.seen.produced.load(Ordering::SeqCst) as i64;
         let next = match self.plan {
             Plan::Batches(total) if number >= total => return Poll::Ready(None),
+            Plan::Changed(_) => return Poll::Ready(None),
             Plan::FailAfterTwo if number >= 2 => {
                 let message = format!("bad row in `{STATEMENT}`");
                 return Poll::Ready(Some(Err(Error::database(message))));
@@ -109,7 +112,11 @@ impl Connection for FakeConnection {
                 schema: schema.clone(),
             };
             let columns = vec![ColumnMetadata::new("bigint", false)];
-            ResultSet::new(schema, columns, Box::pin(batches))
+            let result = ResultSet::new(schema, columns, Box::pin(batches))?;
+            Ok(match self.plan {
+                Plan::Changed(rows) => result.with_rows_affected(rows),
+                _ => result,
+            })
         })
     }
 
@@ -161,6 +168,7 @@ async fn a_slow_reader_slows_the_driver() {
 
     let mut result = result.await.unwrap();
     assert_eq!(result.schema().field(0).name(), "n");
+    assert_eq!(result.rows_affected(), None);
     for read in 0..TOTAL {
         idle().await;
         // The buffer is full and the job holds one more batch.
@@ -174,6 +182,17 @@ async fn a_slow_reader_slows_the_driver() {
 
     job.join().await.unwrap();
     assert_eq!(scheduler.jobs()[0].state, JobState::Succeeded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_count_of_changed_rows_reaches_the_result() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, _) = connection(Plan::Changed(2));
+    let (job, result, _) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let mut result = result.await.unwrap();
+    assert_eq!(result.rows_affected(), Some(2));
+    assert!(next(&mut result).await.is_none());
+    job.join().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

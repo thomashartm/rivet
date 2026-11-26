@@ -10,6 +10,7 @@
 //! | Drop of a result set, the kill fails | For example when the server refuses the second connection. The socket is closed without a read of the rest of the result, at most [`CLOSE_TIMEOUT`] later, and the lock is freed. The next `execute` gives a `connectivity` error. The server stops the statement when it next writes to the closed socket: a statement that sends no rows (for example a long `count(*)`) runs to its end. |
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
+//! | Changed rows | A statement without a result set gives `rows_affected` of its OK packet. `client_found_rows` is off (the default): an `update` counts only the rows whose values change. |
 //! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295, for example `LOCK TABLES`) is run as it is: the server had parsed it as one statement. |
 //! | TLS | On if `tls.enabled` (the default): rustls, the server certificate and the host name of the endpoint are verified, also for the `KILL QUERY` connection. The trust store is the system store, or only the `tls.ca_certificate` file; the built-in Mozilla roots of `mysql_async` are off. A server without TLS is refused. |
 //! | Client certificate | A [`Credential::ClientCertificate`] is shown in the TLS handshake, also of the `KILL QUERY` connection; it replaces the password. With TLS off it is refused with `user`. A `tls.client_certificate` in the profile is refused with `user`: the host resolves its key and passes the credential. |
@@ -301,22 +302,24 @@ impl Connection for MysqlConnection {
                 }
                 Err(error) => Err(error),
             };
-            let columns = match single {
+            // The count is read before the query result is dropped.
+            let answer = match single {
                 Ok(()) => conn
                     .query_iter(statement)
                     .await
-                    .map(|result| result.columns()),
+                    .map(|result| (result.columns(), result.affected_rows())),
                 Err(error) => Err(error),
             };
             lease.querying = false;
-            let columns = match columns {
-                Ok(Some(columns)) if !columns.is_empty() => columns,
+            let columns = match answer {
+                Ok((Some(columns), _)) if !columns.is_empty() => columns,
                 // No result set, for example `create table`, or an error.
                 other => {
                     self.busy.store(false, Ordering::SeqCst);
-                    other.map_err(error)?;
+                    let (_, rows_affected) = other.map_err(error)?;
                     let empty: RecordBatchStream = Box::pin(futures_util::stream::empty());
-                    return ResultSet::new(Arc::new(Schema::empty()), Vec::new(), empty);
+                    let result = ResultSet::new(Arc::new(Schema::empty()), Vec::new(), empty)?;
+                    return Ok(result.with_rows_affected(rows_affected));
                 }
             };
             let (mut fields, mut metadata, mut kinds) = (Vec::new(), Vec::new(), Vec::new());

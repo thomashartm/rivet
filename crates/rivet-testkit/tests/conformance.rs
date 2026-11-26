@@ -28,6 +28,7 @@ struct Flaws {
     ignore_cancel: bool,
     sql_error_is_database_error: bool,
     wrong_quote: bool,
+    no_count: bool,
 }
 
 struct FakeDriver(Flaws);
@@ -83,6 +84,10 @@ fn fake_sql() -> Sql {
         endless: "endless".to_owned(),
         slow: "slow".to_owned(),
         syntax_error: "garbage".to_owned(),
+        count_setup: vec!["setup".to_owned()],
+        count_insert: "insert".to_owned(),
+        count_update: "update".to_owned(),
+        count_select: "ping".to_owned(),
         ..Sql::postgres()
     }
 }
@@ -203,7 +208,9 @@ impl FakeConnection {
 impl Connection for FakeConnection {
     fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>> {
         Box::pin(async move {
-            let known = ["ping", "setup", "types", "empty", "endless", "slow"];
+            let known = [
+                "ping", "setup", "types", "empty", "endless", "slow", "insert", "update",
+            ];
             if !known.contains(&statement.as_str()) {
                 let message = format!(
                     "syntax error in `{statement}` with password {}",
@@ -239,6 +246,12 @@ impl Connection for FakeConnection {
                 "ping" => {
                     let mut batch = Some(ints(&schema, vec![1]));
                     self.result(schema, columns, move || batch.take())
+                }
+                "insert" | "update" if !self.flaws.no_count => {
+                    let empty = Arc::new(Schema::empty());
+                    Ok(self
+                        .result(empty, Vec::new(), || None)?
+                        .with_rows_affected(2))
                 }
                 _ => self.result(schema, columns, || None),
             }
@@ -345,4 +358,13 @@ async fn a_wrong_identifier_quote_fails() {
         ..Flaws::default()
     };
     assert_fails_case(&failure(flaws).await, "reports_dialect");
+}
+
+#[tokio::test]
+async fn a_write_without_a_count_fails() {
+    let flaws = Flaws {
+        no_count: true,
+        ..Flaws::default()
+    };
+    assert_fails_case(&failure(flaws).await, "counts_changed_rows");
 }

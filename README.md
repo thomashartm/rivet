@@ -116,6 +116,7 @@ Run every command from the repository root: rivet reads `./.env` there.
 - A pipe goes on after an error and ends with exit code 1.
 - CSV and JSON stream. Memory stays flat. `| head` stops the query.
 - The table format holds the whole result in memory.
+- After `insert`, `update`, `delete`, `merge`, `replace` or `with`: `(n rows changed)`. After another statement without result rows, for example `create table`: `ok`. CSV and JSON print this line to stderr.
 
 ## Credential management
 

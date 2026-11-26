@@ -234,7 +234,11 @@ async fn stream_rows(
         rows.schema().clone(),
         rows.columns().to_vec(),
         Box::pin(batches),
-    );
+    )
+    .map(|result| match rows.rows_affected() {
+        Some(changed) => result.with_rows_affected(changed),
+        None => result,
+    });
     let failed = result.as_ref().err().map(same);
     if ready.send(result).is_err() {
         return Err(dropped());

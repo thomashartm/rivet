@@ -487,6 +487,7 @@ pub struct ResultSet {
     schema: SchemaRef,
     columns: Vec<ColumnMetadata>,
     batches: RecordBatchStream,
+    rows_affected: Option<u64>,
 }
 
 impl ResultSet {
@@ -509,7 +510,23 @@ impl ResultSet {
             schema,
             columns,
             batches,
+            rows_affected: None,
         })
+    }
+
+    /// Sets the number of rows that the statement changed, as the engine
+    /// reports it. A driver sets it only for a statement with no result
+    /// columns, after the statement has ended.
+    #[must_use]
+    pub fn with_rows_affected(mut self, rows: u64) -> Self {
+        self.rows_affected = Some(rows);
+        self
+    }
+
+    /// Returns the number of rows that the statement changed. `None` if the
+    /// statement returns rows or the driver has no count; `None` is not 0.
+    pub fn rows_affected(&self) -> Option<u64> {
+        self.rows_affected
     }
 
     /// Returns the Arrow schema of every batch.
@@ -536,6 +553,7 @@ impl fmt::Debug for ResultSet {
         f.debug_struct("ResultSet")
             .field("schema", &self.schema)
             .field("columns", &self.columns)
+            .field("rows_affected", &self.rows_affected)
             .finish_non_exhaustive()
     }
 }
@@ -800,6 +818,20 @@ mod tests {
         let one_column = columns().into_iter().take(1).collect();
         let error = ResultSet::new(schema(), one_column, Box::pin(stream)).unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Internal);
+    }
+
+    #[test]
+    fn result_set_carries_the_count_of_changed_rows() {
+        let empty = || -> RecordBatchStream { Box::pin(FixedStream(Default::default())) };
+        let rows = ResultSet::new(Arc::new(Schema::empty()), Vec::new(), empty()).unwrap();
+        assert_eq!(rows.rows_affected(), None);
+        assert!(format!("{rows:?}").contains("rows_affected: None"));
+
+        let changed = ResultSet::new(Arc::new(Schema::empty()), Vec::new(), empty())
+            .unwrap()
+            .with_rows_affected(2);
+        assert_eq!(changed.rows_affected(), Some(2));
+        assert!(format!("{changed:?}").contains("rows_affected: Some(2)"));
     }
 
     #[test]

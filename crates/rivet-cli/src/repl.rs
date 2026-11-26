@@ -17,7 +17,7 @@ use rivet_sdk::extension::{BoxFuture, Connection};
 use rivet_sdk::model::{ConnectionProfile, ResultSet};
 use rustyline::error::ReadlineError;
 
-use crate::output::{Format, TablePages, rows, start};
+use crate::output::{Format, TablePages, changed, rows, start};
 
 /// What the loop works with.
 pub struct Session<'a> {
@@ -256,6 +256,7 @@ fn guarded(
         return false;
     };
     let statement = statement.trim().trim_end_matches(';').to_owned();
+    let text = statement.clone();
     let profile = &session.profile;
     // A job starts only inside the runtime.
     let _runtime = session.runtime.enter();
@@ -302,7 +303,9 @@ fn guarded(
         started => started,
     };
     match started {
-        Ok(Guarded::Started(job, result, back)) => execute(session, &job, result, back, output),
+        Ok(Guarded::Started(job, result, back)) => {
+            execute(session, &job, result, back, &text, output)
+        }
         Ok(Guarded::NeedsConfirmation { connection, .. }) => {
             session.connection = Some(connection);
             eprintln!("error: the statement was not confirmed");
@@ -392,12 +395,13 @@ fn execute(
     job: &JobHandle<()>,
     result: BoxFuture<'static, Result<ResultSet>>,
     back: HandBack,
+    statement: &str,
     output: &mut impl Write,
 ) -> bool {
     let format = session.format;
     let (result, connection) = session.runtime.block_on(async {
         let result = {
-            let mut query = pin!(run(result, format, &mut *output));
+            let mut query = pin!(run(result, format, statement, &mut *output));
             tokio::select! {
                 result = &mut query => result,
                 _ = tokio::signal::ctrl_c() => {
@@ -424,15 +428,19 @@ fn execute(
     }
 }
 
-/// Waits for the result of one statement and writes it to `output`. CSV and JSON
+/// Waits for the result of `statement` and writes it to `output`. CSV and JSON
 /// are written batch by batch, so memory stays flat and output starts at
 /// once. A failed write (for example a closed pipe) stops the statement.
+/// The line of a count of changed rows goes to the table, or to stderr for
+/// CSV and JSON, so their output stays only data.
 async fn run(
     result: BoxFuture<'static, Result<ResultSet>>,
     format: Format,
+    statement: &str,
     output: &mut impl Write,
 ) -> Result<()> {
     let result = result.await?;
+    let summary = result.rows_affected().map(|rows| changed(statement, rows));
     let header: Vec<String> = result
         .schema()
         .fields()
@@ -451,11 +459,14 @@ async fn run(
         while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
             pages.push(&batch?, &mut write)?;
         }
-        return pages.finish(&mut write);
+        return pages.finish(summary, &mut write);
     }
     write(start(format, &header))?;
     while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
         write(rows(format, &header, &batch?))?;
+    }
+    if let Some(line) = summary {
+        eprint!("{line}");
     }
     Ok(())
 }
@@ -498,6 +509,20 @@ mod tests {
         }
     }
 
+    /// A connection whose statements have no columns and change 2 rows.
+    struct Changing;
+
+    impl Connection for Changing {
+        fn execute(&self, _: String) -> BoxFuture<'_, Result<ResultSet>> {
+            let result = ResultSet::new(Arc::new(Schema::empty()), Vec::new(), Box::pin(NoRows));
+            Box::pin(async move { Ok(result?.with_rows_affected(2)) })
+        }
+
+        fn cancel(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Runs `input` in `mode` on a profile with the given flags. Returns
     /// the result of the loop, how many statements reached the driver, and
     /// whether the session still has its connection.
@@ -514,6 +539,31 @@ mod tests {
         confirm: bool,
         switched: &Arc<AtomicUsize>,
     ) -> (bool, usize, bool) {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let connection = Box::new(Counting(executed.clone()));
+        let (ok, kept, _) = drive(
+            input,
+            mode,
+            read_only,
+            confirm,
+            switched,
+            connection,
+            Format::Csv,
+        );
+        (ok, executed.load(Ordering::SeqCst), kept)
+    }
+
+    /// As `run`, on `connection` with `format`. Returns the result of the
+    /// loop, whether the session still has its connection, and the output.
+    fn drive(
+        input: &str,
+        mode: Mode,
+        read_only: bool,
+        confirm: bool,
+        switched: &Arc<AtomicUsize>,
+        connection: Box<dyn Connection>,
+        format: Format,
+    ) -> (bool, bool, String) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -533,18 +583,42 @@ mod tests {
             }
             Ok((Box::new(Counting(switched.clone())), profile(database)))
         };
-        let executed = Arc::new(AtomicUsize::new(0));
         let mut session = Session {
             runtime: &runtime,
             scheduler: JobScheduler::new(std::num::NonZeroUsize::MIN, 0),
-            connection: Some(Box::new(Counting(executed.clone()))),
+            connection: Some(connection),
             profile: profile("first"),
-            format: Format::Csv,
+            format,
             switch: &switch,
         };
-        let ok = repl(&mut session, lines(input.as_bytes()), &mut Vec::new(), mode);
+        let mut output = Vec::new();
+        let ok = repl(&mut session, lines(input.as_bytes()), &mut output, mode);
         let kept = session.connection.is_some();
-        (ok, executed.load(Ordering::SeqCst), kept)
+        (ok, kept, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn a_count_of_changed_rows_is_in_the_table_and_not_in_csv_or_json() {
+        let changing = |format| {
+            let input = "update t set a = 1;\ncreate table u (a int);\n";
+            let switched = Arc::default();
+            drive(
+                input,
+                Mode::Pipe,
+                false,
+                false,
+                &switched,
+                Box::new(Changing),
+                format,
+            )
+        };
+        assert_eq!(
+            changing(Format::Table),
+            (true, true, "(2 rows changed)\nok\n".to_owned())
+        );
+        // A result with no columns: CSV has its empty header line, as before.
+        assert_eq!(changing(Format::Csv), (true, true, "\n\n".to_owned()));
+        assert_eq!(changing(Format::Json), (true, true, String::new()));
     }
 
     #[test]
