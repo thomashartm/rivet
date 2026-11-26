@@ -6,8 +6,9 @@
 //!
 //! | Topic | Behaviour |
 //! | --- | --- |
-//! | Login | The user and the password come from the [`Credentials`] of the request. Other credentials are refused with `auth`. |
-//! | TLS | On if `tls.enabled` (the default): rustls, TLS 1.2 or 1.3, the server certificate and the host name of the endpoint are verified. The trust store is the system store, or only the `tls.ca_certificate` file. The cancel request uses TLS too. A server without TLS is refused. A `tls.client_certificate` is refused with `user` (not supported yet). |
+//! | Login | The user comes from the [`Credentials`] of the request, with a password or a client certificate credential. Other credentials are refused with `auth`. |
+//! | TLS | On if `tls.enabled` (the default): rustls, TLS 1.2 or 1.3, the server certificate and the host name of the endpoint are verified. The trust store is the system store, or only the `tls.ca_certificate` file. The cancel request uses TLS too. A server without TLS is refused. |
+//! | Client certificate | A [`Credential::ClientCertificate`] is shown in the TLS handshake of the login and of the cancel request; it replaces the password. With TLS off it is refused with `user`. A `tls.client_certificate` in the profile is refused with `user`: the host resolves its key and passes the credential. |
 //! | Transport | If the request has a transport, the protocol runs over it and the driver opens no socket. |
 //! | Types | See the table on [`PostgresDriver`]. |
 //! | Rows | Read in batches of [`BATCH_ROWS`] rows, only as fast as the [`ResultSet`] is read. |
@@ -45,8 +46,9 @@ use rivet_sdk::extension::{
     BoxFuture, ConnectRequest, Connection, Credential, Credentials, Dialect, Driver,
 };
 use rivet_sdk::model::{ColumnMetadata, ConnectionProfile, ResultSet};
-use rustls::pki_types::CertificateDer;
+use rivet_sdk::secret::Secret;
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -109,7 +111,7 @@ async fn connect(request: ConnectRequest) -> Result<Box<dyn Connection>> {
         transport,
         ..
     } = request;
-    let tls = tls(&profile)?;
+    let tls = tls(&profile, &credentials.credential)?;
     let config = config(&profile, &credentials)?;
     let (client, target, tunnel) = match transport {
         Some(transport) => {
@@ -151,15 +153,23 @@ fn config(
         .user
         .as_deref()
         .ok_or_else(|| Error::auth("the credentials have no user; PostgreSQL needs one"))?;
-    let Credential::Password(password) = &credentials.credential else {
-        return Err(Error::auth(
-            "the PostgreSQL driver accepts only a password credential",
-        ));
-    };
     let mut config = tokio_postgres::Config::new();
+    match &credentials.credential {
+        Credential::Password(password) => {
+            config.password(password.expose());
+        }
+        // shortcut: a client certificate replaces the password; both together
+        // need an SDK decision (#19). Add the password here once it is made.
+        Credential::ClientCertificate { .. } => {}
+        _ => {
+            return Err(Error::auth(
+                "the PostgreSQL driver accepts only a password or a client certificate \
+                 credential",
+            ));
+        }
+    }
     config
         .user(user)
-        .password(password.expose())
         // `Require` with a verifying connector: no fallback to plaintext.
         .ssl_mode(if profile.tls.enabled {
             SslMode::Require
@@ -204,18 +214,30 @@ impl Tls {
     }
 }
 
-/// The TLS of `profile`, or `None` if the profile turns TLS off.
-fn tls(profile: &ConnectionProfile) -> Result<Option<Tls>> {
+/// The TLS of `profile`, or `None` if the profile turns TLS off. A
+/// client certificate `credential` is the identity of the client.
+fn tls(profile: &ConnectionProfile, credential: &Credential) -> Result<Option<Tls>> {
     let settings = &profile.tls;
+    let identity = match credential {
+        Credential::ClientCertificate {
+            certificate,
+            private_key,
+        } => Some((certificate, private_key)),
+        _ => None,
+    };
     if !settings.enabled {
+        if identity.is_some() {
+            return Err(Error::user(
+                "a client certificate needs TLS; the profile turns TLS off",
+            ));
+        }
         return Ok(None);
     }
-    // shortcut: no client certificate; its key is a secret URI that only the
-    // host can resolve. Add it when the connect request carries the key.
+    // Its key is a secret URI that only the host can resolve.
     if settings.client_certificate.is_some() {
         return Err(Error::user(
-            "the PostgreSQL driver does not support a TLS client certificate yet (ticket \
-             #19); remove `tls.client_certificate` from the profile",
+            "the PostgreSQL driver cannot read `tls.client_certificate`: the host resolves \
+             its key and passes a client certificate credential",
         ));
     }
     let mut roots = rustls::RootCertStore::empty();
@@ -262,12 +284,40 @@ fn tls(profile: &ConnectionProfile) -> Result<Option<Tls>> {
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| Error::internal("the TLS provider is not usable").with_source(error))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    let config = match identity {
+        Some((certificate, key)) => {
+            let (chain, key) = client_identity(certificate, key)?;
+            config.with_client_auth_cert(chain, key).map_err(|error| {
+                Error::user("the client certificate and its key are not usable").with_source(error)
+            })?
+        }
+        None => config.with_no_client_auth(),
+    };
     Ok(Some(Tls {
         connector: MakeRustlsConnect::new(config),
         host: profile.endpoint.host.clone(),
     }))
+}
+
+/// The certificate chain and the key of a client certificate credential,
+/// from PEM. An error names no part of the key.
+fn client_identity(
+    certificate: &str,
+    key: &Secret,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let chain = CertificateDer::pem_slice_iter(certificate.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| {
+            Error::user("the client certificate is not valid PEM").with_source(error)
+        })?;
+    if chain.is_empty() {
+        return Err(Error::user("the client certificate has no PEM certificate"));
+    }
+    // No source: a PEM error can quote a line of the key.
+    let key = PrivateKeyDer::from_pem_slice(key.expose().as_bytes())
+        .map_err(|_| Error::user("the key of the client certificate is not a PEM private key"))?;
+    Ok((chain, key))
 }
 
 /// Two handles of one socket. The cancel request consumes the first (also

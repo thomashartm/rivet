@@ -165,6 +165,53 @@ async fn client_certificate_is_refused_before_any_io() {
     assert!(error.message().contains("client certificate"), "{error}");
 }
 
+/// The text of a key that must appear in no error.
+const KEY: &str =
+    "-----BEGIN PRIVATE KEY-----\nkey-text-that-must-not-leak\n-----END PRIVATE KEY-----\n";
+
+#[tokio::test]
+async fn bad_client_certificate_is_refused_before_any_io() {
+    let certificate = "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
+    for (tls, certificate, says) in [
+        (false, certificate, "needs TLS"),
+        (true, "no PEM here", "no PEM certificate"),
+        (true, certificate, "not a PEM private key"),
+    ] {
+        let credential = Credential::ClientCertificate {
+            certificate: certificate.to_owned(),
+            private_key: Secret::from(KEY.to_owned()),
+        };
+        let (transport, used) = untouched();
+        let error = connect_over(
+            transport,
+            Credentials::new(credential).with_user("app"),
+            tls,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.category(), ErrorCategory::User, "{error:?}");
+        assert!(error.message().contains(says), "{error:?}");
+        assert!(!format!("{error:?}").contains("must-not-leak"), "{error:?}");
+        assert!(!used.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn client_certificate_login_has_no_password() {
+    let credential = Credential::ClientCertificate {
+        certificate: String::new(),
+        private_key: Secret::from(KEY.to_owned()),
+    };
+    let config = config(
+        &profile(true),
+        &Credentials::new(credential).with_user("app"),
+    )
+    .unwrap();
+    assert_eq!(config.get_password(), None);
+    assert_eq!(config.get_user(), Some("app"));
+}
+
 #[tokio::test]
 async fn unusable_ca_file_is_refused_before_any_io() {
     let dir = std::env::temp_dir().join(format!("rivet-pg-tls-{}", std::process::id()));

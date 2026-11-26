@@ -2195,6 +2195,7 @@ dependencies = [
  "rivet-sdk",
  "rivet-testkit",
  "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
 ]
 
