@@ -59,14 +59,14 @@ use rivet_core::settings::{Layer, Settings, user_settings_path};
 use rivet_ext_mysql::MysqlDriver;
 use rivet_ext_postgres::PostgresDriver;
 use rivet_sdk::error::{Error, Result};
-use rivet_sdk::extension::{ConnectRequest, Connection, Credential, Credentials, Driver};
+use rivet_sdk::extension::{ConnectRequest, Credential, Credentials, Driver};
 use rivet_sdk::model::{ClientCertificate, ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
 use rivet_sdk::secret::{Secret, SecretUri};
 use serde::Deserialize;
 use url::Url;
 
 use crate::output::Format;
-use crate::repl::{Mode, Session, lines, prompt, repl};
+use crate::repl::{Connected, Mode, Session, lines, prompt, repl};
 
 mod output;
 mod repl;
@@ -146,20 +146,30 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (connection, profile) = match runtime.block_on(connect(target.as_deref())) {
+    let connected =
+        find(target.as_deref()).and_then(|saved| Ok((runtime.block_on(open(&saved))?, saved)));
+    let ((connection, profile), saved) = match connected {
         Ok(connected) => connected,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let switch = |database: &str| {
+        let saved = SavedConnection {
+            url: with_database(&saved.url, database)?,
+            ..saved.clone()
+        };
+        runtime.block_on(open(&saved))
+    };
     let mut session = Session {
         runtime: &runtime,
         // One statement runs at a time; the CLI lists no finished jobs.
         scheduler: JobScheduler::new(NonZeroUsize::MIN, 0),
         connection: Some(connection),
-        profile: &profile,
+        profile,
         format,
+        switch: &switch,
     };
     let mut stdout = io::stdout().lock();
     let ok = if let Some(file) = file {
@@ -192,9 +202,8 @@ fn usage(problem: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Finds the address of `target`, connects and prints where to. Returns the
-/// connection and its profile.
-async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, ConnectionProfile)> {
+/// Finds the address and the flags of `target`.
+fn find(target: Option<&str>) -> Result<SavedConnection> {
     let dotenv = std::fs::read_to_string(".env").unwrap_or_default();
     let lookup = |key: &str| {
         std::env::var(key)
@@ -205,7 +214,7 @@ async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, Connectio
         url,
         ..SavedConnection::default()
     };
-    let saved = match target {
+    Ok(match target {
         Some(address) if address.contains("://") => from_url(address.to_owned()),
         Some(name) => match saved(&user_settings()?, name)? {
             Some(saved) => saved,
@@ -216,14 +225,19 @@ async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, Connectio
                 "no target and no {ADDRESS_KEY}; run docker/playground.sh or see --help"
             ))
         })?),
-    };
+    })
+}
+
+/// Connects to `saved` and prints where to. Returns the connection and its
+/// profile.
+async fn open(saved: &SavedConnection) -> Result<Connected> {
     let (mut request, driver) = parse(&saved.url)?;
     let client_certificate =
         resolve_secrets(&mut request, saved.password.as_deref(), &SecretStore::new()).await?;
     let profile = &mut request.profile;
     profile.read_only = saved.read_only;
     profile.confirm_on_write = saved.confirm_on_write;
-    profile.environment = saved.environment;
+    profile.environment.clone_from(&saved.environment);
     let profile = profile.clone();
     let flags: Vec<&str> = [
         profile.environment.as_deref(),
@@ -312,7 +326,7 @@ fn user_settings() -> Result<Settings> {
 }
 
 /// One `[connections.<name>]` table of the settings.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedConnection {
     /// The address, without a password (the settings check refuses one).
@@ -453,6 +467,18 @@ fn parse(address: &str) -> Result<(ConnectRequest, &'static dyn Driver)> {
     Ok((ConnectRequest::new(profile, credentials), driver))
 }
 
+/// `address` with the database `database`; the rest (user, password, TLS
+/// parameters) stays.
+fn with_database(address: &str, database: &str) -> Result<String> {
+    let mut url =
+        Url::parse(address).map_err(|error| Error::user(format!("bad address: {error}")))?;
+    url.path_segments_mut()
+        .map_err(|()| Error::user("the address cannot carry a database name"))?
+        .clear()
+        .push(database);
+    Ok(url.into())
+}
+
 /// The TLS settings from the query of the address: TLS is on unless
 /// `tls=off`; `tls_ca=<path>` trusts only that CA file; `tls_cert=<path>`
 /// and `tls_key=<secret URI>` (both or neither) are the client certificate.
@@ -558,6 +584,27 @@ mod tests {
             panic!("not a password");
         };
         assert_eq!(password.expose(), "p+w d");
+    }
+
+    #[test]
+    fn with_database_changes_only_the_database() {
+        let address = "postgres://me:p%40ss@db.local:5433/old?tls_ca=/ca.pem";
+        let changed = with_database(address, "my db/x").unwrap();
+        let (request, _) = parse(&changed).unwrap();
+        assert_eq!(
+            request.profile.endpoint.database.as_deref(),
+            Some("my db/x")
+        );
+        assert_eq!(request.profile.endpoint.host, "db.local");
+        assert_eq!(request.profile.endpoint.port, Some(5433));
+        assert_eq!(
+            request.profile.tls.ca_certificate.as_deref(),
+            Some(std::path::Path::new("/ca.pem"))
+        );
+        assert_eq!(request.credentials.user.as_deref(), Some("me"));
+        // No database in the address before: it gets one.
+        let added = with_database("mysql://me@db.local", "shop").unwrap();
+        assert_eq!(added, "mysql://me@db.local/shop");
     }
 
     #[test]
