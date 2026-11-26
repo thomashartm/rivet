@@ -1,0 +1,23 @@
+[package]
+name = "rivet-ext-mysql"
+description = "MySQL driver extension for rivet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array = { version = "60.2.0", default-features = false }
+arrow-schema = { version = "60.2.0", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
+# Pure-Rust compression backend: `minimal` links the C zlib. No TLS (#19).
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+rivet-sdk = { path = "../rivet-sdk" }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+rivet-testkit = { path = "../rivet-testkit" }
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "time"] }
