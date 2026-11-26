@@ -25,7 +25,7 @@ All rows are proposals of the architect. The rows marked "question" wait for the
 | Conformance suite | It is in `rivet-testkit` and takes a `&dyn Driver`, because the testkit MUST NOT depend on an extension crate. Each driver crate runs it in its own tests. |
 | Wire protocol (question) | Default: the crates `tokio-postgres` and `mysql_async` behind the contract. Reading of the architect: "native async" means a pure Rust async implementation, not own protocol code. |
 | New dependencies (question) | Default: permitted for the two driver crates only, default features off, TLS features off. Licences and the number of packages are not checked on this date. |
-| First type mapping (question) | Default: boolean, signed and unsigned integers, floats, text and binary are typed. Each other type is its text form in a `Utf8` column, with the type name of the database in the field metadata. |
+| First type mapping (question) | Default: boolean, signed and unsigned integers, floats, text and binary are typed, except MySQL `boolean` (`tinyint(1)`), which is `Int8` (`UInt8` if unsigned) with source type `tinyint(1)`, because it can hold values such as 2 or -1. Each other type is its text form in a `Utf8` column, with the type name of the database in the field metadata. |
 | Transport | If the request has a transport stream, the driver uses it and opens no socket. A driver that cannot do this refuses the request. It never connects directly in silence. |
 | TLS | A profile that asks for TLS is refused until #19. No plain text in silence. |
 
