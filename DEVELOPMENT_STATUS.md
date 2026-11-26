@@ -1,6 +1,6 @@
 # Development status
 
-Snapshot of 2026-11-26, written at the handover of the orchestrator session. Check `gh pr list` and `gh issue list` before you act on it: GitHub is the source of truth.
+Snapshot of 2026-11-26, written at the handover of the orchestrator session, updated after the merges of 2026-11-26. Check `gh pr list` and `gh issue list` before you act on it: GitHub is the source of truth.
 
 Same content on GitHub: Epic #14, comments
 [handover note](https://github.com/thomashartm/rivet/issues/14#issuecomment-7186087626),
@@ -14,8 +14,8 @@ Same content on GitHub: Epic #14, comments
 | Area | State |
 |---|---|
 | Epic 1 (core engine) | Code is on main. Review fixes continue (section 4). |
-| Epic 2 (first drivers, execution, guard) | Started. All of it is in draft pull requests (section 3). |
-| Records | ADR-0016 to ADR-0024 are Accepted (#193). ADR-0025 "First database drivers" is Proposed. |
+| Epic 2 (first drivers, execution, guard) | Started. #15 drivers, #20 guard slice 1, #27 slice 1 are on main. |
+| Records | ADR-0016 to ADR-0024 are Accepted (#193). ADR-0025 "First database drivers" records the MySQL `boolean` exception (#208); still Proposed. |
 | Open tickets with work | Label `in progress`: #4, #7, #9, #11, #12, #13, #15, #20, #27, #95 |
 | New tickets, not started | #191 Store permission grants on disk, #192 Uninstall an extension, #204 Memory and CPU limits for a native process, #205 MySQL through a tunnel |
 
@@ -35,26 +35,21 @@ Note: the local `main` checkout in `/Users/thomas/projects/rivet` is far behind 
 | #194 | Installer test close-out (67 install tests, production code identical) |
 | #195 | Driver conformance suite `rivet_testkit::conformance` (`run_all(&dyn Driver, &DatabaseFixture, &Sql)`, 8 cases) |
 | #196 | R-87: native child runs in its own process group (`rustix` feature `process`, unix only) |
+| #197 | Host slice 5: R-121 to R-126. 30 of 30 repeat runs of host/jobs/native tests passed. |
+| #198 | PostgreSQL driver. Plus: tunnel connection closes when an unfinished result is dropped; `bytea_output=hex` set at login; 30 s login limit, 10 s cancel limit. |
+| #199 | MySQL driver. Plus: a second statement in one call is refused via a prepare step; error 1295 falls back to a normal run. R1: a failed kill closes the connection within 1 s and frees the lock. |
+| #200 | #27 slice 1 |
+| #201 | #20 slice 1 |
+| #202 | WASM slice 5: R-114, R-115, R-116. Plus: the redactor also knows the cleaned form of a secret. |
+| #208 | MySQL `tinyint(1)` read as Int8 (maintainer decision 1.1). |
 
-All had green GitHub checks at merge.
+#187 to #196 had green GitHub checks. From #197 on, GitHub Actions did not run (billing block) and was turned off by the maintainer; local gate (fmt, clippy, all tests with containers, check-arch, cargo deny) was the proof.
 
 ---
 
 ## 3. Draft pull requests
 
-Delivered by agents. NOT rebased, NOT read, NOT gated by the orchestrator. The agents' reports are the only evidence.
-
-| PR | Branch / worktree | Content | Before merge |
-|---|---|---|---|
-| #197 | `fix/review-host-5` / `fix-review-host-5` | R-121, R-122, R-123, R-124 (major), R-125, R-126 | Rebase, read (concurrency), full gate with 30 host loops. Touches the same code as R-127 and R-128. |
-| #202 | `fix/review-wasm-5` / `fix-review-wasm-5` | R-114 (major), R-115, R-116 | The agent sent no final report: full gate. |
-| #200 | `feat/27-execute` / `feat-27-execute` | #27 slice 1: `rivet_core::execute::execute(...)` runs a statement as a job | Rebase, read, gate. Open decision: a dropped result ends the job as `Cancelled`. |
-| #201 | `feat/20-guard` / `feat-20-guard` | #20 slice 1: `rivet_core::guard::decide(...)`, 70 classifier cases | Rebase, read, gate. |
-| #198 | `feat/15-postgres` / `feat-15-postgres` | Crate `rivet-ext-postgres` on `tokio-postgres` 0.7.18, 32 new packages | Rebase, read, gate. Open work: with a transport, a dropped unfinished result must close the connection and the next `execute` must refuse with `connectivity`. |
-| #199 | `feat/15-mysql` / `feat-15-mysql` | Crate `rivet-ext-mysql` on `mysql_async` 0.37.1, 50 new packages | Rebase, read, gate. Open work: block more than one statement in one call (decision 83). Cannot run through a tunnel (accepted, #205). No connect timeout. |
-
-- #198 and #199 both change `crates/rivet-testkit/src/conformance.rs` (different lines): merge one, rebase the other.
-- The maintainer accepted the libraries and the new packages on 2026-11-26 (section 5): the merge block on the driver pull requests is lifted.
+None open.
 
 ---
 
@@ -66,12 +61,13 @@ The reviewer is a separate session (`rivet-e0`). Last pass: 15. Findings are R-n
 |---|---|---|
 | blocker | R-17 b | Maintainer accepted the limit (decision 75.1). Open: the architect records it (`ARCHITECTURE.md:219`), then report to the reviewer. |
 | major | R-109 rest, R-118 | Fixed in #189, under review |
-| major | R-114 | Draft #202 |
-| major | R-121, R-122, R-123, R-124 | Draft #197 |
+| major | R-114 | Fixed on main (#202), reviewer verdict pending |
+| major | R-121, R-122, R-123, R-124 | Fixed on main (#197), reviewer verdict pending |
 | major | R-127 (reload and automatic restart can run at the same moment: `host.rs` about 1464, 1853) | No fix started. Not verified by the orchestrator, not answered. |
 | major | R-128 (late crash report of the old instance hits the new one: `host.rs:1971`) | No fix started. Not verified by the orchestrator, not answered. |
 | minor | R-125, R-126 (in #197), R-115, R-116 (in #202), R-117 c, R-129, R-130 (records, for the architect), and the reviewer's older list | Wait (maintainer rule) |
 
+- minor (wait), new from the driver reviews: PostgreSQL panic on non-ASCII text from a broken server (`types.rs:72`, `lib.rs:189`); PostgreSQL drop outside a Tokio runtime does not cancel; MySQL VECTOR columns fail; MySQL cancel can race the next statement; MySQL 1295 fallback not checked on MariaDB; MySQL statement that sends no rows runs on after a failed kill (documented limit); 14 surviving mutations in permissions/secrets/logging tests (from the close-out agent, not yet analysed).
 - Not reviewed yet: #189, #190, #194, #195, #196, drafts.
 - The reviewer asks to check that ten record lines that say "accepted" / "Decision" each match a maintainer answer: 0017:39 :41, 0018:16, 0020:34 :40, 0021:40, 0023:45 :46 :52 :54. Not checked.
 
@@ -98,6 +94,8 @@ Decided by the maintainer on 2026-11-26:
 | 86.5 | Read-only in the database session itself comes later |
 | 87.1 | The "Amended by ADR-0024" lines in ADR-0003 / §6.6 are covered by the acceptance of the records |
 | 87.2 | "Workspace wins" is the rule; the signature condition stays open with #138 |
+| R2 of #199 (MySQL tinyint(1)) | 1.1: a number (Int8), recorded in ADR-0025 |
+| GitHub Actions | Off (maintainer, 2026-11-26); the maintainer turns it on again |
 
 The architect must write the decisions 75, 81 to 83, 86 and 87 into the records.
 
@@ -110,12 +108,11 @@ Still open:
 ## 6. Next work
 
 1. Verify R-127 and R-128, answer the reviewer.
-2. Gate and merge #197, #202, #200, #201.
-3. #27 slice 2: the execution path calls the guard (after #200 and #201).
-4. #198: tunnel rule for a dropped result. #199: block more than one statement in one call. Then gate and merge both.
-5. Config types open for new fields (decision 74): `non_exhaustive` with a constructor.
-6. Architect records as `docs/architecture-decisions-28`: the accepted limit of R-17 b; "on main" notes for #189, #190, #194, #195, #196, later #197; ADR-0025 equal to the driver code (wrong password = `auth`, type name in `ColumnMetadata::source_type`); R-130.
-7. Not started: #204, #205, #138 (signature check on load), R-78 a (extensions get the secret service), start-up call of `Installer::recover_all()` (it also stops on a directory read error although its doc says otherwise), test close-out of #7 and #9, #191, #192, #5, #95 parts 2 to 4.
+2. #27 slice 2: the execution path calls the guard.
+3. Config types open for new fields (decision 74): `non_exhaustive` with a constructor.
+4. Architect records as `docs/architecture-decisions-28`: the accepted limit of R-17 b; "on main" notes for #189, #190, #194, #195, #196, later #197; ADR-0025 equal to the driver code (wrong password = `auth`, type name in `ColumnMetadata::source_type`); R-130.
+5. Not started: #204, #205, #138 (signature check on load), R-78 a (extensions get the secret service), start-up call of `Installer::recover_all()` (it also stops on a directory read error although its doc says otherwise), test close-out of #7 and #9, #191, #192, #5, #95 parts 2 to 4.
+6. Reviewer: review #197 to #202 and #208.
 
 ---
 
@@ -139,3 +136,5 @@ Still open:
 | Test databases | `docker/compose.test.yml`, project `rivet-test`, running: PostgreSQL on 127.0.0.1:54329, MySQL. `RIVET_TEST_CONTAINERS=1` turns the container tests on. |
 | Gate | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`, `cargo xtask check-arch`, `cargo deny check`; repeat loops only for concurrency changes |
 | macOS | No `timeout` command: use `perl -e 'alarm 240; exec @ARGV' ...` |
+| Merged branches | Worktrees of the merged branches can be removed (not removed yet). |
+| `cargo-deny` | 0.22.1 installed locally |
