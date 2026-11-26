@@ -2038,6 +2038,7 @@ dependencies = [
  "arrow-schema",
  "futures-core",
  "percent-encoding",
+ "rivet-ext-mysql",
  "rivet-ext-postgres",
  "rivet-sdk",
  "tokio",
