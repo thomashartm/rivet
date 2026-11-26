@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/rivet-logo.jpg" alt="rivet logo: a smiling rivet holding a key and a database" width="300">
+  <img src="docs/assets/rivet-logo.jpg" alt="rivet logo: a smiling database with a rivet head and a keyhole" width="300">
 </p>
 
 # Rivet
