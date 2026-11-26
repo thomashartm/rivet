@@ -144,9 +144,10 @@ pub const DEFAULT_FUEL_PER_CALL: u64 = 1_000_000_000;
 
 /// The default of [`Limits::component_bytes`]: 4 MiB (ADR-0018).
 ///
-/// A debug build of the host compiles a component of this size for longer
-/// than the default call time limit (ADR-0018: 35 to 64 s), so that load
-/// fails.
+/// ADR-0018 gives 35 to 64 s for a debug build to compile a component of
+/// this size. That number was measured without the optimised compiler
+/// crates of the dev profile (root `Cargo.toml`); with them a generated
+/// component of 4 MiB compiled in about 1.5 s.
 pub const DEFAULT_COMPONENT_BYTES: usize = 4 << 20;
 
 /// The most core instances that one instance of a component can have.
@@ -171,6 +172,10 @@ pub const LOG_BYTES_PER_CALL: usize = 64 * 1024;
 
 /// Log or error text from a component is cut to this number of bytes.
 const MAX_GUEST_TEXT_BYTES: usize = 8 * 1024;
+
+/// A name of a component in an error message is cut to this number of
+/// bytes, the limit of `package.rs` for a key (ADR-0018).
+const MAX_SHOWN_NAME_BYTES: usize = 128;
 
 /// A path in an error text is cut to this number of bytes.
 const MAX_PATH_TEXT_BYTES: usize = 256;
@@ -391,26 +396,34 @@ fn guest_error(state: &State, action: &str, error: &types::Error) -> Error {
 
 /// Makes text from a component safe for a log line or an error message.
 ///
-/// 1. Secrets are redacted. This is before the cut, so the cut cannot leave
-///    a part of a secret that the redacting log writer does not find.
+/// 1. Secrets are redacted. This finds a secret with a character that step 2
+///    changes, for example a TAB.
 /// 2. Each character that can start a line or hide text becomes a space
 ///    ([`is_unsafe`]), and `"` becomes `'`. The human log format writes a host
 ///    field as `name="value"`, so the text cannot imitate one.
-/// 3. The text is cut to [`MAX_GUEST_TEXT_BYTES`].
+/// 3. Secrets are redacted again: step 2 maps several characters to one, so
+///    it can make a secret, for example a TAB that becomes a space. The
+///    redactor also knows the cleaned form of each secret ([`guest_char`]),
+///    so a secret with a TAB that the guest writes with a space is found.
+/// 4. The text is cut to [`MAX_GUEST_TEXT_BYTES`]. This is after the
+///    redaction, so the cut cannot leave a part of a secret: it can only
+///    cut a marker.
 pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
-    let mut text: String = redactor
-        .redact(text)
-        .chars()
-        .map(|c| match c {
-            '"' => '\'',
-            c if is_unsafe(c) => ' ',
-            c => c,
-        })
-        .collect();
+    let cleaned: String = redactor.redact(text).chars().map(guest_char).collect();
+    let mut text = redactor.redact(&cleaned).into_owned();
     // Not `logging::shown`: no escape and no mark, so the result has the
     // limit as its true maximum, and step 2 replaced the unsafe characters.
     text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
     text
+}
+
+/// Step 2 of [`guest_text`] for one character.
+pub(crate) fn guest_char(c: char) -> char {
+    match c {
+        '"' => '\'',
+        c if is_unsafe(c) => ' ',
+        c => c,
+    }
 }
 
 /// The reason that Wasmtime gives for a component that it refuses or for a
@@ -630,10 +643,15 @@ impl WasmRuntime {
                         .imports(&engine)
                         .find(|(name, _)| name.starts_with("wasi:"))
                     {
-                        Some((name, _)) => format!(
-                            "the WASM component imports `{}`, but the host gives no WASI interface",
-                            guest_text(&redactor, name)
-                        ),
+                        Some((name, _)) => {
+                            // The message is also the reason of the state
+                            // (ADR-0018); the source has the full name.
+                            let name = guest_text(&redactor, name);
+                            let (start, mark) = crate::logging::cut(&name, MAX_SHOWN_NAME_BYTES);
+                            format!(
+                                "the WASM component imports `{start}{mark}`, but the host gives no WASI interface"
+                            )
+                        }
                         None => {
                             "the WASM component does not fit the world `rivet:extension`".to_owned()
                         }
@@ -2006,13 +2024,17 @@ mod tests {
         let gave_up = std::time::Instant::now();
         // The limit of the host ends the call first, because the runtime
         // rounds its limit up. If a tick comes in the first millisecond
-        // after the limit, the error of the runtime can be first: the two
-        // texts have "time limit". The text of the host is checked with a
+        // after the limit, the error of the runtime can be first: either
+        // text is correct. The text of the host is checked with a
         // paused clock in `a_call_that_exceeds_the_time_limit_fails_the_extension`
         // (`host.rs`).
         let error = &report.not_activated[&id("acme.spin")];
         assert_eq!(error.category(), ErrorCategory::Internal, "{error}");
-        assert!(error.message().contains("time limit"), "{error}");
+        let texts = [
+            "extension `acme.spin` exceeded the time limit of 300ms in `activate`",
+            "extension `acme.spin`: activate failed: the call time limit was exceeded",
+        ];
+        assert!(texts.contains(&error.message()), "{error}");
         assert_eq!(hosted.state("acme.spin"), Some(ExtensionState::Failed));
 
         // The overshoot of the module documentation: two ticks, plus the
@@ -2044,6 +2066,8 @@ mod tests {
             fuel_per_call: u64::MAX,
             ..Limits::for_host(&config)
         };
+        // R-116c: the limits are equal, not only both set.
+        assert_eq!(limits.call_timeout, config.call_timeout);
         let runtime = Arc::new(runtime_with(limits, &Redactor::new()));
         let hosted = hosted_with(runtime, config);
         let endless = guest("", "(loop $l (br $l)) unreachable");
@@ -2256,6 +2280,115 @@ mod tests {
         assert!(reason.contains("wasi:[REDACTED]/x@0.2.6"), "{reason}");
         for text in all_text(&report.not_activated[&id("acme.import")]) {
             assert!(!text.contains("hunter2"), "{text}");
+        }
+    }
+
+    /// A redactor with secrets that have a space, a `'` and a TAB: the
+    /// characters that [`guest_text`] changes or makes.
+    fn cleaning_redactor() -> Redactor {
+        let redactor = Redactor::new();
+        for secret in [
+            "correct horse battery",
+            "it's-a-secret-pass",
+            "tab\tin-secret",
+        ] {
+            redactor.register(&Secret::from(secret.to_owned()));
+        }
+        redactor
+    }
+
+    /// The parts of the secrets of [`cleaning_redactor`] that no output may
+    /// contain.
+    const CLEANING_SECRET_PARTS: [&str; 3] = ["horse", "a-secret", "in-secret"];
+
+    #[test]
+    fn a_secret_that_the_cleaning_makes_or_changes_is_redacted() {
+        // R-114: the guest writes a TAB for a space and `"` for `'`, or the
+        // secret has a TAB.
+        let redactor = cleaning_redactor();
+        let cases = [
+            "a correct\thorse\u{1b}battery b",
+            "a it\"s-a-secret-pass b",
+            "a tab\tin-secret b",
+            // The cleaned form of a secret with a TAB, written by the guest.
+            "a tab in-secret b",
+        ];
+        for case in cases {
+            let text = guest_text(&redactor, case);
+            assert_eq!(text, "a [REDACTED] b", "{case:?}");
+        }
+        let path = format!("{}/correct\thorse battery/x.wasm", "d".repeat(300));
+        let text = path_text(&redactor, Path::new(&path));
+        assert!(text.ends_with("/[REDACTED]/x.wasm"), "{text}");
+    }
+
+    #[test]
+    fn guest_text_is_cut_to_8_kib_after_the_redaction() {
+        // R-115a: the number is from ADR-0018, not from the constant.
+        let redactor = Redactor::new();
+        redactor.register(&Secret::from("hunter2-value".to_owned()));
+        assert_eq!(guest_text(&redactor, &"a".repeat(9000)), "a".repeat(8192));
+        // The cut is in the marker, not in the secret.
+        let text = guest_text(&redactor, &("a".repeat(8185) + "hunter2-value"));
+        assert_eq!(text, "a".repeat(8185) + "[REDACT");
+        // The cut is not inside a character.
+        let text = guest_text(&redactor, &("a".repeat(8191) + "é"));
+        assert_eq!(text, "a".repeat(8191));
+    }
+
+    #[tokio::test]
+    async fn a_wasi_import_name_in_a_load_message_is_cut_to_128_bytes() {
+        // R-115d, ADR-0018: the message is also the reason of the state; the
+        // source keeps the full cleaned text.
+        let name = format!("wasi:{}/x@0.2.6", "a".repeat(300));
+        let import = format!(r#"(import "{name}" (instance (export "f" (func))))"#);
+        let error = runtime()
+            .load(guest_with(&import, "", "(i32.const 0)"))
+            .await
+            .err()
+            .unwrap();
+        let shown = format!("wasi:{}…", "a".repeat(123));
+        assert_eq!(
+            error.message(),
+            format!("the WASM component imports `{shown}`, but the host gives no WASI interface")
+        );
+        let source = all_text(&error)[2].clone();
+        assert!(source.contains(&format!("{name}`")), "{source}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_returned_error_or_an_import_name_is_redacted() {
+        // R-114, R-115b: through a real error of a component.
+        let redactor = cleaning_redactor();
+        let runtime = runtime_with(SMALL, &redactor);
+        for message in [
+            "correct\thorse\tbattery",
+            "it\"s-a-secret-pass",
+            "tab\tin-secret",
+        ] {
+            let instance = instance(&runtime, refusing_guest(message), "acme.leaky").await;
+            let error = instance.activate().await.unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .ends_with("the component returned an error: [REDACTED]"),
+                "{error}"
+            );
+        }
+        let import = r#"(import "correct\thorse battery" (instance (export "f" (func))))"#;
+        let error = runtime
+            .load(guest_with(import, "", "(i32.const 0)"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            all_text(&error).concat().contains("[REDACTED]"),
+            "{error:?}"
+        );
+        for text in all_text(&error) {
+            for part in CLEANING_SECRET_PARTS {
+                assert!(!text.contains(part), "{part} in {text}");
+            }
         }
     }
 
