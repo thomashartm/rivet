@@ -20,15 +20,20 @@
 //! one stream only. Then:
 //!
 //! - [`Connection::cancel`] fails with `connectivity` and does nothing.
-//! - To drop an unfinished [`ResultSet`] does not stop the statement. It runs
-//!   to its end in the database; the driver discards its rows. The next
-//!   statement on the connection waits until then.
+//! - To drop an unfinished [`ResultSet`] closes the connection: the driver
+//!   drops the transport stream. The server ends the statement when it sees
+//!   the closed stream. Each later [`Connection::execute`] fails with
+//!   `connectivity`; the caller opens a new connection.
+//!
+//! Without a transport, to drop an unfinished [`ResultSet`] sends the cancel
+//! request, and the connection stays usable.
 
 mod transport;
 mod types;
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -42,6 +47,7 @@ use rivet_sdk::model::{ColumnMetadata, ConnectionProfile, ResultSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::task::AbortHandle;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage, SimpleQueryStream};
 
@@ -97,17 +103,22 @@ async fn connect(request: ConnectRequest) -> Result<Box<dyn Connection>> {
         ));
     }
     let config = config(&profile, &credentials)?;
-    let (client, target) = match transport {
-        Some(transport) => (start(&config, Transport::new(transport)).await?, None),
+    let (client, target, tunnel) = match transport {
+        Some(transport) => {
+            let (client, task) = start(&config, Transport::new(transport)).await?;
+            let tunnel = Tunnel {
+                task,
+                closed: Arc::new(AtomicBool::new(false)),
+            };
+            (client, None, Some(tunnel))
+        }
         None => {
             let target = (
                 profile.endpoint.host.clone(),
                 profile.endpoint.port.unwrap_or(DEFAULT_PORT),
             );
-            (
-                start(&config, open_socket(&target).await?).await?,
-                Some(target),
-            )
+            let (client, _) = start(&config, open_socket(&target).await?).await?;
+            (client, Some(target), None)
         }
     };
     let cancel = Canceller {
@@ -117,6 +128,7 @@ async fn connect(request: ConnectRequest) -> Result<Box<dyn Connection>> {
     Ok(Box::new(PostgresConnection {
         client,
         cancel,
+        tunnel,
         busy: Arc::new(Mutex::new(())),
     }))
 }
@@ -156,15 +168,16 @@ async fn open_socket((host, port): &(String, u16)) -> Result<TcpStream> {
 }
 
 /// Logs in over `stream` and starts the background task of the connection.
-async fn start<S>(config: &tokio_postgres::Config, stream: S) -> Result<Client>
+/// To abort the task drops `stream`.
+async fn start<S>(config: &tokio_postgres::Config, stream: S) -> Result<(Client, AbortHandle)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (client, connection) = config.connect_raw(stream, NoTls).await.map_err(map_error)?;
     // The task ends when the client is dropped or the stream fails. A failure
     // reaches the caller as a `closed` error of the next call.
-    tokio::spawn(connection);
-    Ok(client)
+    let task = tokio::spawn(connection).abort_handle();
+    Ok((client, task))
 }
 
 /// Returns the category of a PostgreSQL error code (SQLSTATE).
@@ -230,9 +243,27 @@ impl Canceller {
     }
 }
 
+/// The background task of a connection over a transport.
+#[derive(Clone)]
+struct Tunnel {
+    task: AbortHandle,
+    /// Set when a dropped result closed the connection.
+    closed: Arc<AtomicBool>,
+}
+
+impl Tunnel {
+    /// Closes the connection: aborting the task drops the transport stream.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.task.abort();
+    }
+}
+
 struct PostgresConnection {
     client: Client,
     cancel: Canceller,
+    /// `Some` if the connection runs over a transport.
+    tunnel: Option<Tunnel>,
     /// Held by the result of the running statement, until it ends or its
     /// cancel request is sent.
     busy: Arc<Mutex<()>>,
@@ -242,6 +273,17 @@ impl Connection for PostgresConnection {
     fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>> {
         Box::pin(async move {
             let busy = Arc::clone(&self.busy).lock_owned().await;
+            if self
+                .tunnel
+                .as_ref()
+                .is_some_and(|t| t.closed.load(Ordering::SeqCst))
+            {
+                return Err(Error::connectivity(
+                    "the connection is closed: a result over the tunnel transport stopped \
+                     before its statement ended, and PostgreSQL cannot cancel through a tunnel; \
+                     open a new connection",
+                ));
+            }
             // The extended protocol gives the column types; the simple protocol
             // gives each value as text and runs the statement.
             let prepared = self.client.prepare(&statement).await.map_err(map_error)?;
@@ -274,6 +316,7 @@ impl Connection for PostgresConnection {
                 running: Some(Running {
                     _busy: busy,
                     cancel: self.cancel.clone(),
+                    tunnel: self.tunnel.clone(),
                 }),
             };
             ResultSet::new(Arc::clone(&batches.schema), columns, Box::pin(batches))
@@ -289,14 +332,20 @@ impl Connection for PostgresConnection {
 struct Running {
     _busy: OwnedMutexGuard<()>,
     cancel: Canceller,
+    tunnel: Option<Tunnel>,
 }
 
 impl Running {
-    /// Stops the statement in the background and then frees the connection.
+    /// Stops the statement and then frees the connection. Over a transport
+    /// it closes the connection (see the crate doc); else it sends the
+    /// cancel request in the background.
     fn stop(self) {
+        if let Some(tunnel) = &self.tunnel {
+            tunnel.close();
+            return;
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                // Over a transport the statement runs to its end (see the crate doc).
                 let _ = self.cancel.send().await;
                 drop(self);
             });

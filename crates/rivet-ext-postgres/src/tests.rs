@@ -246,6 +246,79 @@ async fn connection_over_a_transport_maps_sql_errors_and_refuses_cancel() {
     drop(server.await.unwrap());
 }
 
+/// The answers of the server to one `execute` of `select 1 as n` whose
+/// rows never end: the prepare step, the close of the prepared statement and
+/// then [`BATCH_ROWS`] rows of the simple query, with no CommandComplete.
+async fn answer_endless_select(peer: &mut Peer) {
+    let mut columns = 1i16.to_be_bytes().to_vec();
+    columns.extend(b"n\0");
+    columns.extend(0i32.to_be_bytes()); // table
+    columns.extend(0i16.to_be_bytes()); // column number
+    columns.extend(23i32.to_be_bytes()); // int4
+    columns.extend(4i16.to_be_bytes()); // size
+    columns.extend((-1i32).to_be_bytes()); // modifier
+    columns.extend(0i16.to_be_bytes()); // text format
+    let mut prepared = false;
+    loop {
+        match peer.message().await.0 {
+            b'S' if !prepared => {
+                prepared = true;
+                peer.send(b'1', &[]).await; // ParseComplete
+                peer.send(b't', &0i16.to_be_bytes()).await; // ParameterDescription
+                peer.send(b'T', &columns).await; // RowDescription
+                peer.send(b'Z', b"I").await;
+            }
+            b'S' => {
+                peer.send(b'3', &[]).await; // CloseComplete
+                peer.send(b'Z', b"I").await;
+            }
+            b'Q' => break,
+            _ => {}
+        }
+    }
+    peer.send(b'T', &columns).await;
+    let mut row = 1i16.to_be_bytes().to_vec();
+    row.extend(1i32.to_be_bytes());
+    row.push(b'1');
+    for _ in 0..BATCH_ROWS {
+        peer.send(b'D', &row).await; // DataRow
+    }
+}
+
+#[tokio::test]
+async fn dropped_result_over_a_transport_closes_the_connection() {
+    let (transport, mut peer) = pipe();
+    let server = tokio::spawn(async move {
+        peer.accept_login().await;
+        answer_endless_select(&mut peer).await;
+        // The driver must close the stream: the read sees its end.
+        let mut rest = Vec::new();
+        peer.0.read_to_end(&mut rest).await.unwrap();
+    });
+    let connection = connect_over(transport, password(), false).await.unwrap();
+
+    let mut result = connection
+        .execute("select 1 as n".to_owned())
+        .await
+        .unwrap();
+    let next = std::future::poll_fn(|cx| Pin::new(&mut result).poll_next(cx));
+    let batch = tokio::time::timeout(LIMIT, next).await.unwrap();
+    assert_eq!(batch.unwrap().unwrap().num_rows(), BATCH_ROWS);
+    drop(result);
+    tokio::time::timeout(LIMIT, server)
+        .await
+        .expect("the driver closed the transport stream")
+        .unwrap();
+
+    let error = tokio::time::timeout(LIMIT, connection.execute("select 1".to_owned()))
+        .await
+        .expect("the closed connection answers at once")
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Connectivity, "{error}");
+    assert!(error.message().contains("closed"), "{error}");
+    assert!(error.message().contains("tunnel"), "{error}");
+}
+
 #[test]
 fn sqlstate_gives_the_category_of_the_driver_contract() {
     let cases = [
