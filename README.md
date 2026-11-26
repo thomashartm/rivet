@@ -20,6 +20,8 @@ sql> select * from customers;
 - Any other database: `cargo run -p rivet-cli -- postgres://user:password@host:port/database`.
 - Run a file: `cargo run -p rivet-cli -- pg -f script.sql`. It stops at the first error with exit code 1.
 - Ctrl-C cancels the running statement; at the prompt it clears the line. Arrow keys recall the history. `\q` or Ctrl-D quits.
+- `\d` lists the tables, `\d <table>` describes one, `\?` lists the commands.
+- `--format csv` or `--format json` (one object per row) for scripts: `rivet pg -f report.sql --format csv > report.csv`.
 
 ### Saved connections with a keychain password
 
@@ -31,6 +33,9 @@ schema_version = 1
 [connections.prod]
 url = "postgres://app@db.example.com:5432/app"   # no password here; it is refused
 password = "keychain://rivet/prod"
+environment = "prod"       # a label, shown when you connect
+read_only = true           # refuse writes
+# confirm_on_write = true  # ask y/N before a write; refused in a file or a pipe
 ```
 
 Store the password once (macOS): `security add-generic-password -s rivet -a prod -w`. Then: `rivet prod`. A name is looked up in the settings file first, then in `.env`.
