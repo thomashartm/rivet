@@ -9,7 +9,7 @@
 //! | Drop of a result set | `KILL QUERY` on a second connection, then the rest of the result is read and discarded. An endless result is not read to its end. |
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
-//! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295) is refused as well. |
+//! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295, for example `LOCK TABLES`) is run as it is: the server had parsed it as one statement. |
 //! | TLS | Not supported yet (#19): a profile with TLS on is refused. |
 //! | Tunnel transport | Not supported: `mysql_async` opens its own socket. A request with a transport is refused. |
 //!
@@ -45,6 +45,8 @@ mod code {
     pub const ACCESS_DENIED: u16 = 1045;
     /// `ER_HOST_NOT_PRIVILEGED`.
     pub const HOST_NOT_PRIVILEGED: u16 = 1130;
+    /// `ER_UNSUPPORTED_PS`: the statement cannot be prepared.
+    pub const UNSUPPORTED_PS: u16 = 1295;
     /// `ER_QUERY_INTERRUPTED`: `KILL QUERY` stopped the statement.
     pub const QUERY_INTERRUPTED: u16 = 1317;
     /// `ER_ACCESS_DENIED_NO_PASSWORD_ERROR`.
@@ -191,6 +193,11 @@ impl Connection for MysqlConnection {
             // is refused here, before anything runs.
             let single = match conn.prep(statement.as_str()).await {
                 Ok(prepared) => conn.close(prepared).await,
+                // The server parsed the text as one statement before it refused to prepare it
+                // (a text with two statements fails earlier, with 1064), so it may run.
+                Err(mysql_async::Error::Server(server)) if server.code == code::UNSUPPORTED_PS => {
+                    Ok(())
+                }
                 Err(error) => Err(error),
             };
             let columns = match single {

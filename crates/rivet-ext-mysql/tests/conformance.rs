@@ -75,4 +75,32 @@ async fn second_statement_in_one_call_is_refused() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(probe.category(), ErrorCategory::User, "{probe:?}");
+
+    // A statement that cannot be prepared runs; with a second statement it is refused.
+    connection
+        .execute(format!("create table {table} (a int)"))
+        .await
+        .unwrap();
+    connection
+        .execute(format!("lock tables {table} read"))
+        .await
+        .unwrap();
+    connection
+        .execute("unlock tables".to_owned())
+        .await
+        .unwrap();
+    let error = connection
+        .execute(format!("lock tables {table} read; drop table {table}"))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::User, "{error:?}");
+    connection
+        .execute(format!("select * from {table}"))
+        .await
+        .unwrap();
+    connection
+        .execute(format!("drop table {table}"))
+        .await
+        .unwrap();
 }
