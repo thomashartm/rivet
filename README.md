@@ -69,6 +69,7 @@ Run every command from the repository root: rivet reads `./.env` there.
 | nothing | TLS. The server certificate and the host name are checked against the system trust store. |
 | `?tls_ca=/path/ca.pem` | TLS. Only the CA in that file is trusted. |
 | `?tls=off` | Plain text. The connect line says `plaintext, no TLS`. The playground uses this. |
+| `?tls_cert=/path/client.pem&tls_key=keychain://rivet/<name>-key` | TLS with a client certificate: the PEM file and its PEM key from the secret URI. It replaces the password. The connect line says `TLS, client certificate`. |
 
 - Any other parameter in the address is refused.
 - A server without TLS is refused unless the address has `?tls=off`.
@@ -166,7 +167,8 @@ You can also edit these lines by hand.
 
 **Known limit**
 
-- No TLS client certificate yet: a profile with one is refused (#19).
+- A client certificate and a password together are refused (#19).
+- `rivet save` cannot save a connection with a client certificate yet: write its `[connections.<name>]` table by hand, with `tls_cert` and `tls_key` in `url` and no `password`.
 
 ## Licence
 

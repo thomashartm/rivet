@@ -11,10 +11,11 @@
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
 //! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295, for example `LOCK TABLES`) is run as it is: the server had parsed it as one statement. |
-//! | TLS | On if `tls.enabled` (the default): rustls, the server certificate and the host name of the endpoint are verified, also for the `KILL QUERY` connection. The trust store is the system store, or only the `tls.ca_certificate` file; the built-in Mozilla roots of `mysql_async` are off. A server without TLS is refused. A `tls.client_certificate` is refused with `user` (not supported yet). |
+//! | TLS | On if `tls.enabled` (the default): rustls, the server certificate and the host name of the endpoint are verified, also for the `KILL QUERY` connection. The trust store is the system store, or only the `tls.ca_certificate` file; the built-in Mozilla roots of `mysql_async` are off. A server without TLS is refused. |
+//! | Client certificate | A [`Credential::ClientCertificate`] is shown in the TLS handshake, also of the `KILL QUERY` connection; it replaces the password. With TLS off it is refused with `user`. A `tls.client_certificate` in the profile is refused with `user`: the host resolves its key and passes the credential. |
 //! | Tunnel transport | Not supported: `mysql_async` opens its own socket. A request with a transport is refused. |
 //!
-//! The password is in no error and no debug text of this crate.
+//! The password and the key are in no error and no debug text of this crate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,10 +24,15 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts, OptsBuilder, QueryResult, SslOpts, TextProtocol, Value};
+use mysql_async::{
+    ClientIdentity, Conn, Opts, OptsBuilder, QueryResult, SslOpts, TextProtocol, Value,
+};
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{BoxFuture, ConnectRequest, Connection, Credential, Dialect, Driver};
 use rivet_sdk::model::{ResultSet, TlsSettings};
+use rivet_sdk::secret::Secret;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 mod types;
@@ -98,16 +104,22 @@ fn opts(request: &ConnectRequest) -> Result<Opts> {
              its own socket. Remove the tunnels from the profile",
         ));
     }
-    let ssl = ssl_opts(&request.profile.tls)?;
     let credentials = &request.credentials;
+    let ssl = ssl_opts(&request.profile.tls, &credentials.credential)?;
     let user = credentials
         .user
         .clone()
         .ok_or_else(|| Error::user("the MySQL driver needs a user name in the credentials"))?;
-    let Credential::Password(password) = &credentials.credential else {
-        return Err(Error::user(
-            "the MySQL driver accepts only a password credential",
-        ));
+    let password = match &credentials.credential {
+        Credential::Password(password) => Some(password.expose().to_owned()),
+        // shortcut: a client certificate replaces the password; both together
+        // need an SDK decision (#19). Add the password here once it is made.
+        Credential::ClientCertificate { .. } => None,
+        _ => {
+            return Err(Error::user(
+                "the MySQL driver accepts only a password or a client certificate credential",
+            ));
+        }
     };
     let endpoint = &request.profile.endpoint;
     Ok(OptsBuilder::default()
@@ -115,24 +127,36 @@ fn opts(request: &ConnectRequest) -> Result<Opts> {
         .tcp_port(endpoint.port.unwrap_or(DEFAULT_PORT))
         .db_name(endpoint.database.clone())
         .user(Some(user))
-        .pass(Some(password.expose().to_owned()))
+        .pass(password)
         // Else the client switches to the Unix socket that the server names.
         .prefer_socket(false)
         .ssl_opts(ssl)
         .into())
 }
 
-/// The TLS options of `tls`, or `None` if the profile turns TLS off.
-fn ssl_opts(tls: &TlsSettings) -> Result<Option<SslOpts>> {
+/// The TLS options of `tls`, or `None` if the profile turns TLS off. A
+/// client certificate `credential` is the identity of the client.
+fn ssl_opts(tls: &TlsSettings, credential: &Credential) -> Result<Option<SslOpts>> {
+    let identity = match credential {
+        Credential::ClientCertificate {
+            certificate,
+            private_key,
+        } => Some((certificate, private_key)),
+        _ => None,
+    };
     if !tls.enabled {
+        if identity.is_some() {
+            return Err(Error::user(
+                "a client certificate needs TLS; the profile turns TLS off",
+            ));
+        }
         return Ok(None);
     }
-    // shortcut: no client certificate; its key is a secret URI that only the
-    // host can resolve. Add it when the connect request carries the key.
+    // Its key is a secret URI that only the host can resolve.
     if tls.client_certificate.is_some() {
         return Err(Error::user(
-            "the MySQL driver does not support a TLS client certificate yet (ticket #19); \
-             remove `tls.client_certificate` from the profile",
+            "the MySQL driver cannot read `tls.client_certificate`: the host resolves its key \
+             and passes a client certificate credential",
         ));
     }
     let roots: Vec<_> = match &tls.ca_certificate {
@@ -160,10 +184,36 @@ fn ssl_opts(tls: &TlsSettings) -> Result<Option<SslOpts>> {
              file of the server",
         ));
     }
+    let identity = match identity {
+        Some((certificate, key)) => Some(client_identity(certificate, key)?),
+        None => None,
+    };
     Ok(Some(
         SslOpts::default()
             .with_root_certs(roots)
-            .with_disable_built_in_roots(true),
+            .with_disable_built_in_roots(true)
+            .with_client_identity(identity),
+    ))
+}
+
+/// The identity of a client certificate credential. `mysql_async` parses
+/// the PEM only at connect; this check gives a `user` error before any I/O.
+/// An error names no part of the key.
+fn client_identity(certificate: &str, key: &Secret) -> Result<ClientIdentity> {
+    let chain = CertificateDer::pem_slice_iter(certificate.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| {
+            Error::user("the client certificate is not valid PEM").with_source(error)
+        })?;
+    if chain.is_empty() {
+        return Err(Error::user("the client certificate has no PEM certificate"));
+    }
+    // No source: a PEM error can quote a line of the key.
+    PrivateKeyDer::from_pem_slice(key.expose().as_bytes())
+        .map_err(|_| Error::user("the key of the client certificate is not a PEM private key"))?;
+    Ok(ClientIdentity::new(
+        certificate.as_bytes().to_vec().into(),
+        key.expose().as_bytes().to_vec().into(),
     ))
 }
 
@@ -524,6 +574,40 @@ mod tests {
         assert_no_connection(&listener).await;
     }
 
+    fn password() -> Credential {
+        Credential::Password(Secret::from(PASSWORD.to_owned()))
+    }
+
+    /// The text of a key that must appear in no error.
+    const KEY: &str =
+        "-----BEGIN PRIVATE KEY-----\nkey-text-that-must-not-leak\n-----END PRIVATE KEY-----\n";
+
+    fn client_certificate(certificate: &str) -> Credential {
+        Credential::ClientCertificate {
+            certificate: certificate.to_owned(),
+            private_key: Secret::from(KEY.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_client_certificate_is_refused_without_a_connection() {
+        let certificate = "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
+        for (tls, certificate, says) in [
+            (false, certificate, "needs TLS"),
+            (true, "no PEM here", "no PEM certificate"),
+            (true, certificate, "not a PEM private key"),
+        ] {
+            let (listener, port) = listener().await;
+            let mut request = request(port, tls);
+            request.credentials.credential = client_certificate(certificate);
+            let error = connect_error(request).await;
+            assert_eq!(error.category(), ErrorCategory::User, "{error:?}");
+            assert!(error.message().contains(says), "{error:?}");
+            assert!(!format!("{error:?}").contains("must-not-leak"), "{error:?}");
+            assert_no_connection(&listener).await;
+        }
+    }
+
     #[tokio::test]
     async fn missing_ca_file_is_refused_without_a_connection() {
         let (listener, port) = listener().await;
@@ -542,17 +626,20 @@ mod tests {
     #[test]
     fn tls_uses_only_the_chosen_roots() {
         assert!(
-            ssl_opts(&TlsSettings::new().with_enabled(false))
+            ssl_opts(&TlsSettings::new().with_enabled(false), &password())
                 .unwrap()
                 .is_none()
         );
-        let system = ssl_opts(&TlsSettings::new()).unwrap().unwrap();
+        let system = ssl_opts(&TlsSettings::new(), &password()).unwrap().unwrap();
         assert!(system.disable_built_in_roots());
         assert!(!system.root_certs().is_empty());
         assert!(!system.accept_invalid_certs() && !system.skip_domain_validation());
         let path = std::env::temp_dir().join(format!("rivet-mysql-ca-{}.pem", std::process::id()));
         std::fs::write(&path, "pinned").unwrap();
-        let pinned = ssl_opts(&TlsSettings::new().with_ca_certificate(path.clone()));
+        let pinned = ssl_opts(
+            &TlsSettings::new().with_ca_certificate(path.clone()),
+            &password(),
+        );
         std::fs::remove_file(&path).unwrap();
         let pinned = pinned.unwrap().unwrap();
         assert!(pinned.disable_built_in_roots());

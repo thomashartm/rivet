@@ -33,6 +33,7 @@
 //! | any other value | The container tests fail. |
 
 use rivet_sdk::error::{Error, Result};
+use rivet_sdk::extension::{Credential, Credentials};
 use rivet_sdk::model::{ConnectionProfile, Endpoint, ExtensionValue, ProviderRef, TlsSettings};
 use rivet_sdk::secret::Secret;
 use std::io::Write;
@@ -66,9 +67,34 @@ pub const TLS_HOST: &str = "localhost";
 
 /// The directory with the test TLS files that `docker/test-certs.sh`
 /// writes when the containers start: `ca.pem` (the CA of the TLS test
-/// servers) and `other-ca.pem` (a CA that signed nothing).
+/// servers), `other-ca.pem` (a CA that the servers do not trust), and the
+/// client certificates `client` and `other-client`.
 pub fn test_certs_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/test-certs")
+}
+
+/// The user of the TLS test servers that logs in only with the client
+/// certificate `client` (no password).
+pub const CERT_USER: &str = "rivet_cert";
+
+/// The credentials of [`CERT_USER`] with the client certificate `name` of
+/// [`test_certs_dir`]: `client` (signed by the CA that the TLS servers
+/// trust) or `other-client` (signed by `other-ca.pem`).
+///
+/// # Panics
+///
+/// If the files are not there: start the TLS containers first.
+pub fn client_certificate(name: &str) -> Credentials {
+    let read = |file: String| {
+        let path = test_certs_dir().join(file);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+    };
+    let credential = Credential::ClientCertificate {
+        certificate: read(format!("{name}.pem")),
+        private_key: Secret::from(read(format!("{name}.key"))),
+    };
+    Credentials::new(credential).with_user(CERT_USER)
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a PostgreSQL server must stay silent after its answer to the

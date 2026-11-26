@@ -19,6 +19,8 @@ futures-util = { version = "0.3.34", default-features = false }
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "ring", "rustls-tls", "tls12"] }
 rivet-sdk = { path = "../rivet-sdk" }
 rustls-native-certs = "0.8.5"
+# Checks the PEM of a client certificate before `mysql_async` connects.
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
 tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]

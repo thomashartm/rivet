@@ -16,6 +16,10 @@
 //!
 //! - `?tls=off`: plaintext. The connect line says `plaintext, no TLS`.
 //! - `?tls_ca=<path>`: trust only the CA in that PEM file.
+//! - `?tls_cert=<path>&tls_key=<secret URI>`: log in with the client
+//!   certificate (PEM chain) in that file and its PEM key from the secret
+//!   store, for example `keychain://rivet/prod-key`. It replaces the
+//!   password. The connect line says `TLS, client certificate`.
 //!
 //! Any other parameter is refused.
 //!
@@ -56,7 +60,7 @@ use rivet_ext_mysql::MysqlDriver;
 use rivet_ext_postgres::PostgresDriver;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{ConnectRequest, Connection, Credential, Credentials, Driver};
-use rivet_sdk::model::{ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
+use rivet_sdk::model::{ClientCertificate, ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
 use rivet_sdk::secret::{Secret, SecretUri};
 use serde::Deserialize;
 use url::Url;
@@ -78,6 +82,9 @@ usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format t
   no target   RIVET_DATABASE_URL from the environment or ./.env
   ?tls=off    in the address: plaintext; TLS with a verified certificate is the default
   ?tls_ca=<f> in the address: trust only the CA in the PEM file <f>
+  ?tls_cert=<f>&tls_key=<uri>
+              in the address: log in with the client certificate in the PEM
+              file <f> and its key from the secret URI <uri>; no password
   -f <file>   run the statements of <file>, stop at the first error
   --format    table (default), csv, or json (one object per row)
   save        ask for the password, check the connection, store the password in
@@ -211,12 +218,8 @@ async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, Connectio
         })?),
     };
     let (mut request, driver) = parse(&saved.url)?;
-    if let Some(uri) = &saved.password {
-        let secret = SecretStore::new()
-            .resolve(&uri.parse::<SecretUri>()?)
-            .await?;
-        request.credentials.credential = Credential::Password(secret);
-    }
+    let client_certificate =
+        resolve_secrets(&mut request, saved.password.as_deref(), &SecretStore::new()).await?;
     let profile = &mut request.profile;
     profile.read_only = saved.read_only;
     profile.confirm_on_write = saved.confirm_on_write;
@@ -246,13 +249,56 @@ async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, Connectio
     } else {
         format!(" [{}]", flags.join(", "))
     };
-    let tls = if profile.tls.enabled {
-        "TLS"
-    } else {
-        "plaintext, no TLS"
+    let tls = match (profile.tls.enabled, client_certificate) {
+        (true, true) => "TLS, client certificate",
+        (true, false) => "TLS",
+        (false, _) => "plaintext, no TLS",
     };
     eprintln!("connected to {shown}{flags} ({tls})");
     Ok((connection, profile))
+}
+
+/// Puts the secrets into the credentials of `request`: the `password`
+/// secret URI of a saved connection, or the client certificate of the
+/// profile (its PEM file and its key that `store` resolves). The drivers
+/// cannot resolve a secret URI, so the client certificate leaves the
+/// profile. Returns whether the request has a client certificate.
+async fn resolve_secrets(
+    request: &mut ConnectRequest,
+    password: Option<&str>,
+    store: &SecretStore,
+) -> Result<bool> {
+    let certificate = request.profile.tls.client_certificate.take();
+    let credential = match (password, &certificate) {
+        (Some(_), Some(_)) => return Err(no_password_with_certificate()),
+        (Some(uri), None) => Credential::Password(store.resolve(&uri.parse::<SecretUri>()?).await?),
+        (None, Some(certificate)) => {
+            let path = &certificate.certificate;
+            let text = std::fs::read_to_string(path).map_err(|error| {
+                Error::user(format!(
+                    "cannot read the client certificate file {}",
+                    path.display()
+                ))
+                .with_source(error)
+            })?;
+            Credential::ClientCertificate {
+                certificate: text,
+                private_key: store.resolve(&certificate.private_key).await?,
+            }
+        }
+        (None, None) => return Ok(false),
+    };
+    request.credentials.credential = credential;
+    Ok(certificate.is_some())
+}
+
+// shortcut: a client certificate replaces the password; both together need
+// an SDK decision (#19). Pass both once `Credentials` can carry them.
+fn no_password_with_certificate() -> Error {
+    Error::user(
+        "a client certificate replaces the password; remove the password or `tls_cert` and \
+         `tls_key`",
+    )
 }
 
 /// The user settings, or empty settings if the platform has no user
@@ -396,6 +442,9 @@ fn parse(address: &str) -> Result<(ConnectRequest, &'static dyn Driver)> {
         ProviderRef::new("password"),
     )
     .with_tls(tls(&url)?);
+    if url.password().is_some() && profile.tls.client_certificate.is_some() {
+        return Err(no_password_with_certificate());
+    }
     let password = Credential::Password(Secret::from(decode(url.password().unwrap_or(""))?));
     let mut credentials = Credentials::new(password);
     if !url.username().is_empty() {
@@ -405,19 +454,38 @@ fn parse(address: &str) -> Result<(ConnectRequest, &'static dyn Driver)> {
 }
 
 /// The TLS settings from the query of the address: TLS is on unless
-/// `tls=off`; `tls_ca=<path>` trusts only that CA file. Each other
-/// parameter is refused, so a typing error cannot turn TLS off silently.
+/// `tls=off`; `tls_ca=<path>` trusts only that CA file; `tls_cert=<path>`
+/// and `tls_key=<secret URI>` (both or neither) are the client certificate.
+/// Each other parameter is refused, so a typing error cannot turn TLS off
+/// silently.
 fn tls(url: &Url) -> Result<TlsSettings> {
     let mut tls = TlsSettings::new();
     let (mut seen_tls, mut seen_ca) = (false, false);
+    let (mut cert_file, mut key_uri) = (None, None);
     for (key, value) in url.query_pairs() {
         let seen = match key.as_ref() {
             "tls" => &mut seen_tls,
             "tls_ca" => &mut seen_ca,
+            "tls_cert" | "tls_key" => {
+                let slot = if key == "tls_cert" {
+                    &mut cert_file
+                } else {
+                    &mut key_uri
+                };
+                if value.is_empty() {
+                    return Err(Error::user(format!("`{key}` needs a value")));
+                }
+                if slot.replace(value.into_owned()).is_some() {
+                    return Err(Error::user(format!(
+                        "the address has the parameter `{key}` twice"
+                    )));
+                }
+                continue;
+            }
             _ => {
                 return Err(Error::user(format!(
-                    "the address has the unknown parameter `{key}`; rivet knows `tls=on|off` \
-                     and `tls_ca=<CA file>`"
+                    "the address has the unknown parameter `{key}`; rivet knows `tls=on|off`, \
+                     `tls_ca=<CA file>`, `tls_cert=<PEM file>` and `tls_key=<secret URI>`"
                 )));
             }
         };
@@ -442,6 +510,24 @@ fn tls(url: &Url) -> Result<TlsSettings> {
         return Err(Error::user(
             "the address has `tls=off` and `tls_ca`; remove one of them",
         ));
+    }
+    match (cert_file, key_uri) {
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Error::user(
+                "the address needs both `tls_cert` and `tls_key`, or neither",
+            ));
+        }
+        (Some(_), Some(_)) if !tls.enabled => {
+            return Err(Error::user(
+                "a client certificate needs TLS; remove `tls=off` or `tls_cert` and `tls_key`",
+            ));
+        }
+        (Some(file), Some(uri)) => {
+            // The key is never in the address, only its URI.
+            let uri = uri.parse::<SecretUri>()?;
+            tls = tls.with_client_certificate(ClientCertificate::new(file, uri));
+        }
     }
     Ok(tls)
 }
@@ -576,6 +662,114 @@ mod tests {
             assert_eq!(error.category(), rivet_sdk::error::ErrorCategory::User);
             assert!(error.message().contains(says), "{wrong}: {error}");
         }
+    }
+
+    #[test]
+    fn parse_reads_the_client_certificate_parameters() {
+        let (request, _) =
+            parse("postgres://app@h/d?tls_cert=%2Fc%20x.pem&tls_key=keychain%3A%2F%2Frivet%2Fk")
+                .unwrap();
+        let certificate = request.profile.tls.client_certificate.unwrap();
+        assert_eq!(certificate.certificate, std::path::Path::new("/c x.pem"));
+        assert_eq!(certificate.private_key.as_str(), "keychain://rivet/k");
+        let key_text = "-----BEGIN PRIVATE KEY-----MC4CAQAw";
+        for (wrong, says) in [
+            ("postgres://a@h/d?tls_cert=c.pem", "both"),
+            ("postgres://a@h/d?tls_key=keychain://rivet/k", "both"),
+            (
+                "mysql://a@h/d?tls=off&tls_cert=c.pem&tls_key=keychain://rivet/k",
+                "needs TLS",
+            ),
+            (
+                "postgres://a@h/d?tls_cert=c.pem&tls_cert=d.pem&tls_key=keychain://rivet/k",
+                "twice",
+            ),
+            (
+                "postgres://a@h/d?tls_cert=&tls_key=keychain://rivet/k",
+                "needs a value",
+            ),
+            (
+                "postgres://a:pw@h/d?tls_cert=c.pem&tls_key=keychain://rivet/k",
+                "replaces the password",
+            ),
+            (
+                &format!("postgres://a@h/d?tls_cert=c.pem&tls_key={key_text}"),
+                "secret URI",
+            ),
+            ("postgres://a@h/d?tls_crt=c.pem", "tls_cert=<PEM file>"),
+        ] {
+            let error = parse(wrong).err().unwrap();
+            assert_eq!(error.category(), rivet_sdk::error::ErrorCategory::User);
+            assert!(error.message().contains(says), "{wrong}: {error}");
+            assert!(!format!("{error:?}").contains("MC4CAQAw"), "{error:?}");
+        }
+    }
+
+    /// A secret backend with one fixed value.
+    struct Fixed;
+
+    impl rivet_core::secrets::SecretBackend for Fixed {
+        fn resolve<'a>(&'a self, path: &'a str) -> rivet_core::secrets::SecretFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(path, "client-key");
+                Ok(Secret::from("the key text".to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_secrets_moves_the_client_certificate_into_the_credentials() {
+        let store = SecretStore::new();
+        store
+            .register(
+                "acme.vault".parse().unwrap(),
+                "acme",
+                std::sync::Arc::new(Fixed),
+            )
+            .unwrap();
+        let file = std::env::temp_dir().join(format!("rivet-cli-cert-{}.pem", std::process::id()));
+        let address = format!(
+            "postgres://app@h/d?tls_cert={}&tls_key=acme://client-key",
+            file.display()
+        );
+        let request = || parse(&address).unwrap().0;
+
+        std::fs::write(&file, "the certificate").unwrap();
+        let mut with_certificate = request();
+        let resolved = resolve_secrets(&mut with_certificate, None, &store).await;
+        let with_password = resolve_secrets(&mut request(), Some("acme://p"), &store).await;
+        std::fs::remove_file(&file).unwrap();
+        assert!(resolved.unwrap(), "a client certificate is used");
+        assert!(with_certificate.profile.tls.client_certificate.is_none());
+        let Credential::ClientCertificate {
+            certificate,
+            private_key,
+        } = &with_certificate.credentials.credential
+        else {
+            panic!("not a client certificate");
+        };
+        assert_eq!(certificate, "the certificate");
+        assert_eq!(private_key.expose(), "the key text");
+        assert!(!format!("{:?}", with_certificate.credentials).contains("key text"));
+        let error = with_password.err().unwrap();
+        assert!(error.message().contains("replaces the password"), "{error}");
+
+        let missing = resolve_secrets(&mut request(), None, &store)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(missing.category(), rivet_sdk::error::ErrorCategory::User);
+        assert!(
+            missing.message().contains(&*file.to_string_lossy()),
+            "{missing}"
+        );
+
+        let mut plain = parse("postgres://app:pw@h/d").unwrap().0;
+        assert!(!resolve_secrets(&mut plain, None, &store).await.unwrap());
+        let Credential::Password(password) = &plain.credentials.credential else {
+            panic!("not a password");
+        };
+        assert_eq!(password.expose(), "pw");
     }
 
     #[test]

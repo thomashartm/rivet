@@ -15,6 +15,8 @@
 # - postgres-tls and mysql-tls are the same databases with TLS. Their test
 #   certificate (host name `localhost`) and CA come from docker/test-certs.sh,
 #   written to docker/test-certs/ on the first start; Git ignores them.
+# - Both TLS servers also have the user `rivet_cert`, which logs in only with
+#   the client certificate docker/test-certs/client.pem (no password).
 name: rivet-test
 
 services:
@@ -73,8 +75,12 @@ services:
       - -c
       - >-
         install -o postgres -m 600 /certs/server.key /tmp/server.key &&
+        printf '%s\n' 'local all all trust' 'hostssl all rivet_cert all cert'
+        'host all all all scram-sha-256' > /tmp/pg_hba.conf &&
+        echo 'CREATE ROLE rivet_cert LOGIN;' > /docker-entrypoint-initdb.d/cert-user.sql &&
         exec docker-entrypoint.sh postgres -c ssl=on
         -c ssl_cert_file=/certs/server.pem -c ssl_key_file=/tmp/server.key
+        -c ssl_ca_file=/certs/client-ca.pem -c hba_file=/tmp/pg_hba.conf
     ports:
       - "127.0.0.1:54330:5432"
     volumes:
@@ -89,12 +95,17 @@ services:
     depends_on:
       tls-certs:
         condition: service_completed_successfully
-    # Plaintext is refused, so a test that connects has used TLS.
-    command:
-      - --ssl-ca=/certs/ca.pem
-      - --ssl-cert=/certs/server.pem
-      - --ssl-key=/certs/server.key
-      - --require-secure-transport=ON
+    # Plaintext is refused, so a test that connects has used TLS. `--ssl-ca`
+    # is the CA of the client certificates.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        echo "CREATE USER rivet_cert REQUIRE SUBJECT '/CN=rivet_cert';
+        GRANT ALL ON rivet_test.* TO rivet_cert;" > /docker-entrypoint-initdb.d/cert-user.sql &&
+        exec docker-entrypoint.sh mysqld --ssl-ca=/certs/client-ca.pem
+        --ssl-cert=/certs/server.pem --ssl-key=/certs/server.key
+        --require-secure-transport=ON
     ports:
       - "127.0.0.1:33070:3306"
     volumes:
