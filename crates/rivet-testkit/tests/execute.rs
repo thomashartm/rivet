@@ -15,12 +15,12 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures_core::Stream;
 use rivet_core::Owner;
-use rivet_core::execute::{RESULT_BUFFER, execute};
+use rivet_core::execute::{Guarded, RESULT_BUFFER, execute, execute_guarded};
 use rivet_core::jobs::{JobScheduler, JobState};
 use rivet_core::logging::{LogConfig, Redactor, dispatch};
 use rivet_sdk::error::{Error, ErrorCategory, Result};
 use rivet_sdk::extension::{BoxFuture, Connection};
-use rivet_sdk::model::{ColumnMetadata, ResultSet};
+use rivet_sdk::model::{ColumnMetadata, ConnectionProfile, Endpoint, ProviderRef, ResultSet};
 
 /// The statement of every test. A test checks that it is in no log event.
 const STATEMENT: &str = "select secret_column from secret_table";
@@ -41,6 +41,8 @@ enum Plan {
 /// What the fake connection saw. The test reads it.
 #[derive(Default)]
 struct Seen {
+    /// `true` after `Connection::execute` was called.
+    executed: AtomicBool,
     /// How many batches the driver made.
     produced: AtomicUsize,
     /// `true` after the driver result set was dropped.
@@ -92,6 +94,7 @@ impl Stream for FakeBatches {
 
 impl Connection for FakeConnection {
     fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>> {
+        self.seen.executed.store(true, Ordering::SeqCst);
         Box::pin(async move {
             if let Plan::Refuse = self.plan {
                 return Err(Error::user(format!("syntax error in `{statement}`")));
@@ -328,4 +331,111 @@ impl Capture {
     fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
+}
+
+/// A write that names secret data. A test checks that it is in no error
+/// and no log event of the guard path.
+const WRITE: &str = "delete from secret_table where token = 'hunter2'";
+
+fn profile(read_only: bool, confirm_on_write: bool) -> ConnectionProfile {
+    ConnectionProfile::new(
+        ProviderRef::new("fake"),
+        Endpoint::new("localhost"),
+        ProviderRef::new("none"),
+    )
+    .with_read_only(read_only)
+    .with_confirm_on_write(confirm_on_write)
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_guard_denies_a_write_on_a_read_only_profile() {
+    let (capture, _guard) = capture_log();
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Batches(1));
+    let profile = profile(true, false);
+    // `confirmed` does not change a deny.
+    let Err(error) = execute_guarded(
+        &scheduler,
+        owner(),
+        &profile,
+        connection,
+        WRITE.to_owned(),
+        true,
+    ) else {
+        panic!("expected a deny");
+    };
+    assert_eq!(error.category(), ErrorCategory::Policy);
+    assert!(!seen.executed.load(Ordering::SeqCst));
+    assert!(scheduler.jobs().is_empty());
+
+    let text = format!("{error} {error:?} {}", capture.text());
+    for part in ["secret_table", "hunter2", "delete"] {
+        assert!(!text.contains(part), "leaks {part}: {text}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_guard_asks_to_confirm_a_write_then_runs_it() {
+    let (capture, _guard) = capture_log();
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Batches(1));
+    let profile = profile(false, true);
+    let guarded = execute_guarded(
+        &scheduler,
+        owner(),
+        &profile,
+        connection,
+        WRITE.to_owned(),
+        false,
+    );
+    let Ok(Guarded::NeedsConfirmation {
+        connection,
+        statement,
+    }) = guarded
+    else {
+        panic!("expected NeedsConfirmation");
+    };
+    assert!(!seen.executed.load(Ordering::SeqCst));
+    assert!(scheduler.jobs().is_empty());
+    assert!(!capture.text().contains("secret_table"));
+
+    let guarded = execute_guarded(&scheduler, owner(), &profile, connection, statement, true);
+    let Ok(Guarded::Started(job, result)) = guarded else {
+        panic!("expected Started");
+    };
+    let mut result = result.await.unwrap();
+    assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 0);
+    assert!(next(&mut result).await.is_none());
+    job.join().await.unwrap();
+    assert!(seen.executed.load(Ordering::SeqCst));
+    assert_eq!(scheduler.jobs()[0].state, JobState::Succeeded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_guard_allows_a_read_and_the_job_runs_as_before() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Endless);
+    // A read passes both flags without a confirmation.
+    let profile = profile(true, true);
+    let guarded = execute_guarded(
+        &scheduler,
+        owner(),
+        &profile,
+        connection,
+        STATEMENT.to_owned(),
+        false,
+    );
+    let Ok(Guarded::Started(job, result)) = guarded else {
+        panic!("expected Started");
+    };
+    let mut result = result.await.unwrap();
+    next(&mut result).await.unwrap().unwrap();
+    idle().await;
+    // Bounded: the buffer is full and the job holds one more batch.
+    assert_eq!(seen.produced.load(Ordering::SeqCst), RESULT_BUFFER + 2);
+
+    job.cancel();
+    let error = job.join().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert!(seen.cancelled_while_running.load(Ordering::SeqCst));
 }
