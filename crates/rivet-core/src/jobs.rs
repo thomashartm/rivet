@@ -336,6 +336,8 @@ impl JobScheduler {
 
     /// Creates a scheduler with the limits of `config`, for example from
     /// [`JobConfig::from_settings`].
+    /// The values are used as given and are not checked; only
+    /// [`JobConfig::from_settings`] checks the ranges (ADR-0021).
     pub fn with_config(config: JobConfig) -> Self {
         let slots = config.max_concurrent.get().min(Semaphore::MAX_PERMITS);
         Self {

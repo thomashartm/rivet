@@ -131,7 +131,7 @@ flowchart TB
 
 ¹ Binaries bundle built-in extensions as packaged artifacts loaded through the extension host, not as Rust dependencies.
 ² The in-process desktop build links `rivet-core` only in the binary crate that wires the `EngineClient`, never in `rivet-ui-shell` itself.
-³ Proposed, [ADR-0016](docs/adr/0016-testkit-dependency-rule.md). A crate MAY depend on `rivet-testkit` only as a dev-dependency. `rivet-sdk`, `rivet-engine-api` and `rivet-core` MUST NOT depend on it in any kind. For all other pairs, the table applies to normal, build and dev dependencies alike.
+³ [ADR-0016](docs/adr/0016-testkit-dependency-rule.md). A crate MAY depend on `rivet-testkit` only as a dev-dependency. `rivet-sdk`, `rivet-engine-api` and `rivet-core` MUST NOT depend on it in any kind. For all other pairs, the table applies to normal, build and dev dependencies alike.
 
 ### 3.3 Rules
 
@@ -209,12 +209,18 @@ stateDiagram-v2
     Failed --> Active: restart (with backoff)
     Failed --> Disabled: restart limit reached
     Inactive --> [*]: unload
+    Resolved --> Failed: activation fails
+    Inactive --> Failed: activation fails
+    Resolved --> [*]: removed
+    Rejected --> [*]: removed
+    Failed --> [*]: unload or reload
+    Disabled --> [*]: unload or reload
 ```
 
-- The extension host has two edges that this diagram does not show. The code is as [ADR-0017](docs/adr/0017-extension-host-lifecycle.md) (Proposed) wants it; the diagram changes when the ADR is accepted:
+- Edges that [ADR-0017](docs/adr/0017-extension-host-lifecycle.md) added to the diagram (accepted on 2026-11-25):
   - a failed activation goes from `Resolved` or `Inactive` directly to `Failed` (row b, since PR #121);
   - an extension in `Resolved` or `Rejected` can be removed and discovered again (row c).
-- Also not in the diagram (ADR-0017 row f, Proposed; in the code since PR #131): an explicit unload or reload can also remove an extension in `Failed` or `Disabled`. A reload then reads the package again and gives `Resolved` or `Rejected`.
+- ADR-0017 row f (in the code since PR #131): an explicit unload or reload can also remove an extension in `Failed` or `Disabled`. A reload then reads the package again and gives `Resolved` or `Rejected`.
 - As built, if two discovery directories contain the same extension id, the later directory wins: bundled < user < workspace. ADR-0017 proposes to limit this when signature checks exist.
 - Hot reload = deactivate, unload, load new version, activate. Open handles of the old version MUST be closed or migrated before unload.
 
@@ -303,6 +309,7 @@ flowchart LR
 
 - The SDK defines one error model with categories: `user` (bad input), `auth`, `connectivity`, `database`, `policy` (blocked by a guard), `cancelled`, `retryable`, `internal`.
 - Errors MUST keep the source chain and MUST NOT contain secrets.
+  - Exception: an error that comes from extension code (a WASM guest, a native process, a secret backend of an extension) keeps its category and a message that the host cleaned. Its source is dropped, or it is one text that the host cleaned by the same rules. An error value or raw text of extension code MUST NOT be a source.
 - Panics and WASM traps MUST be caught at the extension boundary and turned into `internal` errors plus an extension `Failed` state.
 
 ### 5.7 Graceful Shutdown and Recovery
@@ -376,7 +383,7 @@ Shutdown order:
 | --- | --- |
 | In-process, Rust | Native Rust types and Arrow arrays in memory |
 | Host ↔ WASM extension | WIT records; bulk data as Arrow IPC buffers |
-| Host ↔ out-of-process native host | Arrow IPC over a local socket; control messages in a typed schema |
+| Host ↔ out-of-process native host | Arrow IPC over a local socket; control messages in a typed schema (amended by [ADR-0024](docs/adr/0024-native-process-runtime.md): JSON lines with a fixed set of messages) |
 | Engine ↔ remote client (daemon) | Control API over gRPC; result data over Arrow Flight ([ADR-0004](docs/adr/0004-control-api-protocol.md)) |
 | Engine ↔ external tools | CSV, JSON, Parquet, Excel, SQL, Markdown via exporters |
 
@@ -409,7 +416,7 @@ Shutdown order:
 
 ### 7.4 Credential Handling
 
-- Secrets MUST be redacted in logs, traces, errors and crash reports by a central logging layer.
+- Secrets of 4 bytes or more MUST be redacted in logs, traces, errors and crash reports by a central logging layer ([ADR-0022](docs/adr/0022-short-secrets-not-redacted.md)).
 - Extensions receive secrets only through the secret service and only for namespaces they were granted.
 
 ### 7.5 Secure Database Connectivity
@@ -457,7 +464,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | Responsiveness | UI keeps 60 fps while scrolling a 10-million-row result. No UI frame waits on I/O. |
 | Memory | Idle engine < 50 MB resident. Streaming any result size uses bounded memory set by buffer settings. |
 | Scalability and streaming | Exports and copies of 100 GB complete with constant memory. Throughput is limited by network or database, not by the client. |
-| Reliability | A crashing extension never stops the engine. A restart of a failed extension takes < 1 s (first restart, from the failure to `Active`; [ADR-0021](docs/adr/0021-extension-supervision.md), Proposed). IAM token expiry never causes a user-visible error on idle pools. |
+| Reliability | A crashing extension never stops the engine. A failed extension is restarted with backoff ([ADR-0021](docs/adr/0021-extension-supervision.md)); no time target applies to the restart. IAM token expiry never causes a user-visible error on idle pools. |
 | Security and isolation | Every extension runs with only its granted capabilities. No secret appears in logs, history or config. Verified by tests. |
 | Portability | Windows, macOS and Linux (X11 and Wayland) on x86_64 and aarch64. |
 | Extensibility and compatibility | An extension built against SDK 1.x runs on every engine with SDK 1.y, y ≥ x. Checked by API compatibility tools. |
@@ -489,7 +496,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | # | Decision | Outcome | ADR |
 | --- | --- | --- | --- |
 | 1 | Async runtime | Tokio | [0001](docs/adr/0001-async-runtime.md) |
-| 2 | WASM runtime | Wasmtime; WASI: none for now (ADR-0018, Proposed) | [0002](docs/adr/0002-wasm-runtime.md) |
+| 2 | WASM runtime | Wasmtime; WASI: none for now (ADR-0018) | [0002](docs/adr/0002-wasm-runtime.md) |
 | 3 | Native plugin placement | Out-of-process by default; in-process only for signed first-party extensions with a measured need | [0003](docs/adr/0003-native-plugin-placement.md) |
 | 4 | Control API protocol | gRPC, with Arrow Flight for result streams | [0004](docs/adr/0004-control-api-protocol.md) |
 | 5 | Local persistence | SQLite for history, metadata cache and audit log | [0005](docs/adr/0005-local-persistence.md) |
@@ -503,12 +510,13 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 13 | SDK bindings delivery | WIT with the WASM runtime, C ABI with the native runtime; one extension point at a time | [0013](docs/adr/0013-sdk-bindings-delivery.md) |
 | 14 | Keychain on Linux | Optional build feature; built in on macOS and Windows | [0014](docs/adr/0014-keychain-optional-on-linux.md) |
 | 15 | Integration test databases | Local PostgreSQL and MySQL containers with Docker Compose | [0015](docs/adr/0015-integration-test-databases.md) |
-| 16 | `rivet-testkit` dependencies (Proposed) | May use `rivet-sdk`, `rivet-engine-api`, `rivet-core`; others use it as dev-dependency only | [0016](docs/adr/0016-testkit-dependency-rule.md) |
-| 17 | Extension host lifecycle (Proposed) | As-built behaviour recorded; changes to §4.4 proposed | [0017](docs/adr/0017-extension-host-lifecycle.md) |
-| 18 | WASM runtime parameters (Proposed) | No WASI for now; fuel and time limit; memory budget with trap; WIT package `rivet:extension` | [0018](docs/adr/0018-wasm-runtime-parameters.md) |
-| 19 | Publisher identity and trust store (Proposed) | Publisher = first segment of the extension id; `trust.toml` in the user configuration directory | [0019](docs/adr/0019-publisher-identity-and-trust-store.md) |
-| 20 | Permission matching rules (Proposed) | Exact matches, deny in case of doubt | [0020](docs/adr/0020-permission-matching-rules.md) |
-| 21 | Extension supervision (Proposed) | Restart with backoff from 100 ms to 1 s, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
-| 22 | Short secrets in logs (Proposed) | Values shorter than 4 bytes are not redacted. The store writes a `warn` event for each read of such a value | [0022](docs/adr/0022-short-secrets-not-redacted.md) |
-| 23 | Package format and install layout (Proposed) | Uncompressed tar with three fixed entries; store plus active directory; journal for update and rollback | [0023](docs/adr/0023-package-format-and-install-layout.md) |
-| 24 | Native process runtime (Proposed) | One child process per native extension; JSON lines over standard input and output; empty environment | [0024](docs/adr/0024-native-process-runtime.md) |
+| 16 | `rivet-testkit` dependencies | May use `rivet-sdk`, `rivet-engine-api`, `rivet-core`; others use it as dev-dependency only | [0016](docs/adr/0016-testkit-dependency-rule.md) |
+| 17 | Extension host lifecycle | As-built behaviour recorded; changes to §4.4 proposed | [0017](docs/adr/0017-extension-host-lifecycle.md) |
+| 18 | WASM runtime parameters | No WASI for now; fuel and time limit; memory budget with trap; WIT package `rivet:extension` | [0018](docs/adr/0018-wasm-runtime-parameters.md) |
+| 19 | Publisher identity and trust store | Publisher = first segment of the extension id; `trust.toml` in the user configuration directory | [0019](docs/adr/0019-publisher-identity-and-trust-store.md) |
+| 20 | Permission matching rules | Exact matches, deny in case of doubt | [0020](docs/adr/0020-permission-matching-rules.md) |
+| 21 | Extension supervision | Restart with backoff from 100 ms to 1 s, limit 5; call timeout 30 s; 8 jobs per extension | [0021](docs/adr/0021-extension-supervision.md) |
+| 22 | Short secrets in logs | Values shorter than 4 bytes are not redacted. The store writes a `warn` event for each read of such a value | [0022](docs/adr/0022-short-secrets-not-redacted.md) |
+| 23 | Package format and install layout | Uncompressed tar with three fixed entries; store plus active directory; journal for update and rollback | [0023](docs/adr/0023-package-format-and-install-layout.md) |
+| 24 | Native process runtime | One child process per native extension; JSON lines over standard input and output; empty environment | [0024](docs/adr/0024-native-process-runtime.md) |
+| 25 | First database drivers (Proposed) | Crates `rivet-ext-postgres` and `rivet-ext-mysql` on the existing driver contract; conformance suite in the testkit | [0025](docs/adr/0025-first-database-drivers.md) |
