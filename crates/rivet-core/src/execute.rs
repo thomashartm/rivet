@@ -1,5 +1,8 @@
-//! Runs one statement as a job (ARCHITECTURE.md §5.4, §5.5, §5.6).
+//! Runs one statement as a job (ARCHITECTURE.md §5.3, §5.4, §5.5, §5.6).
 //!
+//! - [`execute_guarded`] calls the statement guard ([`guard::decide`]) with
+//!   the profile flags `read_only` and `confirm_on_write` before the
+//!   statement reaches the driver. Only an allowed statement starts a job.
 //! - [`execute`] starts a job of the [`JobScheduler`] that runs one
 //!   statement on one [`Connection`].
 //! - The caller gets the job handle and a future of the result. The future
@@ -16,9 +19,11 @@
 //!   `cancelled`).
 //! - The log events of this module contain the job id and an error
 //!   category only, never the statement text: it can contain personal data.
+//!   The guard path writes no log event, and its errors do not contain the
+//!   statement text.
 //!
-//! Slice 1 of ticket #27 has no guard. Slice 2 calls the guard of ticket #20
-//! before the statement reaches the driver.
+//! [`execute`] runs without the guard. A caller that runs a statement of a
+//! user uses [`execute_guarded`].
 
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -28,10 +33,11 @@ use arrow_array::RecordBatch;
 use futures_core::Stream;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{BoxFuture, Connection};
-use rivet_sdk::model::ResultSet;
+use rivet_sdk::model::{ConnectionProfile, ResultSet};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Owner;
+use crate::guard::{self, Decision};
 use crate::jobs::{JobContext, JobHandle, JobScheduler};
 
 /// The most record batches that the job reads from the driver before the
@@ -41,7 +47,63 @@ pub const RESULT_BUFFER: usize = 4;
 /// The kind of the job in [`JobScheduler::jobs`].
 pub const JOB_KIND: &str = "execute";
 
-/// Starts a job that runs `statement` on `connection`.
+/// The result of [`execute_guarded`].
+pub enum Guarded {
+    /// The guard allowed the statement. The values are the values of
+    /// [`execute`].
+    Started(JobHandle<()>, BoxFuture<'static, Result<ResultSet>>),
+    /// The statement is a write on a `confirm_on_write` profile. The driver
+    /// was not called and no job was started. The caller asks the user, then
+    /// calls [`execute_guarded`] again with these values and
+    /// `confirmed = true`.
+    NeedsConfirmation {
+        /// The connection that the caller gave.
+        connection: Box<dyn Connection>,
+        /// The statement that the caller gave.
+        statement: String,
+    },
+}
+
+/// Calls the guard with the flags of `profile`, then runs `statement` as
+/// [`execute`] does if the guard allows it.
+///
+/// `confirmed` is `true` when the user confirmed a write (see
+/// [`Guarded::NeedsConfirmation`]).
+///
+/// # Errors
+///
+/// - The guard denies the statement: its `policy` error. The driver is not
+///   called, no job is started, and `connection` is dropped.
+/// - The errors of [`execute`].
+pub fn execute_guarded(
+    scheduler: &JobScheduler,
+    owner: Owner,
+    profile: &ConnectionProfile,
+    connection: Box<dyn Connection>,
+    statement: String,
+    confirmed: bool,
+) -> Result<Guarded> {
+    let decision = guard::decide(
+        profile.read_only,
+        profile.confirm_on_write,
+        &statement,
+        confirmed,
+    );
+    match decision {
+        Decision::Allow => {
+            let (job, result) = execute(scheduler, owner, connection, statement)?;
+            Ok(Guarded::Started(job, result))
+        }
+        Decision::NeedsConfirmation => Ok(Guarded::NeedsConfirmation {
+            connection,
+            statement,
+        }),
+        Decision::Deny(error) => Err(error),
+    }
+}
+
+/// Starts a job that runs `statement` on `connection`. It does not call the
+/// guard; see [`execute_guarded`].
 ///
 /// Returns the job handle and a future of the result. The future is ready
 /// when the schema is known; the [`ResultSet`] then streams the batches.
