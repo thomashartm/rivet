@@ -91,6 +91,17 @@ fn needles(value: &str) -> Vec<Zeroizing<String>> {
         }
         added = start..needles.len();
     }
+    // The form that `wasm::guest_text` makes of the value (R-114). Its
+    // second redaction finds it; no escape chain is needed on top.
+    let cleaned = Zeroizing::new(
+        value
+            .chars()
+            .map(crate::wasm::guest_char)
+            .collect::<String>(),
+    );
+    if !needles.iter().any(|known| **known == *cleaned) {
+        needles.push(cleaned);
+    }
     needles
 }
 
