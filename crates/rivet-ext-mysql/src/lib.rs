@@ -9,6 +9,7 @@
 //! | Drop of a result set | `KILL QUERY` on a second connection, then the rest of the result is read and discarded. An endless result is not read to its end. |
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
+//! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295) is refused as well. |
 //! | TLS | Not supported yet (#19): a profile with TLS on is refused. |
 //! | Tunnel transport | Not supported: `mysql_async` opens its own socket. A request with a transport is refused. |
 //!
@@ -185,10 +186,20 @@ impl Connection for MysqlConnection {
                 .as_mut()
                 .ok_or_else(|| Error::connectivity("the MySQL connection is closed"))?;
             self.busy.store(true, Ordering::SeqCst);
-            let columns = conn
-                .query_iter(statement)
-                .await
-                .map(|result| result.columns());
+            // `mysql_async` always enables multi-statements and has no switch for it. The
+            // server parses a prepared statement as exactly one statement, so a second one
+            // is refused here, before anything runs.
+            let single = match conn.prep(statement.as_str()).await {
+                Ok(prepared) => conn.close(prepared).await,
+                Err(error) => Err(error),
+            };
+            let columns = match single {
+                Ok(()) => conn
+                    .query_iter(statement)
+                    .await
+                    .map(|result| result.columns()),
+                Err(error) => Err(error),
+            };
             lease.querying = false;
             let columns = match columns {
                 Ok(Some(columns)) if !columns.is_empty() => columns,
