@@ -1,6 +1,6 @@
 # ADR-0027: Changed-row count in `ResultSet`
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-26
 
 ## Context
@@ -23,22 +23,23 @@ Facts on `main` on this date:
 
 ## Decision
 
-All rows are proposals of the architect. The rows marked "question" wait for the maintainer; work starts with the default.
+The maintainer accepted this ADR on 2026-11-26. The rows marked "maintainer decision" record the answers of the maintainer to the open questions of the proposal.
 
 | Topic | Decision |
 | --- | --- |
 | SDK API | `ResultSet::with_rows_affected(self, rows: u64) -> Self` and `ResultSet::rows_affected(&self) -> Option<u64>`. A new private field `rows_affected: Option<u64>`; `ResultSet::new` sets `None`. `Debug` shows the field. |
 | Semver | Additive (ARCHITECTURE.md §4.1, §10): the fields are private, `new` keeps its signature, no trait changes. Not a breaking change. |
 | Meaning | `Some(n)`: the statement has no result columns and ended; `n` is the number the engine reports for it. `None`: the statement returns rows (also with `RETURNING`, also a row result with zero columns such as PostgreSQL `select;`), or the driver has no count. A client MUST NOT read `None` as 0. |
-| DDL and other statements without a count (question) | Default: report what the engine reports. Both engines report 0 (PostgreSQL: `extract_row_affected` gives 0 for a tag such as `CREATE TABLE`; MySQL: the OK packet of DDL has 0 affected rows). So DDL gives `Some(0)` on both. A driver cannot give `None` for DDL: `tokio-postgres` does not pass the command tag, and MySQL sends no tag. Engine-specific results that follow from this rule: PostgreSQL `create table ... as select` reports the rows it wrote (tag `SELECT n`); MySQL `create table ... select` too. |
-| MySQL `update` count (question) | Default: the driver turns on `client_found_rows`. Then an `update` counts the rows it finds, as PostgreSQL does, and one rule holds for both engines. Without it, an `update` that writes the same values reports 0 on MySQL and N on PostgreSQL. Side effect: `ROW_COUNT()` in the session and `insert ... on duplicate key update` follow the found-rows rule of MySQL. |
+| DDL and other statements without a count (maintainer decision 2026-11-26) | The SDK carries what the engine reports. Both engines report 0 (PostgreSQL: `extract_row_affected` gives 0 for a tag such as `CREATE TABLE`; MySQL: the OK packet of DDL has 0 affected rows). So DDL gives `Some(0)` on both. A driver cannot give `None` for DDL: `tokio-postgres` does not pass the command tag, and MySQL sends no tag. Engine-specific results that follow from this rule: PostgreSQL `create table ... as select` reports the rows it wrote (tag `SELECT n`); MySQL `create table ... select` too. |
+| MySQL `update` count (maintainer decision 2026-11-26) | The driver keeps the `mysql_async` default: `client_found_rows` is off. The count differs per engine: MySQL counts the rows whose values changed; PostgreSQL counts the rows the statement matched. An `update` that writes the same values gives 0 on MySQL and N on PostgreSQL. |
 | PostgreSQL driver | If the prepared statement has no columns, `execute` reads the stream to its end before it returns. It keeps the number of `CommandComplete`. If a `RowDescription` comes (a row result with zero columns), `rows_affected` stays `None` and the result gives the same zero-column batches as today. Else it returns an empty result with `with_rows_affected(n)`. An error of the statement is the error of `execute`. A statement with columns is unchanged. |
 | PostgreSQL cancel | The wait MUST stay cancellable. `Connection::cancel` already works during the wait, because it does not take `busy`. The read MUST go through `Batches` (or another value that holds `Running`), so that a dropped `execute` future sends the cancel request as a dropped result does today. `busy` is held until the stream has ended. A cancelled wait gives the `cancelled` error (SQLSTATE 57014). |
 | MySQL driver | In the "No result set" path, read `affected_rows` of the query result before it is dropped, and return the empty result with `with_rows_affected(n)`. Cancel does not change. A statement with a result set is unchanged. More than one statement in one call stays refused (decision 83). |
 | Core | `stream_rows` in `execute.rs` carries `rows_affected` of the driver result into the result that it makes. |
-| CLI table output | If `rows_affected` is `Some(n)`: `(n rows changed)` in place of `(0 rows)`. If `None`: `(N rows)` as today. |
-| CLI CSV and JSON output | Maintainer decision: the line `(n rows changed)` goes to stderr. stdout stays as today. |
-| Conformance | New case in `rivet_testkit::conformance`, run by `run_all`: on one connection, make a temporary table, insert 2 rows, `update` both to new values → `Some(2)`; a `select` → `None`. If the `client_found_rows` row is accepted, an `update` that writes the same values also gives `Some(2)`. The SQL of each engine is in `Sql`. |
+| CLI table output (maintainer decision 2026-11-26) | If `rows_affected` is `None`: `(N rows)` as today. If it is `Some(n)`: `(n rows changed)` only if the first keyword of the statement is `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `REPLACE` or `WITH` (case-insensitive); else `ok`. This is presentation only; the SDK value does not change. |
+| CLI keyword limit (maintainer decision 2026-11-26) | Shortcut: a statement that starts with a comment or `(` prints `ok`, also for a write. The keyword list of the read-only guard (decision 86.3) is private and is not reused. |
+| CLI CSV and JSON output (maintainer decision 2026-11-26) | The same line (`(n rows changed)` or `ok`) goes to stderr. stdout stays as today. |
+| Conformance | New case in `rivet_testkit::conformance`, run by `run_all`: on one connection, make a temporary table, insert 2 rows, `update` both rows to values that differ from the old values → `Some(2)` on both engines; a `select` → `None`. The SQL of each engine is in `Sql`. |
 | PostgreSQL cancel test | A driver test: a long statement without result columns (for example `do $$ begin perform pg_sleep(30); end $$`) is cancelled with `Connection::cancel` and gives `cancelled`; the connection runs the next statement. |
 | WIT and C ABI | Not changed now. When a result set crosses the WIT border or the native protocol (ADR-0013, ADR-0024), the count MUST be part of it, with the same meaning (`option<u64>` in WIT). |
 
@@ -46,11 +47,12 @@ All rows are proposals of the architect. The rows marked "question" wait for the
 
 - A user sees the count after a write. CSV and JSON stdout stays only data, so scripts do not change.
 - A write with no result columns on PostgreSQL now returns from `execute` only after it ends. A client that shows "running" while it waits for `execute` sees no change: today the empty stream also ends only at the end of the statement.
-- DDL prints `(0 rows changed)`. The CLI cannot tell DDL from a write that changed no rows.
-- With `client_found_rows`, the MySQL count means "rows found", not "rows with new values". The CLI text says "changed"; for an `update` that writes the same values this is not exact on either engine.
+- DDL prints `ok`. The SDK value for DDL is `Some(0)`; only the first keyword lets the CLI tell DDL from a write that changed no rows. `create table ... as select` also prints `ok`, although the engine reports its rows.
+- A write that starts with a comment or `(` prints `ok` (keyword limit above).
+- The same `update` can print different counts on MySQL and PostgreSQL when it writes unchanged values. This is the behaviour of each engine and is documented, not hidden.
 - Each new driver must fill the count; the conformance case checks it.
 - Not in scope: a count for `... RETURNING` (the rows are shown), the statement verb in the message (`UPDATE 2`; MySQL does not send it), parameter binding (decision 86.1).
 
 ## Status
 
-Proposed. The maintainer approves this ADR before the code of #229 starts.
+Accepted by the maintainer on 2026-11-26. The code of #229 can start.
