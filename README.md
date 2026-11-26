@@ -149,3 +149,7 @@ read_only = true
 **Known limit**
 
 - No TLS yet: connections are plain text (#19).
+
+## Licence
+
+[Apache License 2.0](LICENSE).

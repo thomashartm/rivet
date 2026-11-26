@@ -13,7 +13,7 @@
 | [0009](0009-crate-layout.md) | Crate layout | Accepted |
 | [0010](0010-architecture-check.md) | Architecture check with xtask | Accepted |
 | [0011](0011-control-api-token-scopes.md) | Control API token scopes | Accepted |
-| [0012](0012-project-licence-open.md) | Project licence is not decided; dependencies stay permissive | Accepted |
+| [0012](0012-project-licence-open.md) | Project licence is not decided; dependencies stay permissive | Superseded by 0026 |
 | [0013](0013-sdk-bindings-delivery.md) | WIT and C ABI bindings are delivered with the runtimes | Accepted |
 | [0014](0014-keychain-optional-on-linux.md) | The OS keychain backend is optional on Linux | Accepted |
 | [0015](0015-integration-test-databases.md) | Integration tests use local database containers | Accepted |
@@ -27,6 +27,7 @@
 | [0023](0023-package-format-and-install-layout.md) | Package format and install layout | Accepted |
 | [0024](0024-native-process-runtime.md) | Native process runtime: protocol and supervision | Accepted |
 | [0025](0025-first-database-drivers.md) | First database drivers | Proposed |
+| [0026](0026-project-licence-apache-2.0.md) | Project licence is Apache-2.0 | Accepted |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 
