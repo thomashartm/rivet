@@ -24,9 +24,13 @@ rivet-core = { path = "../rivet-core" }
 rivet-ext-mysql = { path = "../rivet-ext-mysql" }
 rivet-ext-postgres = { path = "../rivet-ext-postgres" }
 rivet-sdk = { path = "../rivet-sdk" }
+# Reads the password of `rivet save` without echo.
+rpassword = "7.5.5"
 # Line editing and history at the prompt.
+rustyline = { version = "19.0.0", default-features = false, features = ["with-file-history"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-rustyline = { version = "19.0.0", default-features = false, features = ["with-file-history"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal"] }
+# Writes a TOML string for `rivet save`.
+toml = { version = "1", default-features = false, features = ["display"] }
 url = "2.5.9"

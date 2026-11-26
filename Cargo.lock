@@ -2075,10 +2075,12 @@ dependencies = [
  "rivet-ext-mysql",
  "rivet-ext-postgres",
  "rivet-sdk",
+ "rpassword",
  "rustyline",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "url",
 ]
 

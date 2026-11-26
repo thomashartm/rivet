@@ -14,7 +14,7 @@ use rivet_sdk::extension::Connection;
 use rivet_sdk::model::ConnectionProfile;
 use rustyline::error::ReadlineError;
 
-use crate::output::{Format, render};
+use crate::output::{Format, render, rows, start};
 
 /// What the loop works with.
 pub struct Session<'a> {
@@ -298,7 +298,7 @@ fn execute(session: &Session<'_>, statement: &str, output: &mut impl Write) -> b
     let connection = session.connection;
     let statement = statement.trim().trim_end_matches(';').to_owned();
     let result = session.runtime.block_on(async {
-        let mut query = pin!(run(connection, statement, session.format));
+        let mut query = pin!(run(connection, statement, session.format, &mut *output));
         tokio::select! {
             result = &mut query => result,
             _ = tokio::signal::ctrl_c() => {
@@ -311,11 +311,7 @@ fn execute(session: &Session<'_>, statement: &str, output: &mut impl Write) -> b
         }
     });
     match result {
-        Ok(text) => {
-            let _ = output.write_all(text.as_bytes());
-            let _ = output.flush();
-            true
-        }
+        Ok(()) => true,
         Err(error) => {
             eprintln!("error: {error}");
             false
@@ -323,8 +319,15 @@ fn execute(session: &Session<'_>, statement: &str, output: &mut impl Write) -> b
     }
 }
 
-/// Runs one statement and returns its result as text.
-async fn run(connection: &dyn Connection, statement: String, format: Format) -> Result<String> {
+/// Runs one statement and writes its result to `output`. CSV and JSON
+/// are written batch by batch, so memory stays flat and output starts at
+/// once. A failed write (for example a closed pipe) stops the statement.
+async fn run(
+    connection: &dyn Connection,
+    statement: String,
+    format: Format,
+    output: &mut impl Write,
+) -> Result<()> {
     let result = connection.execute(statement).await?;
     let header: Vec<String> = result
         .schema()
@@ -333,13 +336,26 @@ async fn run(connection: &dyn Connection, statement: String, format: Format) -> 
         .map(|field| field.name().clone())
         .collect();
     let mut result = pin!(result);
-    // shortcut: the whole result is held in memory (the table aligns its
-    // columns); stream CSV and JSON per batch when large results matter.
-    let mut batches = Vec::new();
-    while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
-        batches.push(batch?);
+    let mut write = |text: String| {
+        output
+            .write_all(text.as_bytes())
+            .and_then(|()| output.flush())
+            .map_err(|error| Error::user(format!("cannot write the result: {error}")))
+    };
+    if format == Format::Table {
+        // shortcut: the table holds the whole result to align its columns;
+        // page it when large results at the prompt matter.
+        let mut batches = Vec::new();
+        while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
+            batches.push(batch?);
+        }
+        return write(render(format, &header, &batches));
     }
-    Ok(render(format, &header, &batches))
+    write(start(format, &header))?;
+    while let Some(batch) = poll_fn(|cx| result.as_mut().poll_next(cx)).await {
+        write(rows(format, &header, &batch?))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
