@@ -76,6 +76,7 @@ const USAGE: &str = "\
 usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format table|csv|json]
        rivet save <name> <postgres://user@host:port/db | mysql://…>
                   [--read-only] [--confirm-on-write] [--env <label>]
+                  [--key-file <PEM key file>]
 
   <name>      a saved connection: [connections.<name>] in the user settings
               file, or RIVET_DATABASE_URL_<NAME> in the environment or ./.env
@@ -91,7 +92,9 @@ usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format t
               the keychain and the connection in the user settings file
   --read-only         (save) the saved connection refuses statements that write
   --confirm-on-write  (save) the saved connection asks y/N before a write
-  --env <label>       (save) a label such as prod, shown when you connect";
+  --env <label>       (save) a label such as prod, shown when you connect
+  --key-file <f>      (save) with ?tls_cert in the address: store the PEM key in
+                      <f> in the keychain instead of a password";
 
 fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("save") {
@@ -286,24 +289,25 @@ async fn resolve_secrets(
     let credential = match (password, &certificate) {
         (Some(_), Some(_)) => return Err(no_password_with_certificate()),
         (Some(uri), None) => Credential::Password(store.resolve(&uri.parse::<SecretUri>()?).await?),
-        (None, Some(certificate)) => {
-            let path = &certificate.certificate;
-            let text = std::fs::read_to_string(path).map_err(|error| {
-                Error::user(format!(
-                    "cannot read the client certificate file {}",
-                    path.display()
-                ))
-                .with_source(error)
-            })?;
-            Credential::ClientCertificate {
-                certificate: text,
-                private_key: store.resolve(&certificate.private_key).await?,
-            }
-        }
+        (None, Some(certificate)) => Credential::ClientCertificate {
+            certificate: read_certificate(&certificate.certificate)?,
+            private_key: store.resolve(&certificate.private_key).await?,
+        },
         (None, None) => return Ok(false),
     };
     request.credentials.credential = credential;
     Ok(certificate.is_some())
+}
+
+/// The text of the client certificate file `path`.
+fn read_certificate(path: &std::path::Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|error| {
+        Error::user(format!(
+            "cannot read the client certificate file {}",
+            path.display()
+        ))
+        .with_source(error)
+    })
 }
 
 // shortcut: a client certificate replaces the password; both together need

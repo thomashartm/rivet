@@ -161,12 +161,38 @@ Flags (after `save`, in any order, each once):
 | `--read-only` | `read_only = true` | Refuses statements that write |
 | `--confirm-on-write` | `confirm_on_write = true` | Asks y/N before a statement that writes. A file or a pipe cannot answer, so it is refused there. |
 | `--env <label>` | `environment = "<label>"` | A label. Shown when you connect and in the confirmation question. |
+| `--key-file <path>` | `tls_key=keychain://rivet/<name>-key` in `url`, no `password` | Saves a client certificate. See below. |
 
-TLS options stay in the address: `?tls=off`, `?tls_ca=<path>`.
+TLS options stay in the address: `?tls=off`, `?tls_ca=<path>`, `?tls_cert=<path>`.
 
-- A wrong password stores nothing.
+- A wrong password, certificate or key stores nothing.
 - A name that already exists is refused.
 - A name has letters, digits, `-` and `_` only.
+
+**Save a connection with a client certificate**
+
+1. Run `rivet save prod "postgres://app@db.example.com:5432/app?tls_cert=/path/client.pem" --key-file /path/client.key`. Put `tls_cert` in the address. Leave `tls_key` and the password out.
+2. rivet checks the address, the flags and both files. A bad one stops here.
+3. rivet connects once with the certificate and the key. There is no password prompt.
+4. rivet stores the PEM key in the keychain as `keychain://rivet/prod-key`.
+5. rivet adds the connection to the settings file, with `tls_key` in `url` and no `password`.
+6. Run `rivet prod`. The connect line says `TLS, client certificate`.
+
+Refused before the connect:
+
+- `--key-file` without `tls_cert` in the address
+- `tls_cert` without `--key-file`
+- `tls_key` in the address
+- A password in the address
+- `tls=off`
+- A key file or certificate file that cannot be read
+
+The saved result. rivet percent-encodes the `tls_key` URI in `url` and reads it back as `keychain://rivet/prod-key`.
+
+```toml
+[connections.prod]
+url = "postgres://app@db.example.com:5432/app?tls_cert=/path/client.pem&tls_key=keychain%3A%2F%2Frivet%2Fprod-key"
+```
 
 **The saved result**
 
@@ -185,7 +211,6 @@ You can also edit these lines by hand.
 **Known limit**
 
 - A client certificate and a password together are refused (#19).
-- `rivet save` cannot save a connection with a client certificate yet: write its `[connections.<name>]` table by hand, with `tls_cert` and `tls_key` in `url` and no `password`.
 
 ## Licence
 
