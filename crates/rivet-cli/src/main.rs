@@ -71,6 +71,7 @@ mod save;
 const USAGE: &str = "\
 usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format table|csv|json]
        rivet save <name> <postgres://user@host:port/db | mysql://…>
+                  [--read-only] [--confirm-on-write] [--env <label>]
 
   <name>      a saved connection: [connections.<name>] in the user settings
               file, or RIVET_DATABASE_URL_<NAME> in the environment or ./.env
@@ -80,17 +81,17 @@ usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format t
   -f <file>   run the statements of <file>, stop at the first error
   --format    table (default), csv, or json (one object per row)
   save        ask for the password, check the connection, store the password in
-              the keychain and the connection in the user settings file";
+              the keychain and the connection in the user settings file
+  --read-only         (save) the saved connection refuses statements that write
+  --confirm-on-write  (save) the saved connection asks y/N before a write
+  --env <label>       (save) a label such as prod, shown when you connect";
 
 fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("save") {
         let rest: Vec<String> = std::env::args().skip(2).collect();
-        let [name, address] = rest.as_slice() else {
-            return usage("save needs <name> and <address>");
-        };
         let saved = tokio::runtime::Runtime::new()
             .map_err(|error| Error::internal("cannot start the runtime").with_source(error))
-            .and_then(|runtime| save::run(&runtime, name, address));
+            .and_then(|runtime| save::run(&runtime, &rest));
         return match saved {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

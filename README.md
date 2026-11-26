@@ -128,18 +128,29 @@ The settings file:
 
 **Save a connection**
 
-1. Run `rivet save prod postgres://app@db.example.com:5432/app`. Leave the password out of the address.
-2. Type the password. It is hidden.
-3. rivet connects once to check the password.
-4. rivet stores the password in the keychain as `keychain://rivet/prod`.
-5. rivet adds the connection to the settings file.
-6. Run `rivet prod`.
+1. Run `rivet save prod postgres://app@db.example.com:5432/app --env prod --read-only`. Leave the password out of the address.
+2. rivet checks the address and the flags. A bad one stops here, before the password prompt.
+3. Type the password. It is hidden.
+4. rivet connects once to check the password.
+5. rivet stores the password in the keychain as `keychain://rivet/prod`.
+6. rivet adds the connection to the settings file.
+7. Run `rivet prod`.
+
+Flags (after `save`, in any order, each once):
+
+| Flag | Written to the settings file | Effect |
+|---|---|---|
+| `--read-only` | `read_only = true` | Refuses statements that write |
+| `--confirm-on-write` | `confirm_on_write = true` | Asks y/N before a statement that writes. A file or a pipe cannot answer, so it is refused there. |
+| `--env <label>` | `environment = "<label>"` | A label. Shown when you connect and in the confirmation question. |
+
+TLS options stay in the address: `?tls=off`, `?tls_ca=<path>`.
 
 - A wrong password stores nothing.
 - A name that already exists is refused.
 - A name has letters, digits, `-` and `_` only.
 
-**Add safety flags (by hand, in the settings file)**
+**The saved result**
 
 ```toml
 schema_version = 1
@@ -151,11 +162,7 @@ environment = "prod"
 read_only = true
 ```
 
-| Flag | Effect |
-|---|---|
-| `environment = "prod"` | A label. Shown when you connect and in the confirmation question. |
-| `read_only = true` | Refuses statements that write |
-| `confirm_on_write = true` | Asks y/N before a statement that writes. A file or a pipe cannot answer, so it is refused there. |
+You can also edit these lines by hand.
 
 **Known limit**
 
