@@ -91,11 +91,18 @@ Decided by the maintainer on 2026-11-26:
 | 83 (MySQL, more than one statement in one call) | The driver must block it |
 | 72 (memory / CPU limits of a native process) | Ticket #204 created |
 | 74 (config types) | Open for new fields (not implemented yet) |
+| 86.1 | Parameter binding comes later, with a contract change |
+| 86.2 | The driver splits a script into statements, later |
+| 86.3 | The statement guard uses a keyword list, not a full parser |
+| 86.4 | The environment tag is free text |
+| 86.5 | Read-only in the database session itself comes later |
+| 87.1 | The "Amended by ADR-0024" lines in ADR-0003 / §6.6 are covered by the acceptance of the records |
+| 87.2 | "Workspace wins" is the rule; the signature condition stays open with #138 |
+
+The architect must write the decisions 75, 81 to 83, 86 and 87 into the records.
 
 Still open:
 
-- From the architect for #27 and #20: parameter binding needs a contract change; who splits a script; keyword list or parser; environment tag as free text; read-only also in the database session.
-- Two readings to confirm: the "Amended by ADR-0024" lines in ADR-0003 / §6.6 are covered by the acceptance; "workspace wins" is the rule and the signature condition stays open with #138.
 - Questions 1 to 59 are only in the session transcript.
 
 ---
