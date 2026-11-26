@@ -25,6 +25,16 @@ allow = [
 crate = "tiny-keccak"
 allow = ["CC0-1.0"]
 
+# clipboard-win and error-code come in through rustyline (rivet-cli) on
+# Windows only. BSL-1.0 is a permissive, OSI-approved licence.
+[[licenses.exceptions]]
+crate = "clipboard-win"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+crate = "error-code"
+allow = ["BSL-1.0"]
+
 [bans]
 multiple-versions = "warn"
 

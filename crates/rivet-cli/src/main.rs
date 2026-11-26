@@ -3,19 +3,33 @@
 //! ```text
 //! rivet postgres://user:password@localhost:5432/database
 //! rivet mysql://user:password@localhost:3306/database
-//! rivet mysql          # the named connection RIVET_DATABASE_URL_MYSQL
-//! rivet                # the default connection RIVET_DATABASE_URL
+//! rivet prod                # a saved connection
+//! rivet                     # the default connection RIVET_DATABASE_URL
+//! rivet pg -f script.sql    # runs a file, stops at the first error
 //! sql> select 1 as one;
 //! ```
 //!
-//! A connection name or no argument reads the address from the environment
-//! first, then from a `.env` file in the current directory.
+//! # Saved connections
+//!
+//! `rivet <name>` looks in this order:
+//!
+//! 1. The user settings file (`rivet_core::settings::user_settings_path`):
+//!    `[connections.<name>]` with `url` (no password in it) and an optional
+//!    `password` secret URI, for example `keychain://rivet/prod`.
+//! 2. `RIVET_DATABASE_URL_<NAME>` in the environment, then in `./.env`
+//!    (the playground; `docker/playground.sh` writes it).
+//!
+//! # Input
 //!
 //! A statement ends with `;` at the end of a line. Ctrl-C cancels the
-//! running statement. `\q` or end of input (Ctrl-D) quits.
+//! running statement; at the prompt it clears the input. `\q` or Ctrl-D
+//! quits. At a terminal the prompt has line editing and a history file
+//! next to the user settings file.
 
+use std::collections::BTreeMap;
 use std::future::poll_fn;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::pin::pin;
 use std::process::ExitCode;
 
@@ -24,37 +38,51 @@ use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Typ
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 use futures_core::Stream;
+use rivet_core::secrets::SecretStore;
+use rivet_core::settings::{Layer, Settings, user_settings_path};
 use rivet_ext_mysql::MysqlDriver;
 use rivet_ext_postgres::PostgresDriver;
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{ConnectRequest, Connection, Credential, Credentials, Driver};
 use rivet_sdk::model::{ConnectionProfile, Endpoint, ProviderRef, TlsSettings};
-use rivet_sdk::secret::Secret;
+use rivet_sdk::secret::{Secret, SecretUri};
+use rustyline::error::ReadlineError;
 use url::Url;
 
+const USAGE: &str = "\
+usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>]
+
+  <name>      a saved connection: [connections.<name>] in the user settings
+              file, or RIVET_DATABASE_URL_<NAME> in the environment or ./.env
+  no target   RIVET_DATABASE_URL from the environment or ./.env
+  -f <file>   run the statements of <file>, stop at the first error";
+
 fn main() -> ExitCode {
-    let dotenv = std::fs::read_to_string(".env").unwrap_or_default();
-    let lookup = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .or_else(|| from_dotenv(&dotenv, key))
-    };
-    let address = match std::env::args().nth(1) {
-        Some(address) if address.contains("://") => Some(address),
-        Some(name) => lookup(&key_of(&name)),
-        None => lookup(ADDRESS_KEY),
-    };
-    let Some(address) = address else {
-        eprintln!(
-            "usage: rivet [postgres://… | mysql://… | <name>]\n\
-             \n\
-             No argument uses {ADDRESS_KEY}; a <name> uses {ADDRESS_KEY}_<NAME>.\n\
-             Both are read from the environment, then from ./.env \
-             (docker/playground.sh writes one).\n\
-             Names in ./.env: {}",
-            names(&dotenv).join(", ")
-        );
-        return ExitCode::from(2);
+    let mut target = None;
+    let mut file = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "-f" | "--file" => match args.next() {
+                Some(path) => file = Some(path),
+                None => return usage("-f needs a file"),
+            },
+            _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
+            _ => return usage(&format!("unexpected argument `{arg}`")),
+        }
+    }
+    // Opened before the connection, so a wrong path fails fast.
+    let file = match file.map(|path| std::fs::File::open(&path).map_err(|error| (path, error))) {
+        None => None,
+        Some(Ok(file)) => Some(file),
+        Some(Err((path, error))) => {
+            eprintln!("error: cannot open {path}: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -63,43 +91,153 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut target = String::new();
-    let connection = match parse(&address).and_then(|(request, driver)| {
-        let endpoint = &request.profile.endpoint;
-        target = format!(
-            "{} {}:{}/{}",
-            request.profile.engine.id,
-            endpoint.host,
-            endpoint
-                .port
-                .map_or("default".to_owned(), |port| port.to_string()),
-            endpoint.database.as_deref().unwrap_or("")
-        );
-        runtime.block_on(driver.connect(request))
-    }) {
+    let connection = match runtime.block_on(connect(target.as_deref())) {
         Ok(connection) => connection,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!(
-        "connected to {target} (plaintext, no TLS). End a statement with `;`. \
-         Ctrl-C cancels it. `\\q` quits."
+    let mut stdout = io::stdout().lock();
+    let ok = if let Some(file) = file {
+        repl(
+            &runtime,
+            connection.as_ref(),
+            lines(io::BufReader::new(file)),
+            &mut stdout,
+            true,
+        )
+    } else if io::stdin().is_terminal() {
+        eprintln!("End a statement with `;`. Ctrl-C cancels it. `\\q` or Ctrl-D quits.");
+        prompt(&runtime, connection.as_ref(), &mut stdout)
+    } else {
+        repl(
+            &runtime,
+            connection.as_ref(),
+            lines(io::stdin().lock()),
+            &mut stdout,
+            false,
+        )
+    };
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn usage(problem: &str) -> ExitCode {
+    eprintln!("error: {problem}\n\n{USAGE}");
+    ExitCode::from(2)
+}
+
+/// Finds the address of `target`, connects and prints where to.
+async fn connect(target: Option<&str>) -> Result<Box<dyn Connection>> {
+    let dotenv = std::fs::read_to_string(".env").unwrap_or_default();
+    let lookup = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .or_else(|| from_dotenv(&dotenv, key))
+    };
+    let (address, password) = match target {
+        Some(address) if address.contains("://") => (address.to_owned(), None),
+        Some(name) => match saved(&user_settings()?, name)? {
+            Some(saved) => saved,
+            None => (
+                lookup(&key_of(name)).ok_or_else(|| unknown(name, &dotenv))?,
+                None,
+            ),
+        },
+        None => (
+            lookup(ADDRESS_KEY).ok_or_else(|| {
+                Error::user(format!(
+                    "no target and no {ADDRESS_KEY}; run docker/playground.sh or see --help"
+                ))
+            })?,
+            None,
+        ),
+    };
+    let (mut request, driver) = parse(&address)?;
+    if let Some(uri) = password {
+        let secret = SecretStore::new().resolve(&uri).await?;
+        request.credentials.credential = Credential::Password(secret);
+    }
+    let endpoint = &request.profile.endpoint;
+    let shown = format!(
+        "{} {}:{}/{}",
+        request.profile.engine.id,
+        endpoint.host,
+        endpoint
+            .port
+            .map_or("default".to_owned(), |port| port.to_string()),
+        endpoint.database.as_deref().unwrap_or("")
     );
-    repl(
-        &runtime,
-        connection.as_ref(),
-        io::stdin().lock(),
-        io::stdout().lock(),
-    );
-    ExitCode::SUCCESS
+    let connection = driver.connect(request).await?;
+    eprintln!("connected to {shown} (plaintext, no TLS)");
+    Ok(connection)
+}
+
+/// The user settings, or empty settings if the platform has no user
+/// settings directory.
+fn user_settings() -> Result<Settings> {
+    let mut settings = Settings::new();
+    if let Ok(path) = user_settings_path() {
+        settings.load_layer(Layer::User, &path)?;
+    }
+    Ok(settings)
+}
+
+/// One `[connections.<name>]` table of the settings: `url` and `password`.
+type SavedConnection = BTreeMap<String, String>;
+
+/// The address and the password URI of the saved connection `name` in
+/// `settings`, or `None` if there is none.
+fn saved(settings: &Settings, name: &str) -> Result<Option<(String, Option<SecretUri>)>> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::user(format!(
+            "`{name}` is not a connection name: use letters, digits, `-` and `_`"
+        )));
+    }
+    let Some(saved) = settings.get::<SavedConnection>(&format!("connections.{name}"))? else {
+        return Ok(None);
+    };
+    let url = saved
+        .get("url")
+        .ok_or_else(|| Error::user(format!("connections.{name} has no `url`")))?;
+    let password = saved
+        .get("password")
+        .map(|uri| uri.parse::<SecretUri>())
+        .transpose()?;
+    Ok(Some((url.clone(), password)))
+}
+
+/// The error for a connection name that is nowhere.
+fn unknown(name: &str, dotenv: &str) -> Error {
+    let in_settings = user_settings()
+        .and_then(|settings| settings.get::<BTreeMap<String, SavedConnection>>("connections"))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_keys();
+    let known: Vec<String> = in_settings.chain(names(dotenv)).collect();
+    Error::user(format!(
+        "no connection named `{name}`; known: {}",
+        if known.is_empty() {
+            "none".to_owned()
+        } else {
+            known.join(", ")
+        }
+    ))
 }
 
 /// The variable that holds the default database address. A named
 /// connection uses this name, `_` and the upper-case name.
-// shortcut: named connections live in .env with their passwords; move them
-// to the settings file with keychain:// passwords (ARCHITECTURE.md §6.2).
+// shortcut: .env connections keep plain-text passwords; they serve the local
+// playground. Real connections belong in the settings file (keychain).
 const ADDRESS_KEY: &str = "RIVET_DATABASE_URL";
 
 /// The variable of the named connection `name`: `my-db` is
@@ -191,51 +329,169 @@ fn decode(part: &str) -> Result<String> {
         .map_err(|_| Error::user("the address is not valid UTF-8 after decoding"))
 }
 
-/// Reads statements from `input` and writes their results to `output`.
+/// One input of the statement loop.
+enum Input {
+    Line(String),
+    /// Ctrl-C at the prompt: drop the statement typed so far.
+    Clear,
+    /// The input cannot be read.
+    Failed,
+    End,
+}
+
+/// The lines of `input`, without a prompt.
+fn lines(input: impl BufRead) -> impl FnMut(&str) -> Input {
+    let mut lines = input.lines();
+    move |_| match lines.next() {
+        Some(Ok(line)) => Input::Line(line),
+        Some(Err(error)) => {
+            eprintln!("error: cannot read the input: {error}");
+            Input::Failed
+        }
+        None => Input::End,
+    }
+}
+
+/// The interactive prompt: line editing and a history file.
+fn prompt(
+    runtime: &tokio::runtime::Runtime,
+    connection: &dyn Connection,
+    output: &mut impl Write,
+) -> bool {
+    let mut editor = match rustyline::DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(error) => {
+            eprintln!("error: cannot start the line editor: {error}");
+            return false;
+        }
+    };
+    let history: Option<PathBuf> = user_settings_path()
+        .ok()
+        .map(|path| path.with_file_name("history"));
+    if let Some(path) = &history {
+        // No history yet is normal.
+        let _ = editor.load_history(path);
+    }
+    let ok = repl(
+        runtime,
+        connection,
+        |prompt| match editor.readline(prompt) {
+            Ok(line) => {
+                let _ = editor.add_history_entry(line.as_str());
+                Input::Line(line)
+            }
+            Err(ReadlineError::Interrupted) => Input::Clear,
+            Err(ReadlineError::Eof) => Input::End,
+            Err(error) => {
+                eprintln!("error: cannot read the input: {error}");
+                Input::Failed
+            }
+        },
+        output,
+        false,
+    );
+    if let Some(path) = &history {
+        let saved = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(ReadlineError::from)
+            .and_then(|()| editor.save_history(path));
+        if let Err(error) = saved {
+            eprintln!(
+                "warning: cannot save the history to {}: {error}",
+                path.display()
+            );
+        }
+    }
+    ok
+}
+
+/// Runs the statements that `next` gives and writes their results to
+/// `output`; errors go to stderr. `next` gets the prompt to show.
+///
+/// A `script` stops at the first failed statement and also runs a last
+/// statement without `;`. Returns `false` if a statement or the input failed.
 fn repl(
     runtime: &tokio::runtime::Runtime,
     connection: &dyn Connection,
-    input: impl BufRead,
-    mut output: impl Write,
-) {
+    mut next: impl FnMut(&str) -> Input,
+    output: &mut impl Write,
+    script: bool,
+) -> bool {
+    // shortcut: a statement ends at a line that ends with `;`, so a `;` at a
+    // line end inside a function body splits it; the driver splits scripts
+    // later (decision 86.2).
     let mut statement = String::new();
-    let prompt = |output: &mut dyn Write, more: bool| {
-        let _ = write!(output, "{}", if more { "...> " } else { "sql> " });
-        let _ = output.flush();
-    };
-    prompt(&mut output, false);
-    for line in input.lines() {
-        let Ok(line) = line else { break };
+    let mut ok = true;
+    loop {
+        let line = match next(if statement.is_empty() {
+            "sql> "
+        } else {
+            "...> "
+        }) {
+            Input::Line(line) => line,
+            Input::Clear => {
+                statement.clear();
+                continue;
+            }
+            Input::Failed => return false,
+            Input::End => break,
+        };
         if statement.is_empty() && line.trim() == "\\q" {
-            return;
+            return ok;
+        }
+        if statement.is_empty() && line.trim().is_empty() {
+            continue;
         }
         statement.push_str(&line);
         statement.push('\n');
         if !line.trim_end().ends_with(';') {
-            prompt(&mut output, !statement.trim().is_empty());
-            if statement.trim().is_empty() {
-                statement.clear();
-            }
             continue;
         }
-        let sql = std::mem::take(&mut statement);
-        let text = runtime
-            .block_on(async {
-                let mut query = pin!(run(connection, sql.trim().trim_end_matches(';').to_owned()));
-                tokio::select! {
-                    result = &mut query => result,
-                    _ = tokio::signal::ctrl_c() => {
-                        // The query then ends with a `cancelled` error.
-                        if let Err(error) = connection.cancel().await {
-                            let _ = writeln!(output, "error: cancel failed: {error}");
-                        }
-                        query.await
-                    }
+        if !execute(runtime, connection, &std::mem::take(&mut statement), output) {
+            ok = false;
+            if script {
+                return false;
+            }
+        }
+    }
+    if script && !statement.trim().is_empty() {
+        ok &= execute(runtime, connection, &statement, output);
+    }
+    ok
+}
+
+/// Runs one statement; Ctrl-C cancels it. Returns `false` if it failed.
+fn execute(
+    runtime: &tokio::runtime::Runtime,
+    connection: &dyn Connection,
+    statement: &str,
+    output: &mut impl Write,
+) -> bool {
+    let statement = statement.trim().trim_end_matches(';').to_owned();
+    let result = runtime.block_on(async {
+        let mut query = pin!(run(connection, statement));
+        tokio::select! {
+            result = &mut query => result,
+            _ = tokio::signal::ctrl_c() => {
+                // The query then ends with a `cancelled` error.
+                if let Err(error) = connection.cancel().await {
+                    eprintln!("error: cancel failed: {error}");
                 }
-            })
-            .unwrap_or_else(|error| format!("error: {error}\n"));
-        let _ = output.write_all(text.as_bytes());
-        prompt(&mut output, false);
+                query.await
+            }
+        }
+    });
+    match result {
+        Ok(text) => {
+            let _ = output.write_all(text.as_bytes());
+            let _ = output.flush();
+            true
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            false
+        }
     }
 }
 
@@ -367,6 +623,35 @@ mod tests {
         let text = "RIVET_DATABASE_URL=a\nRIVET_DATABASE_URL_PG=b\n# RIVET_DATABASE_URL_OLD=c\nRIVET_DATABASE_URL_MYSQL=d";
         assert_eq!(names(text), ["pg", "mysql"]);
         assert_eq!(from_dotenv(text, &key_of("mysql")).as_deref(), Some("d"));
+    }
+
+    fn settings(text: &str) -> Settings {
+        let mut settings = Settings::new();
+        settings.set_layer(Layer::User, "test", text).unwrap();
+        settings
+    }
+
+    #[test]
+    fn saved_reads_url_and_password_uri() {
+        let settings = settings(
+            "schema_version = 1\n[connections.prod]\nurl = \"postgres://app@db/x\"\n\
+             password = \"keychain://rivet/prod\"\n[connections.local]\nurl = \"mysql://root@h/y\"\n",
+        );
+        let (url, password) = saved(&settings, "prod").unwrap().unwrap();
+        assert_eq!(url, "postgres://app@db/x");
+        assert_eq!(password.unwrap().as_str(), "keychain://rivet/prod");
+        assert!(saved(&settings, "local").unwrap().unwrap().1.is_none());
+        assert!(saved(&settings, "other").unwrap().is_none());
+    }
+
+    #[test]
+    fn saved_refuses_bad_names_and_entries() {
+        let empty = settings("schema_version = 1\n");
+        assert!(saved(&empty, "a.b").is_err());
+        assert!(saved(&empty, "").is_err());
+        let no_url =
+            settings("schema_version = 1\n[connections.x]\npassword = \"keychain://rivet/x\"\n");
+        assert!(saved(&no_url, "x").is_err());
     }
 
     #[test]
