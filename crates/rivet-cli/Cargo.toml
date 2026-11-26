@@ -18,9 +18,10 @@ arrow-array = { version = "60.2.0", default-features = false }
 arrow-schema = { version = "60.2.0", default-features = false }
 futures-core = "0.3.34"
 percent-encoding = "2.3.2"
-# shortcut: linked directly, against ARCHITECTURE.md §3.2 footnote 1; load it
-# through the extension host once the host can hand out a driver.
+# shortcut: the drivers are linked directly, against ARCHITECTURE.md §3.2
+# footnote 1; load them through the extension host once it can hand out a driver.
+rivet-ext-mysql = { path = "../rivet-ext-mysql" }
 rivet-ext-postgres = { path = "../rivet-ext-postgres" }
 rivet-sdk = { path = "../rivet-sdk" }
-tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal"] }
 url = "2.5.9"
