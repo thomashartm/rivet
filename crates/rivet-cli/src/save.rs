@@ -69,6 +69,15 @@ pub fn run(runtime: &tokio::runtime::Runtime, args: &[String]) -> Result<()> {
     }
     // Validates the address (TLS parameters included) before the prompt.
     let (mut request, driver) = parse(address)?;
+    // shortcut: no password to ask for and store with a client certificate;
+    // save it without `password` once `rivet save` needs it.
+    if request.profile.tls.client_certificate.is_some() {
+        return Err(Error::user(
+            "rivet save cannot save a client certificate yet: write the \
+             [connections.<name>] table by hand, with `tls_cert` and `tls_key` in `url` and \
+             no `password`",
+        ));
+    }
     let path = user_settings_path()?;
     let current = match std::fs::read_to_string(&path) {
         Ok(text) => text,
