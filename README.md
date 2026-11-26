@@ -128,18 +128,29 @@ The settings file:
 
 **Save a connection**
 
-1. Run `rivet save prod postgres://app@db.example.com:5432/app`. Leave the password out of the address.
-2. Type the password. It is hidden.
-3. rivet connects once to check the password.
-4. rivet stores the password in the keychain as `keychain://rivet/prod`.
-5. rivet adds the connection to the settings file.
-6. Run `rivet prod`.
+1. Run `rivet save prod postgres://app@db.example.com:5432/app --env prod --read-only`. Leave the password out of the address.
+2. rivet checks the address and the flags. A bad one stops here, before the password prompt.
+3. Type the password. It is hidden.
+4. rivet connects once to check the password.
+5. rivet stores the password in the keychain as `keychain://rivet/prod`.
+6. rivet adds the connection to the settings file.
+7. Run `rivet prod`.
+
+Flags (after `save`, in any order, each once):
+
+| Flag | Written to the settings file |
+|---|---|
+| `--read-only` | `read_only = true` |
+| `--confirm-on-write` | `confirm_on_write = true` |
+| `--env <label>` | `environment = "<label>"` |
+
+TLS options stay in the address: `?tls=off`, `?tls_ca=<path>`.
 
 - A wrong password stores nothing.
 - A name that already exists is refused.
 - A name has letters, digits, `-` and `_` only.
 
-**Add safety flags (by hand, in the settings file)**
+**The saved result**
 
 ```toml
 schema_version = 1
