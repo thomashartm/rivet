@@ -1,0 +1,331 @@
+//! Tests of `rivet_core::execute` against an in-memory connection. No
+//! container is needed. The tests use the paused Tokio clock: a sleep
+//! returns when every task waits, so no test depends on real time.
+
+use std::future::poll_fn;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures_core::Stream;
+use rivet_core::Owner;
+use rivet_core::execute::{RESULT_BUFFER, execute};
+use rivet_core::jobs::{JobScheduler, JobState};
+use rivet_core::logging::{LogConfig, Redactor, dispatch};
+use rivet_sdk::error::{Error, ErrorCategory, Result};
+use rivet_sdk::extension::{BoxFuture, Connection};
+use rivet_sdk::model::{ColumnMetadata, ResultSet};
+
+/// The statement of every test. A test checks that it is in no log event.
+const STATEMENT: &str = "select secret_column from secret_table";
+
+/// What the fake connection does.
+#[derive(Clone, Copy)]
+enum Plan {
+    /// Returns this many batches, then ends.
+    Batches(i64),
+    /// Returns batches until the result set is dropped.
+    Endless,
+    /// Returns two batches, then a `database` error.
+    FailAfterTwo,
+    /// `execute` fails with a `user` error.
+    Refuse,
+}
+
+/// What the fake connection saw. The test reads it.
+#[derive(Default)]
+struct Seen {
+    /// How many batches the driver made.
+    produced: AtomicUsize,
+    /// `true` after the driver result set was dropped.
+    dropped: AtomicBool,
+    /// `true` after `cancel` was called while the result set was alive.
+    cancelled_while_running: AtomicBool,
+}
+
+struct FakeConnection {
+    plan: Plan,
+    seen: Arc<Seen>,
+}
+
+/// The batches of the fake. Each batch has one row: its number.
+struct FakeBatches {
+    plan: Plan,
+    seen: Arc<Seen>,
+    schema: SchemaRef,
+}
+
+impl Drop for FakeBatches {
+    fn drop(&mut self) {
+        self.seen.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Stream for FakeBatches {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let number = self.seen.produced.load(Ordering::SeqCst) as i64;
+        let next = match self.plan {
+            Plan::Batches(total) if number >= total => return Poll::Ready(None),
+            Plan::FailAfterTwo if number >= 2 => {
+                let message = format!("bad row in `{STATEMENT}`");
+                return Poll::Ready(Some(Err(Error::database(message))));
+            }
+            _ => number,
+        };
+        self.seen.produced.fetch_add(1, Ordering::SeqCst);
+        let column = Arc::new(Int64Array::from(vec![next]));
+        Poll::Ready(Some(Ok(RecordBatch::try_new(
+            self.schema.clone(),
+            vec![column],
+        )
+        .unwrap())))
+    }
+}
+
+impl Connection for FakeConnection {
+    fn execute(&self, statement: String) -> BoxFuture<'_, Result<ResultSet>> {
+        Box::pin(async move {
+            if let Plan::Refuse = self.plan {
+                return Err(Error::user(format!("syntax error in `{statement}`")));
+            }
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+            let batches = FakeBatches {
+                plan: self.plan,
+                seen: self.seen.clone(),
+                schema: schema.clone(),
+            };
+            let columns = vec![ColumnMetadata::new("bigint", false)];
+            ResultSet::new(schema, columns, Box::pin(batches))
+        })
+    }
+
+    fn cancel(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let running = !self.seen.dropped.load(Ordering::SeqCst);
+            self.seen
+                .cancelled_while_running
+                .store(running, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+fn owner() -> Owner {
+    "acme.test".parse().unwrap()
+}
+
+fn connection(plan: Plan) -> (Box<dyn Connection>, Arc<Seen>) {
+    let seen = Arc::new(Seen::default());
+    let connection = FakeConnection {
+        plan,
+        seen: seen.clone(),
+    };
+    (Box::new(connection), seen)
+}
+
+/// Returns when every task waits. The clock is paused, so this takes no
+/// real time.
+async fn idle() {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+async fn next(result: &mut ResultSet) -> Option<Result<RecordBatch>> {
+    poll_fn(|cx| Pin::new(&mut *result).poll_next(cx)).await
+}
+
+fn number(batch: &RecordBatch) -> i64 {
+    let column = batch.column(0).as_any().downcast_ref::<Int64Array>();
+    column.unwrap().value(0)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_reader_slows_the_driver() {
+    const TOTAL: i64 = 50;
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Batches(TOTAL));
+    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+
+    let mut result = result.await.unwrap();
+    assert_eq!(result.schema().field(0).name(), "n");
+    for read in 0..TOTAL {
+        idle().await;
+        // The buffer is full and the job holds one more batch.
+        let ahead = (read + RESULT_BUFFER as i64 + 1).min(TOTAL);
+        assert_eq!(seen.produced.load(Ordering::SeqCst) as i64, ahead);
+        let batch = next(&mut result).await.unwrap().unwrap();
+        assert_eq!(number(&batch), read);
+    }
+    assert!(next(&mut result).await.is_none());
+    assert!(next(&mut result).await.is_none());
+
+    job.join().await.unwrap();
+    assert_eq!(scheduler.jobs()[0].state, JobState::Succeeded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_calls_the_driver_and_ends_the_result() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Endless);
+    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let mut result = result.await.unwrap();
+    next(&mut result).await.unwrap().unwrap();
+    idle().await;
+
+    job.cancel();
+    let watch = job.watch();
+    let error = job.join().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert_eq!(watch.borrow().state, JobState::Cancelled);
+    assert!(seen.cancelled_while_running.load(Ordering::SeqCst));
+    assert!(seen.dropped.load(Ordering::SeqCst));
+
+    // The batches in the buffer arrive, then the `cancelled` error.
+    let error = loop {
+        match next(&mut result).await.unwrap() {
+            Ok(_) => continue,
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert!(next(&mut result).await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn to_drop_the_result_stops_the_statement() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, seen) = connection(Plan::Endless);
+    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let mut result = result.await.unwrap();
+    next(&mut result).await.unwrap().unwrap();
+    idle().await;
+    assert!(!seen.dropped.load(Ordering::SeqCst));
+
+    drop(result);
+    let watch = job.watch();
+    let error = job.join().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert_eq!(watch.borrow().state, JobState::Cancelled);
+    assert!(seen.dropped.load(Ordering::SeqCst));
+    assert!(!seen.cancelled_while_running.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_driver_error_keeps_its_category_and_message() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, _) = connection(Plan::FailAfterTwo);
+    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let mut result = result.await.unwrap();
+    assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 0);
+    assert_eq!(number(&next(&mut result).await.unwrap().unwrap()), 1);
+    let error = next(&mut result).await.unwrap().unwrap_err();
+    let message = format!("bad row in `{STATEMENT}`");
+    assert_eq!(error.category(), ErrorCategory::Database);
+    assert_eq!(error.message(), message);
+    assert!(next(&mut result).await.is_none());
+
+    let watch = job.watch();
+    let error = job.join().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Database);
+    assert_eq!(error.message(), message);
+    assert_eq!(watch.borrow().state, JobState::Failed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_statement_keeps_its_category_and_message() {
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    let (connection, _) = connection(Plan::Refuse);
+    let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+    let message = format!("syntax error in `{STATEMENT}`");
+    let error = result.await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::User);
+    assert_eq!(error.message(), message);
+
+    let watch = job.watch();
+    let error = job.join().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::User);
+    assert_eq!(error.message(), message);
+    assert_eq!(watch.borrow().state, JobState::Failed);
+}
+
+/// A log output that the test reads.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Makes a capture the log subscriber of this thread, at level `TRACE`.
+///
+/// It also keeps a second subscriber alive for the whole test process, as
+/// `rivet_core::logging::capture_logs` does: with one subscriber only,
+/// tracing-core caches the interest of a log statement for the process, and
+/// a parallel test with no subscriber could turn it off.
+fn capture_log() -> (Capture, tracing::dispatcher::DefaultGuard) {
+    static SECOND: OnceLock<tracing::Dispatch> = OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
+    let capture = Capture::default();
+    let writer = {
+        let capture = capture.clone();
+        move || capture.clone()
+    };
+    let config = LogConfig {
+        level: tracing::Level::TRACE,
+        ..LogConfig::default()
+    };
+    let log = dispatch(&config, writer, Redactor::new());
+    (capture, tracing::dispatcher::set_default(&log))
+}
+
+// The jobs run on this thread (current-thread runtime), so the capture of
+// this thread sees their log events.
+#[tokio::test(start_paused = true)]
+async fn no_log_event_contains_the_statement() {
+    let (capture, _guard) = capture_log();
+    let scheduler = JobScheduler::new(NonZeroUsize::MIN, 100);
+    for plan in [
+        Plan::Batches(3),
+        Plan::FailAfterTwo,
+        Plan::Refuse,
+        Plan::Endless,
+    ] {
+        let (connection, _) = connection(plan);
+        let (job, result) = execute(&scheduler, owner(), connection, STATEMENT.to_owned()).unwrap();
+        if let Ok(mut result) = result.await {
+            next(&mut result).await.unwrap().unwrap();
+            if let Plan::Endless = plan {
+                job.cancel();
+            }
+            while let Some(Ok(_)) = next(&mut result).await {}
+        }
+        let _ = job.join().await;
+    }
+
+    let text = capture.text();
+    assert_eq!(text.matches("statement started").count(), 4, "{text}");
+    assert_eq!(text.matches("statement ended").count(), 4, "{text}");
+    assert!(text.contains("job=4"), "{text}");
+    assert!(!text.contains("secret_column"), "{text}");
+    assert!(!text.contains("secret_table"), "{text}");
+}
+
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
