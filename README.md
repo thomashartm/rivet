@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/rivet-logo.jpg" alt="rivet logo: a smiling rivet holding a key and a database" width="300">
+</p>
+
 # Rivet
 
 Rivet is a headless-first database client for PostgreSQL and MySQL, written in Rust. The goal is to run queries and stream results from the command line, with an optional desktop client that uses the same engine.
