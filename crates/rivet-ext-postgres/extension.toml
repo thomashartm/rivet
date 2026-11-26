@@ -1,0 +1,8 @@
+# The extension manifest of the PostgreSQL driver (ARCHITECTURE.md §4.4).
+id = "rivet.postgres"
+version = "0.1.0"
+sdk = ">=0.1.0, <0.2.0"
+
+[[contributes]]
+kind = "driver"
+id = "postgres"
