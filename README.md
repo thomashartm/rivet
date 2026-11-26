@@ -138,11 +138,11 @@ The settings file:
 
 Flags (after `save`, in any order, each once):
 
-| Flag | Written to the settings file |
-|---|---|
-| `--read-only` | `read_only = true` |
-| `--confirm-on-write` | `confirm_on_write = true` |
-| `--env <label>` | `environment = "<label>"` |
+| Flag | Written to the settings file | Effect |
+|---|---|---|
+| `--read-only` | `read_only = true` | Refuses statements that write |
+| `--confirm-on-write` | `confirm_on_write = true` | Asks y/N before a statement that writes. A file or a pipe cannot answer, so it is refused there. |
+| `--env <label>` | `environment = "<label>"` | A label. Shown when you connect and in the confirmation question. |
 
 TLS options stay in the address: `?tls=off`, `?tls_ca=<path>`.
 
@@ -162,11 +162,7 @@ environment = "prod"
 read_only = true
 ```
 
-| Flag | Effect |
-|---|---|
-| `environment = "prod"` | A label. Shown when you connect and in the confirmation question. |
-| `read_only = true` | Refuses statements that write |
-| `confirm_on_write = true` | Asks y/N before a statement that writes. A file or a pipe cannot answer, so it is refused there. |
+You can also edit these lines by hand.
 
 **Known limit**
 
