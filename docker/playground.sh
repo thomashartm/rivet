@@ -38,4 +38,4 @@ add MYSQL_DATABASE playground
 add RIVET_DATABASE_URL_MYSQL "mysql://rivet:$mysql_password@127.0.0.1:53306/playground"
 
 docker compose --env-file "$env_file" -f "$root/docker/compose.playground.yml" up -d --wait
-echo "playground ready. Run: cargo run -p rivet-cli [-- pg | mysql]"
+echo "playground ready. Run: make run (PostgreSQL) or make run-mysql"
