@@ -7,7 +7,7 @@
 //! | Topic | Behaviour |
 //! | --- | --- |
 //! | Login | The user and the password come from the [`Credentials`] of the request. Other credentials are refused with `auth`. |
-//! | TLS | Not supported yet (#19). A profile with `tls.enabled = true` is refused with `user`; the driver does not connect. |
+//! | TLS | On if `tls.enabled` (the default): rustls, TLS 1.2 or 1.3, the server certificate and the host name of the endpoint are verified. The trust store is the system store, or only the `tls.ca_certificate` file. The cancel request uses TLS too. A server without TLS is refused. A `tls.client_certificate` is refused with `user` (not supported yet). |
 //! | Transport | If the request has a transport, the protocol runs over it and the driver opens no socket. |
 //! | Types | See the table on [`PostgresDriver`]. |
 //! | Rows | Read in batches of [`BATCH_ROWS`] rows, only as fast as the [`ResultSet`] is read. |
@@ -45,12 +45,16 @@ use rivet_sdk::extension::{
     BoxFuture, ConnectRequest, Connection, Credential, Credentials, Dialect, Driver,
 };
 use rivet_sdk::model::{ColumnMetadata, ConnectionProfile, ResultSet};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::AbortHandle;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage, SimpleQueryStream};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::transport::Transport;
 use crate::types::ColumnBuilder;
@@ -105,16 +109,11 @@ async fn connect(request: ConnectRequest) -> Result<Box<dyn Connection>> {
         transport,
         ..
     } = request;
-    if profile.tls.enabled {
-        return Err(Error::user(
-            "the PostgreSQL driver cannot use TLS yet (ticket #19); the profile asks for \
-             TLS, so the driver does not connect",
-        ));
-    }
+    let tls = tls(&profile)?;
     let config = config(&profile, &credentials)?;
     let (client, target, tunnel) = match transport {
         Some(transport) => {
-            let (client, task) = start(&config, Transport::new(transport)).await?;
+            let (client, task) = start(&config, Transport::new(transport), tls.as_ref()).await?;
             let tunnel = Tunnel {
                 task,
                 closed: Arc::new(AtomicBool::new(false)),
@@ -126,13 +125,14 @@ async fn connect(request: ConnectRequest) -> Result<Box<dyn Connection>> {
                 profile.endpoint.host.clone(),
                 profile.endpoint.port.unwrap_or(DEFAULT_PORT),
             );
-            let (client, _) = start(&config, open_socket(&target).await?).await?;
+            let (client, _) = start(&config, open_socket(&target).await?, tls.as_ref()).await?;
             (client, Some(target), None)
         }
     };
     let cancel = Canceller {
         token: client.cancel_token(),
         target,
+        tls,
     };
     Ok(Box::new(PostgresConnection {
         client,
@@ -160,7 +160,12 @@ fn config(
     config
         .user(user)
         .password(password.expose())
-        .ssl_mode(SslMode::Disable)
+        // `Require` with a verifying connector: no fallback to plaintext.
+        .ssl_mode(if profile.tls.enabled {
+            SslMode::Require
+        } else {
+            SslMode::Disable
+        })
         // The decoder of `bytea` reads only the hex format; a role or database
         // default of `escape` must not change that.
         .options("-c bytea_output=hex");
@@ -179,23 +184,136 @@ async fn open_socket((host, port): &(String, u16)) -> Result<TcpStream> {
         })
 }
 
+/// The TLS of a connection: the connector and the host name that the server
+/// certificate must have.
+#[derive(Clone)]
+struct Tls {
+    connector: MakeRustlsConnect,
+    host: String,
+}
+
+impl Tls {
+    fn connect<S>(&self) -> <MakeRustlsConnect as MakeTlsConnect<S>>::TlsConnect
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        match MakeTlsConnect::<S>::make_tls_connect(&mut self.connector.clone(), &self.host) {
+            Ok(connect) => connect,
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// The TLS of `profile`, or `None` if the profile turns TLS off.
+fn tls(profile: &ConnectionProfile) -> Result<Option<Tls>> {
+    let settings = &profile.tls;
+    if !settings.enabled {
+        return Ok(None);
+    }
+    // shortcut: no client certificate; its key is a secret URI that only the
+    // host can resolve. Add it when the connect request carries the key.
+    if settings.client_certificate.is_some() {
+        return Err(Error::user(
+            "the PostgreSQL driver does not support a TLS client certificate yet (ticket \
+             #19); remove `tls.client_certificate` from the profile",
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    match &settings.ca_certificate {
+        Some(path) => {
+            let unreadable = |error: rustls::pki_types::pem::Error| {
+                Error::user(format!(
+                    "cannot read the CA certificate file {}",
+                    path.display()
+                ))
+                .with_source(error)
+            };
+            for certificate in CertificateDer::pem_file_iter(path).map_err(unreadable)? {
+                roots
+                    .add(certificate.map_err(unreadable)?)
+                    .map_err(|error| {
+                        Error::user(format!(
+                            "{} has a certificate that is not a valid CA certificate",
+                            path.display()
+                        ))
+                        .with_source(error)
+                    })?;
+            }
+            if roots.is_empty() {
+                return Err(Error::user(format!(
+                    "{} has no PEM certificate",
+                    path.display()
+                )));
+            }
+        }
+        None => {
+            let (added, _) =
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            if added == 0 {
+                return Err(Error::user(
+                    "the system trust store has no certificate; set `tls.ca_certificate` to \
+                     the CA file of the server",
+                ));
+            }
+        }
+    }
+    // The provider is explicit: the process default depends on crate features.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| Error::internal("the TLS provider is not usable").with_source(error))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Some(Tls {
+        connector: MakeRustlsConnect::new(config),
+        host: profile.endpoint.host.clone(),
+    }))
+}
+
+/// Two handles of one socket. The cancel request consumes the first (also
+/// inside TLS); the second waits for the server to close the socket.
+fn twin(socket: TcpStream) -> std::io::Result<(TcpStream, TcpStream)> {
+    let socket = socket.into_std()?;
+    let watch = socket.try_clone()?;
+    Ok((TcpStream::from_std(socket)?, TcpStream::from_std(watch)?))
+}
+
 /// Logs in over `stream` and starts the background task of the connection.
-/// To abort the task drops `stream`.
-async fn start<S>(config: &tokio_postgres::Config, stream: S) -> Result<(Client, AbortHandle)>
+/// To abort the task drops `stream`. `tls` is `None` for plaintext.
+async fn start<S>(
+    config: &tokio_postgres::Config,
+    stream: S,
+    tls: Option<&Tls>,
+) -> Result<(Client, AbortHandle)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (client, connection) =
-        tokio::time::timeout(LOGIN_TIMEOUT, config.connect_raw(stream, NoTls))
-            .await
-            .map_err(|elapsed| {
-                Error::connectivity(format!(
-                    "PostgreSQL did not finish the login in {} seconds",
-                    LOGIN_TIMEOUT.as_secs()
-                ))
-                .with_source(elapsed)
-            })?
-            .map_err(map_error)?;
+    match tls {
+        Some(tls) => login(config, stream, tls.connect::<S>()).await,
+        None => login(config, stream, NoTls).await,
+    }
+}
+
+async fn login<S, T>(
+    config: &tokio_postgres::Config,
+    stream: S,
+    tls: T,
+) -> Result<(Client, AbortHandle)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: TlsConnect<S>,
+    T::Stream: Send + 'static,
+{
+    let (client, connection) = tokio::time::timeout(LOGIN_TIMEOUT, config.connect_raw(stream, tls))
+        .await
+        .map_err(|elapsed| {
+            Error::connectivity(format!(
+                "PostgreSQL did not finish the login in {} seconds",
+                LOGIN_TIMEOUT.as_secs()
+            ))
+            .with_source(elapsed)
+        })?
+        .map_err(map_error)?;
     // The task ends when the client is dropped or the stream fails. A failure
     // reaches the caller as a `closed` error of the next call.
     let task = tokio::spawn(connection).abort_handle();
@@ -227,6 +345,13 @@ fn map_error(error: tokio_postgres::Error) -> Error {
         let message = format!("PostgreSQL: {} (SQLSTATE {code})", db.message());
         return Error::new(category(code), message).with_source(error);
     }
+    // `tokio-postgres` has no TLS test and its text leaves out the cause (for
+    // example a wrong certificate); the unit and container tests pin the text.
+    if error.to_string() == "error performing TLS handshake" {
+        let cause = std::error::Error::source(&error).map_or(String::new(), |c| format!(": {c}"));
+        let message = format!("PostgreSQL: the TLS connection failed{cause}");
+        return Error::connectivity(message).with_source(error);
+    }
     let io = std::error::Error::source(&error).is_some_and(|source| source.is::<std::io::Error>());
     let category = if error.is_closed() || io {
         ErrorCategory::Connectivity
@@ -243,6 +368,8 @@ struct Canceller {
     /// The host and port of the server. `None` if the connection runs over a
     /// transport: then no second connection is possible.
     target: Option<(String, u16)>,
+    /// The TLS of the connection; the cancel request uses it too.
+    tls: Option<Tls>,
 }
 
 impl Canceller {
@@ -254,14 +381,21 @@ impl Canceller {
             ));
         };
         let cancel = async {
-            let mut socket = open_socket(target).await?;
-            self.token
-                .cancel_query_raw(&mut socket, NoTls)
-                .await
-                .map_err(map_error)?;
+            let (socket, mut watch) = twin(open_socket(target).await?).map_err(|error| {
+                Error::connectivity("cannot prepare the cancel socket").with_source(error)
+            })?;
+            let sent = match &self.tls {
+                Some(tls) => {
+                    self.token
+                        .cancel_query_raw(socket, tls.connect::<TcpStream>())
+                        .await
+                }
+                None => self.token.cancel_query_raw(socket, NoTls).await,
+            };
+            sent.map_err(map_error)?;
             // The server closes the socket after it has passed the request on.
             // A later statement thus cannot get the cancel.
-            let _ = socket.read_to_end(&mut Vec::new()).await;
+            let _ = watch.read_to_end(&mut Vec::new()).await;
             Ok(())
         };
         tokio::time::timeout(CANCEL_TIMEOUT, cancel)

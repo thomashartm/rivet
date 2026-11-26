@@ -51,6 +51,13 @@ impl AsyncRead for Transport {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // A reader may wait for the answer to a write it never flushed (the
+        // `SSLRequest` of the TLS start): the write must go on meanwhile.
+        if this.writing.is_some()
+            && let Poll::Ready(Err(error)) = this.poll_written(cx)
+        {
+            return Poll::Ready(Err(error));
+        }
         if this.unread.is_empty() {
             let stream = &this.stream;
             let read = this.reading.get_or_insert_with(|| {

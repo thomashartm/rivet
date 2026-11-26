@@ -1,2 +1,4 @@
 target/
 .env
+# Throwaway TLS files of the container tests (docker/test-certs.sh).
+docker/test-certs/

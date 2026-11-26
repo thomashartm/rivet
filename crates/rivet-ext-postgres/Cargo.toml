@@ -15,9 +15,12 @@ arrow-array = { version = "60.2.0", default-features = false }
 arrow-schema = { version = "60.2.0", default-features = false }
 futures-core = "0.3.34"
 rivet-sdk = { path = "../rivet-sdk" }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "sync", "time"] }
 # Without the default `runtime` feature: the driver opens its sockets itself.
 tokio-postgres = { version = "0.7.18", default-features = false }
+tokio-postgres-rustls = "0.14.0"
 
 [dev-dependencies]
 rivet-testkit = { path = "../rivet-testkit" }

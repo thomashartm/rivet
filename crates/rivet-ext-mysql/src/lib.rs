@@ -11,7 +11,7 @@
 //! | Drop of an `execute` future before the answer | `KILL QUERY`, and the connection is closed: the next statement would read the old answer. The next `execute` gives a `connectivity` error. |
 //! | `cancel` | `KILL QUERY <connection id>` on a second connection. |
 //! | One statement for each `execute` | `mysql_async` cannot turn multi-statements off. The statement is prepared first: the server refuses a second statement (`user` error, code 1064) and runs none. A statement that cannot be prepared (code 1295, for example `LOCK TABLES`) is run as it is: the server had parsed it as one statement. |
-//! | TLS | Not supported yet (#19): a profile with TLS on is refused. |
+//! | TLS | On if `tls.enabled` (the default): rustls, the server certificate and the host name of the endpoint are verified, also for the `KILL QUERY` connection. The trust store is the system store, or only the `tls.ca_certificate` file; the built-in Mozilla roots of `mysql_async` are off. A server without TLS is refused. A `tls.client_certificate` is refused with `user` (not supported yet). |
 //! | Tunnel transport | Not supported: `mysql_async` opens its own socket. A request with a transport is refused. |
 //!
 //! The password is in no error and no debug text of this crate.
@@ -23,10 +23,10 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Opts, OptsBuilder, QueryResult, TextProtocol, Value};
+use mysql_async::{Conn, Opts, OptsBuilder, QueryResult, SslOpts, TextProtocol, Value};
 use rivet_sdk::error::{Error, Result};
 use rivet_sdk::extension::{BoxFuture, ConnectRequest, Connection, Credential, Dialect, Driver};
-use rivet_sdk::model::ResultSet;
+use rivet_sdk::model::{ResultSet, TlsSettings};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 mod types;
@@ -98,12 +98,7 @@ fn opts(request: &ConnectRequest) -> Result<Opts> {
              its own socket. Remove the tunnels from the profile",
         ));
     }
-    if request.profile.tls.enabled {
-        return Err(Error::user(
-            "the MySQL driver does not support TLS yet (ticket #19). To connect in plain \
-             text, set `tls.enabled = false` in the profile",
-        ));
-    }
+    let ssl = ssl_opts(&request.profile.tls)?;
     let credentials = &request.credentials;
     let user = credentials
         .user
@@ -123,7 +118,53 @@ fn opts(request: &ConnectRequest) -> Result<Opts> {
         .pass(Some(password.expose().to_owned()))
         // Else the client switches to the Unix socket that the server names.
         .prefer_socket(false)
+        .ssl_opts(ssl)
         .into())
+}
+
+/// The TLS options of `tls`, or `None` if the profile turns TLS off.
+fn ssl_opts(tls: &TlsSettings) -> Result<Option<SslOpts>> {
+    if !tls.enabled {
+        return Ok(None);
+    }
+    // shortcut: no client certificate; its key is a secret URI that only the
+    // host can resolve. Add it when the connect request carries the key.
+    if tls.client_certificate.is_some() {
+        return Err(Error::user(
+            "the MySQL driver does not support a TLS client certificate yet (ticket #19); \
+             remove `tls.client_certificate` from the profile",
+        ));
+    }
+    let roots: Vec<_> = match &tls.ca_certificate {
+        // `mysql_async` reads PEM or DER and fails the connect on a bad file.
+        Some(path) => vec![
+            std::fs::read(path)
+                .map_err(|error| {
+                    Error::user(format!(
+                        "cannot read the CA certificate file {}",
+                        path.display()
+                    ))
+                    .with_source(error)
+                })?
+                .into(),
+        ],
+        None => rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .map(|certificate| certificate.to_vec().into())
+            .collect(),
+    };
+    if roots.is_empty() {
+        return Err(Error::user(
+            "the system trust store has no certificate; set `tls.ca_certificate` to the CA \
+             file of the server",
+        ));
+    }
+    Ok(Some(
+        SslOpts::default()
+            .with_root_certs(roots)
+            .with_disable_built_in_roots(true),
+    ))
 }
 
 /// Maps an error of `mysql_async` to the categories of the [`Driver`] doc.
@@ -141,9 +182,10 @@ fn error(error: mysql_async::Error) -> Error {
             _ => Error::user(message),
         },
         mysql_async::Error::Io(_)
-        | mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed) => {
-            Error::connectivity(message)
-        }
+        | mysql_async::Error::Driver(
+            mysql_async::DriverError::ConnectionClosed
+            | mysql_async::DriverError::NoClientSslFlagFromServer,
+        ) => Error::connectivity(message),
         _ => Error::internal(message),
     }
 }
@@ -469,14 +511,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_with_tls_is_refused_without_a_connection() {
+    async fn client_certificate_is_refused_without_a_connection() {
         let (listener, port) = listener().await;
-        let error = connect_error(request(port, true)).await;
+        let mut request = request(port, true);
+        let key = "keychain://rivet/client-key".parse().unwrap();
+        request.profile.tls = TlsSettings::new()
+            .with_client_certificate(rivet_sdk::model::ClientCertificate::new("c.pem", key));
+        let error = connect_error(request).await;
         assert_eq!(error.category(), ErrorCategory::User);
-        assert!(error.message().contains("TLS"), "{error:?}");
-        assert!(error.message().contains("#19"), "{error:?}");
+        assert!(error.message().contains("client certificate"), "{error:?}");
         assert_no_password(&error);
         assert_no_connection(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn missing_ca_file_is_refused_without_a_connection() {
+        let (listener, port) = listener().await;
+        let mut request = request(port, true);
+        let path = std::env::temp_dir().join("rivet-mysql-no-such-ca.pem");
+        request.profile.tls = TlsSettings::new().with_ca_certificate(path.clone());
+        let error = connect_error(request).await;
+        assert_eq!(error.category(), ErrorCategory::User);
+        assert!(
+            error.message().contains(&*path.to_string_lossy()),
+            "{error:?}"
+        );
+        assert_no_connection(&listener).await;
+    }
+
+    #[test]
+    fn tls_uses_only_the_chosen_roots() {
+        assert!(
+            ssl_opts(&TlsSettings::new().with_enabled(false))
+                .unwrap()
+                .is_none()
+        );
+        let system = ssl_opts(&TlsSettings::new()).unwrap().unwrap();
+        assert!(system.disable_built_in_roots());
+        assert!(!system.root_certs().is_empty());
+        assert!(!system.accept_invalid_certs() && !system.skip_domain_validation());
+        let path = std::env::temp_dir().join(format!("rivet-mysql-ca-{}.pem", std::process::id()));
+        std::fs::write(&path, "pinned").unwrap();
+        let pinned = ssl_opts(&TlsSettings::new().with_ca_certificate(path.clone()));
+        std::fs::remove_file(&path).unwrap();
+        let pinned = pinned.unwrap().unwrap();
+        assert!(pinned.disable_built_in_roots());
+        assert_eq!(pinned.root_certs().len(), 1, "only the pinned CA");
     }
 
     struct NoStream;
@@ -600,6 +680,10 @@ mod tests {
             ),
             (
                 mysql_async::DriverError::ConnectionClosed.into(),
+                ErrorCategory::Connectivity,
+            ),
+            (
+                mysql_async::DriverError::NoClientSslFlagFromServer.into(),
                 ErrorCategory::Connectivity,
             ),
             (

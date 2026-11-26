@@ -58,6 +58,18 @@ const HOST: &str = "127.0.0.1";
 const DATABASE: &str = "rivet_test";
 const POSTGRES_PORT: u16 = 54329;
 const MYSQL_PORT: u16 = 33069;
+const POSTGRES_TLS_PORT: u16 = 54330;
+const MYSQL_TLS_PORT: u16 = 33070;
+
+/// The host name in the certificate of the TLS test servers.
+pub const TLS_HOST: &str = "localhost";
+
+/// The directory with the test TLS files that `docker/test-certs.sh`
+/// writes when the containers start: `ca.pem` (the CA of the TLS test
+/// servers) and `other-ca.pem` (a CA that signed nothing).
+pub fn test_certs_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/test-certs")
+}
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a PostgreSQL server must stay silent after its answer to the
 /// `SSLRequest`.
@@ -248,6 +260,25 @@ pub fn mysql() -> DatabaseFixture {
     DatabaseFixture::new("mysql", MYSQL_PORT)
 }
 
+/// The same database as the fixture, on its TLS server: the host is
+/// [`TLS_HOST`] and TLS is on, with only the test CA trusted.
+fn with_tls(mut fixture: DatabaseFixture, port: u16) -> DatabaseFixture {
+    fixture.profile.endpoint.host = TLS_HOST.to_owned();
+    fixture.profile.endpoint.port = Some(port);
+    fixture.profile.tls = TlsSettings::new().with_ca_certificate(test_certs_dir().join("ca.pem"));
+    fixture
+}
+
+/// The PostgreSQL TLS test database (`postgres-tls`).
+pub fn postgres_tls() -> DatabaseFixture {
+    with_tls(postgres(), POSTGRES_TLS_PORT)
+}
+
+/// The MySQL TLS test database (`mysql-tls`). It refuses plaintext.
+pub fn mysql_tls() -> DatabaseFixture {
+    with_tls(mysql(), MYSQL_TLS_PORT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +312,15 @@ mod tests {
                 .collect();
             assert_eq!(ports, [format!("      - \"{port}\"")], "{name}: ports");
             assert!(!service.contains("volumes:"), "{name}: no persistent data");
+            assert!(service.contains("tmpfs:"), "{name}: data in memory");
+        }
+        for (name, port) in [
+            ("postgres-tls", "127.0.0.1:54330:5432"),
+            ("mysql-tls", "127.0.0.1:33070:3306"),
+        ] {
+            let service = service(name);
+            assert!(service.contains(&format!("- \"{port}\"")), "{name}: port");
+            assert!(service.contains("./test-certs:/certs:ro"), "{name}: certs");
             assert!(service.contains("tmpfs:"), "{name}: data in memory");
         }
         assert!(!COMPOSE.contains("latest"));
@@ -321,6 +361,18 @@ mod tests {
             // The password is not in the profile, and not in the debug text.
             assert!(!format!("{fixture:?}").contains(TEST_ONLY_PASSWORD));
         }
+    }
+
+    #[test]
+    fn tls_fixtures_trust_only_the_test_ca() {
+        for (fixture, port) in [(postgres_tls(), 54330), (mysql_tls(), 33070)] {
+            assert_eq!(fixture.profile.endpoint.host, TLS_HOST);
+            assert_eq!(fixture.profile.endpoint.port, Some(port));
+            assert!(fixture.profile.tls.enabled);
+            let ca = fixture.profile.tls.ca_certificate.unwrap();
+            assert_eq!(ca, test_certs_dir().join("ca.pem"));
+        }
+        assert!(COMPOSE.contains("./test-certs:/certs\n"));
     }
 
     #[tokio::test]
