@@ -59,6 +59,14 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The child process: speaks the protocol on its standard input and output.
 fn child(directory: &Path) -> ! {
     let behaviour = std::fs::read_to_string(directory.join("behaviour")).unwrap();
+    // `<behaviour>+second`: the child first starts a second process (R-87).
+    let behaviour = match behaviour.strip_suffix("+second") {
+        Some(behaviour) => {
+            second(directory, true);
+            behaviour.to_owned()
+        }
+        None => behaviour,
+    };
     // One extension has one process at a time: the file `overlap` says that
     // an older process of this package directory exists.
     #[cfg(unix)]
@@ -307,7 +315,11 @@ impl Drop for Package {
     /// Ends the process that the child started with `second`.
     fn drop(&mut self) {
         if let Ok(pid) = std::fs::read_to_string(self.directory.join("second")) {
-            let _ = std::process::Command::new("kill").arg(pid).status();
+            // The runtime can have ended it already.
+            let _ = std::process::Command::new("kill")
+                .arg(pid)
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 }
@@ -320,6 +332,13 @@ impl Package {
             .lines()
             .map(|line| line.parse().unwrap())
             .collect()
+    }
+
+    /// The process id of the process that the child started with `second`.
+    #[cfg(unix)]
+    fn second(&self) -> u32 {
+        let pid = std::fs::read_to_string(self.directory.join("second")).unwrap();
+        pid.parse().unwrap()
     }
 
     #[cfg(unix)]
@@ -1091,6 +1110,63 @@ async fn a_dropped_call_kills_the_process() {
     assert_eq!(error.category(), ErrorCategory::Internal);
 }
 
+/// R-87 (ADR-0024): a process that the child started ends with the child.
+/// The child fails the handshake, or exits before it.
+#[cfg(unix)]
+async fn a_failed_load_ends_the_processes_that_the_child_started() {
+    for behaviour in ["wrong-version+second", "gone+second"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, _crashes) = runtime(config);
+        load(&runtime, &package).await.err().expect(behaviour);
+        until(|| !alive(package.second())).await;
+    }
+}
+
+/// R-87 (ADR-0024): to drop the instance ends the processes that the child
+/// started. The child exits on its closed input, or it is killed after the
+/// grace time.
+#[cfg(unix)]
+async fn to_drop_the_instance_ends_the_processes_that_the_child_started() {
+    for behaviour in ["ok+second", "stubborn+second"] {
+        let package = package(behaviour);
+        let mut config = config();
+        config.grace = Duration::from_millis(100);
+        let (runtime, _crashes) = runtime(config);
+        let instance = load(&runtime, &package).await.unwrap();
+        assert!(alive(package.second()), "{behaviour}");
+        drop(instance);
+        until(|| !alive(package.second())).await;
+    }
+}
+
+/// R-87 (ADR-0024): a dropped call ends the processes that the child
+/// started.
+#[cfg(unix)]
+async fn a_dropped_call_ends_the_processes_that_the_child_started() {
+    let package = package("hang+second");
+    let instance = loaded(&package).await;
+    let hanging = package.directory.join("hanging");
+    tokio::select! {
+        result = instance.activate(context()) => panic!("the call returned: {result:?}"),
+        () = until(|| hanging.exists()) => {}
+    }
+    until(|| !alive(package.second())).await;
+}
+
+/// R-87 (ADR-0024): after a crash the runtime ends the processes that the
+/// child started.
+#[cfg(unix)]
+async fn a_crash_ends_the_processes_that_the_child_started() {
+    let package = package("crash+second");
+    let (runtime, mut crashes) = runtime(config());
+    let _instance = load(&runtime, &package).await.unwrap();
+    std::fs::write(package.directory.join("crash"), "").unwrap();
+    within(crashes.recv()).await.unwrap();
+    until(|| !alive(package.second())).await;
+}
+
 /// Criterion 7.
 async fn the_process_gets_only_the_allowed_environment() {
     // Cargo gives this variable to the test program, so the test program
@@ -1295,6 +1371,14 @@ const TESTS: &[Test] = tests![
     a_process_that_is_killed_after_the_grace_time_is_not_left_defunct,
     #[cfg(unix)]
     a_dropped_call_kills_the_process,
+    #[cfg(unix)]
+    a_failed_load_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    to_drop_the_instance_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    a_dropped_call_ends_the_processes_that_the_child_started,
+    #[cfg(unix)]
+    a_crash_ends_the_processes_that_the_child_started,
     the_process_gets_only_the_allowed_environment,
     error_output_goes_to_the_log_as_untrusted_text,
     error_output_past_the_budget_is_dropped_and_counted,

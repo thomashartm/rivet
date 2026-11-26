@@ -1,6 +1,6 @@
 # ADR-0016: Dependency rule for `rivet-testkit`
 
-- Status: Proposed
+- Status: Accepted (maintainer, 2026-11-25). The points that the text marks as open or as a proposal stay open.
 - Date: 2026-11-25
 
 ## Context

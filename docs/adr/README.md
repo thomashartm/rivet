@@ -17,15 +17,16 @@
 | [0013](0013-sdk-bindings-delivery.md) | WIT and C ABI bindings are delivered with the runtimes | Accepted |
 | [0014](0014-keychain-optional-on-linux.md) | The OS keychain backend is optional on Linux | Accepted |
 | [0015](0015-integration-test-databases.md) | Integration tests use local database containers | Accepted |
-| [0016](0016-testkit-dependency-rule.md) | Dependency rule for `rivet-testkit` | Proposed |
-| [0017](0017-extension-host-lifecycle.md) | Extension host lifecycle: as built, and proposed changes | Proposed |
-| [0018](0018-wasm-runtime-parameters.md) | WASM runtime parameters | Proposed |
-| [0019](0019-publisher-identity-and-trust-store.md) | Publisher identity and trust store | Proposed |
-| [0020](0020-permission-matching-rules.md) | Permission matching rules | Proposed |
-| [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Proposed |
-| [0022](0022-short-secrets-not-redacted.md) | Secrets shorter than 4 bytes are not redacted in logs | Proposed |
-| [0023](0023-package-format-and-install-layout.md) | Package format and install layout | Proposed |
-| [0024](0024-native-process-runtime.md) | Native process runtime: protocol and supervision | Proposed |
+| [0016](0016-testkit-dependency-rule.md) | Dependency rule for `rivet-testkit` | Accepted |
+| [0017](0017-extension-host-lifecycle.md) | Extension host lifecycle: as built, and proposed changes | Accepted |
+| [0018](0018-wasm-runtime-parameters.md) | WASM runtime parameters | Accepted |
+| [0019](0019-publisher-identity-and-trust-store.md) | Publisher identity and trust store | Accepted |
+| [0020](0020-permission-matching-rules.md) | Permission matching rules | Accepted |
+| [0021](0021-extension-supervision.md) | Extension supervision: restart, timeouts and job limit | Accepted |
+| [0022](0022-short-secrets-not-redacted.md) | Secrets shorter than 4 bytes are not redacted in logs | Accepted |
+| [0023](0023-package-format-and-install-layout.md) | Package format and install layout | Accepted |
+| [0024](0024-native-process-runtime.md) | Native process runtime: protocol and supervision | Accepted |
+| [0025](0025-first-database-drivers.md) | First database drivers | Proposed |
 
 New ADRs use the next free number and the sections Context, Decision, Consequences, Status.
 

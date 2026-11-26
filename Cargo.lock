@@ -1585,6 +1585,7 @@ dependencies = [
  "minisign",
  "minisign-verify",
  "rivet-sdk",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
