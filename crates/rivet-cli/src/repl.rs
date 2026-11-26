@@ -270,9 +270,13 @@ fn guarded(
             eprintln!("error: the statement was not confirmed");
             false
         }
+        Ok(Guarded::Denied { error, connection }) => {
+            session.connection = Some(connection);
+            eprintln!("error: {error}");
+            false
+        }
         Err(error) => {
-            // The guard refused, or the job did not start: the connection
-            // is gone (decision on #27).
+            // The job did not start: the scheduler dropped the connection.
             eprintln!("error: {error}");
             eprintln!("error: the connection is closed; restart rivet");
             false
@@ -508,11 +512,10 @@ mod tests {
 
     #[test]
     fn a_write_on_a_read_only_profile_is_refused() {
-        // The guard closes the connection (decision on #27): the select
-        // after it fails too.
+        // The connection is kept (decision on #27): the select after it runs.
         assert_eq!(
             session("delete from t;\nselect 1;\n", Mode::Pipe, true, false),
-            (false, 0, false)
+            (false, 1, true)
         );
     }
 

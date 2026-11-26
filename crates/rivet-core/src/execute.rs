@@ -81,6 +81,15 @@ pub enum Guarded {
         /// The statement that the caller gave.
         statement: String,
     },
+    /// The guard refused the statement. The driver was not called and no
+    /// job was started; the connection is handed back unchanged (decision
+    /// on #27).
+    Denied {
+        /// The `policy` error of the guard.
+        error: Error,
+        /// The connection that the caller gave.
+        connection: Box<dyn Connection>,
+    },
 }
 
 /// Calls the guard with the flags of `profile`, then runs `statement` as
@@ -91,9 +100,8 @@ pub enum Guarded {
 ///
 /// # Errors
 ///
-/// - The guard denies the statement: its `policy` error. The driver is not
-///   called, no job is started, and `connection` is dropped.
-/// - The errors of [`execute`].
+/// The errors of [`execute`]. A refusal of the guard is not an error but
+/// [`Guarded::Denied`], which hands `connection` back.
 pub fn execute_guarded(
     scheduler: &JobScheduler,
     owner: Owner,
@@ -117,7 +125,7 @@ pub fn execute_guarded(
             connection,
             statement,
         }),
-        Decision::Deny(error) => Err(error),
+        Decision::Deny(error) => Ok(Guarded::Denied { error, connection }),
     }
 }
 

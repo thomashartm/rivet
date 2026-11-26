@@ -358,7 +358,7 @@ async fn the_guard_denies_a_write_on_a_read_only_profile() {
     let (connection, seen) = connection(Plan::Batches(1));
     let profile = profile(true, false);
     // `confirmed` does not change a deny.
-    let Err(error) = execute_guarded(
+    let Ok(Guarded::Denied { error, connection }) = execute_guarded(
         &scheduler,
         owner(),
         &profile,
@@ -371,6 +371,11 @@ async fn the_guard_denies_a_write_on_a_read_only_profile() {
     assert_eq!(error.category(), ErrorCategory::Policy);
     assert!(!seen.executed.load(Ordering::SeqCst));
     assert!(scheduler.jobs().is_empty());
+    // The connection comes back and runs the next statement (decision on #27).
+    let (job, result, _) = execute(&scheduler, owner(), connection, "select 1".to_owned()).unwrap();
+    drop(result.await.unwrap());
+    job.join().await.unwrap();
+    assert!(seen.executed.load(Ordering::SeqCst));
 
     let text = format!("{error} {error:?} {}", capture.text());
     for part in ["secret_table", "hunter2", "delete"] {
