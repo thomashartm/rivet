@@ -402,25 +402,28 @@ fn guest_error(state: &State, action: &str, error: &types::Error) -> Error {
 ///    ([`is_unsafe`]), and `"` becomes `'`. The human log format writes a host
 ///    field as `name="value"`, so the text cannot imitate one.
 /// 3. Secrets are redacted again: step 2 maps several characters to one, so
-///    it can make a secret, for example a TAB that becomes a space.
+///    it can make a secret, for example a TAB that becomes a space. The
+///    redactor also knows the cleaned form of each secret ([`guest_char`]),
+///    so a secret with a TAB that the guest writes with a space is found.
 /// 4. The text is cut to [`MAX_GUEST_TEXT_BYTES`]. This is after the
 ///    redaction, so the cut cannot leave a part of a secret: it can only
 ///    cut a marker.
 pub(crate) fn guest_text(redactor: &Redactor, text: &str) -> String {
-    let cleaned: String = redactor
-        .redact(text)
-        .chars()
-        .map(|c| match c {
-            '"' => '\'',
-            c if is_unsafe(c) => ' ',
-            c => c,
-        })
-        .collect();
+    let cleaned: String = redactor.redact(text).chars().map(guest_char).collect();
     let mut text = redactor.redact(&cleaned).into_owned();
     // Not `logging::shown`: no escape and no mark, so the result has the
     // limit as its true maximum, and step 2 replaced the unsafe characters.
     text.truncate(text.floor_char_boundary(MAX_GUEST_TEXT_BYTES));
     text
+}
+
+/// Step 2 of [`guest_text`] for one character.
+pub(crate) fn guest_char(c: char) -> char {
+    match c {
+        '"' => '\'',
+        c if is_unsafe(c) => ' ',
+        c => c,
+    }
 }
 
 /// The reason that Wasmtime gives for a component that it refuses or for a
@@ -2307,6 +2310,8 @@ mod tests {
             "a correct\thorse\u{1b}battery b",
             "a it\"s-a-secret-pass b",
             "a tab\tin-secret b",
+            // The cleaned form of a secret with a TAB, written by the guest.
+            "a tab in-secret b",
         ];
         for case in cases {
             let text = guest_text(&redactor, case);
