@@ -6,7 +6,7 @@ members = ["crates/*", "xtask"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
-# No licence field: the project licence is not decided yet.
+license = "Apache-2.0"
 publish = false
 
 [workspace.lints.rust]

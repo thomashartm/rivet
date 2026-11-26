@@ -142,7 +142,7 @@ flowchart TB
 - UI components MUST NOT open database, cloud or network connections. All data comes through the Engine API.
 - Boundaries MUST be enforced in CI:
   - an `xtask check-arch` step validates the table in §3.2 against `cargo metadata` ([ADR-0010](docs/adr/0010-architecture-check.md));
-  - `cargo-deny` checks licences, advisories and banned crates. Dependencies MUST have a permissive licence from the allow list in `deny.toml`; the project licence is not decided ([ADR-0012](docs/adr/0012-project-licence-open.md));
+  - `cargo-deny` checks licences, advisories and banned crates. Dependencies MUST have a permissive licence from the allow list in `deny.toml`; the project licence is Apache-2.0 ([ADR-0026](docs/adr/0026-project-licence-apache-2.0.md));
   - extension manifests are validated for undeclared dependencies.
 
 ## 4. Extension Architecture
@@ -506,7 +506,7 @@ All targets are binding and MUST be checked by benchmarks in CI.
 | 9 | Crate layout | `rivet-*` crates as in §3.1 | [0009](docs/adr/0009-crate-layout.md) |
 | 10 | Architecture check tool | `xtask check-arch` reading `cargo metadata` | [0010](docs/adr/0010-architecture-check.md) |
 | 11 | Control API token scopes | `read-only`, `run-queries`, `manage-tunnels` | [0011](docs/adr/0011-control-api-token-scopes.md) |
-| 12 | Project licence | Not decided; dependencies permissive only; `tiny-keccak` (CC0-1.0) accepted | [0012](docs/adr/0012-project-licence-open.md) |
+| 12 | Project licence | Apache-2.0; dependencies permissive only; exceptions in `deny.toml` | [0026](docs/adr/0026-project-licence-apache-2.0.md) (replaces [0012](docs/adr/0012-project-licence-open.md)) |
 | 13 | SDK bindings delivery | WIT with the WASM runtime, C ABI with the native runtime; one extension point at a time | [0013](docs/adr/0013-sdk-bindings-delivery.md) |
 | 14 | Keychain on Linux | Optional build feature; built in on macOS and Windows | [0014](docs/adr/0014-keychain-optional-on-linux.md) |
 | 15 | Integration test databases | Local PostgreSQL and MySQL containers with Docker Compose | [0015](docs/adr/0015-integration-test-databases.md) |

@@ -53,3 +53,7 @@ read_only = true           # refuse writes
 Fastest way: `rivet save prod postgres://app@db.example.com:5432/app`. It asks for the password (hidden), checks that the connection works, stores the password in the keychain and adds the table above. Then: `rivet prod`. The flags (`read_only`, …) you add by hand. A name is looked up in the settings file first, then in `.env`.
 
 Plaintext only for now: the drivers have no TLS yet (#19).
+
+## Licence
+
+[Apache License 2.0](LICENSE).

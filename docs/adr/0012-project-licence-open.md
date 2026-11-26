@@ -1,6 +1,6 @@
 # ADR-0012: Project licence is not decided; dependencies stay permissive
 
-- Status: Accepted
+- Status: Superseded by [ADR-0026](0026-project-licence-apache-2.0.md)
 - Date: 2026-11-25
 
 ## Context
