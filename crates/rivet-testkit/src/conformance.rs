@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use futures_core::Stream;
 use rivet_sdk::error::{Error, ErrorCategory, Result};
@@ -184,6 +184,13 @@ impl Sql {
     /// The SQL for the MySQL container.
     pub fn mysql() -> Self {
         let mut type_columns = common_columns();
+        // MySQL `boolean` is `tinyint(1)` and can hold 2 or -1: a number
+        // (maintainer decision 1.1 of 2026-11-26).
+        type_columns[0] = column(
+            "b",
+            Int8Array::from(vec![Some(1), None]),
+            Some("tinyint(1)"),
+        );
         type_columns.push(column(
             "u32",
             UInt32Array::from(vec![Some(u32::MAX), None]),

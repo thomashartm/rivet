@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use arrow_array::{Array, Int8Array};
+use futures_util::StreamExt;
 use rivet_ext_mysql::MysqlDriver;
 use rivet_sdk::error::ErrorCategory;
 use rivet_sdk::extension::{ConnectRequest, Credential, Credentials, Driver};
@@ -103,4 +105,35 @@ async fn second_statement_in_one_call_is_refused() {
         .execute(format!("drop table {table}"))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_column_keeps_values_other_than_0_and_1() {
+    if !database::containers_enabled() {
+        return;
+    }
+    let fixture = database::mysql();
+    let password = Credential::Password(Secret::from(fixture.password.expose().to_owned()));
+    let credentials = Credentials::new(password).with_user(fixture.user.clone());
+    let request = ConnectRequest::new(fixture.profile.clone(), credentials);
+    let connection = MysqlDriver.connect(request).await.unwrap();
+
+    connection
+        .execute("create temporary table rivet_flag_probe (id int, b boolean)".to_owned())
+        .await
+        .unwrap();
+    connection
+        .execute("insert into rivet_flag_probe values (1, 2), (2, -1), (3, 0)".to_owned())
+        .await
+        .unwrap();
+    let mut result = connection
+        .execute("select b from rivet_flag_probe order by id".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(result.columns()[0].source_type, "tinyint(1)");
+    let batch = result.next().await.unwrap().unwrap();
+    assert_eq!(
+        batch.column(0).as_ref(),
+        &Int8Array::from(vec![2, -1, 0]) as &dyn Array
+    );
 }

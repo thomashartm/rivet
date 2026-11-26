@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 use mysql_async::consts::{ColumnFlags, ColumnType};
@@ -23,7 +23,6 @@ const BINARY_CHARSET: u16 = 63;
 /// The Arrow type of one result column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Kind {
-    Boolean,
     Int8,
     Int16,
     Int32,
@@ -45,8 +44,8 @@ impl Kind {
         let unsigned = column.flags().contains(ColumnFlags::UNSIGNED_FLAG);
         let binary = column.character_set() == BINARY_CHARSET;
         match column.column_type() {
-            // MySQL has no boolean type: `boolean` is `tinyint(1)`.
-            MYSQL_TYPE_TINY if column.column_length() == 1 => Self::Boolean,
+            // `boolean` is `tinyint(1)` and can hold any tinyint, for example
+            // 2: it is a number, so no value is lost (maintainer decision).
             MYSQL_TYPE_TINY if unsigned => Self::UInt8,
             MYSQL_TYPE_TINY => Self::Int8,
             MYSQL_TYPE_SHORT if unsigned => Self::UInt16,
@@ -76,7 +75,6 @@ impl Kind {
 
     fn data_type(self) -> DataType {
         match self {
-            Self::Boolean => DataType::Boolean,
             Self::Int8 => DataType::Int8,
             Self::Int16 => DataType::Int16,
             Self::Int32 => DataType::Int32,
@@ -96,7 +94,6 @@ impl Kind {
     /// for the error message.
     pub(crate) fn array(self, name: &str, values: Vec<Value>) -> Result<ArrayRef> {
         Ok(match self {
-            Self::Boolean => Arc::new(BooleanArray::from(convert::<bool>(name, values)?)),
             Self::Int8 => Arc::new(Int8Array::from(convert::<i8>(name, values)?)),
             Self::Int16 => Arc::new(Int16Array::from(convert::<i16>(name, values)?)),
             Self::Int32 => Arc::new(Int32Array::from(convert::<i32>(name, values)?)),
@@ -227,8 +224,8 @@ mod tests {
         let cases: Vec<(Column, DataType, &str, &str)> = vec![
             (
                 column(MYSQL_TYPE_TINY).with_column_length(1),
-                DataType::Boolean,
-                "1",
+                DataType::Int8,
+                "2",
                 "tinyint(1)",
             ),
             (
@@ -360,12 +357,13 @@ mod tests {
             max.as_ref(),
             &UInt64Array::from(vec![u64::MAX]) as &dyn Array
         );
-        let flags = Kind::Boolean
-            .array("c", vec![bytes("0"), bytes("1")])
+        // A `tinyint(1)` (`boolean`) can hold more than 0 and 1.
+        let flags = Kind::Int8
+            .array("c", vec![bytes("0"), bytes("1"), bytes("2"), bytes("-1")])
             .unwrap();
         assert_eq!(
             flags.as_ref(),
-            &BooleanArray::from(vec![false, true]) as &dyn Array
+            &Int8Array::from(vec![0, 1, 2, -1]) as &dyn Array
         );
         let float = Kind::Float32.array("c", vec![bytes("1.5")]).unwrap();
         assert_eq!(float.as_ref(), &Float32Array::from(vec![1.5]) as &dyn Array);
