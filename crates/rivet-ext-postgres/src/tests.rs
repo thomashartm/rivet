@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rivet_sdk::extension::ByteStream;
 use rivet_sdk::manifest::{ExtensionPoint, Manifest};
-use rivet_sdk::model::{Endpoint, ProviderRef, TlsSettings};
+use rivet_sdk::model::{ClientCertificate, Endpoint, ProviderRef, TlsSettings};
 use rivet_sdk::secret::Secret;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
@@ -146,17 +146,78 @@ fn untouched() -> (Box<dyn ByteStream>, Arc<AtomicBool>) {
     (Box::new(Untouched(Arc::clone(&used))), used)
 }
 
-#[tokio::test]
-async fn profile_with_tls_is_refused_before_any_io() {
+/// Connects over an untouched transport with `tls` and returns the error.
+async fn refused_before_any_io(tls: TlsSettings) -> Error {
     let (transport, used) = untouched();
-    let error = connect_over(transport, password(), true)
-        .await
-        .err()
-        .unwrap();
+    let request =
+        ConnectRequest::new(profile(true).with_tls(tls), password()).with_transport(transport);
+    let error = PostgresDriver.connect(request).await.err().unwrap();
+    assert!(!used.load(Ordering::SeqCst), "{error}");
+    error
+}
+
+#[tokio::test]
+async fn client_certificate_is_refused_before_any_io() {
+    let key = "keychain://rivet/client-key".parse().unwrap();
+    let tls = TlsSettings::new().with_client_certificate(ClientCertificate::new("c.pem", key));
+    let error = refused_before_any_io(tls).await;
     assert_eq!(error.category(), ErrorCategory::User);
-    assert!(error.message().contains("TLS"), "{error}");
-    assert!(error.message().contains("#19"), "{error}");
-    assert!(!used.load(Ordering::SeqCst));
+    assert!(error.message().contains("client certificate"), "{error}");
+}
+
+#[tokio::test]
+async fn unusable_ca_file_is_refused_before_any_io() {
+    let dir = std::env::temp_dir().join(format!("rivet-pg-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let empty = dir.join("empty.pem");
+    std::fs::write(&empty, "no certificate here\n").unwrap();
+    for path in [dir.join("missing.pem"), empty] {
+        let error =
+            refused_before_any_io(TlsSettings::new().with_ca_certificate(path.clone())).await;
+        assert_eq!(error.category(), ErrorCategory::User, "{error}");
+        assert!(
+            error.message().contains(&*path.to_string_lossy()),
+            "{error}"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn server_without_tls_is_refused_not_used_in_plaintext() {
+    let (transport, mut peer) = pipe();
+    let server = async move {
+        let mut request = [0; 8];
+        peer.0.read_exact(&mut request).await.unwrap();
+        peer.0.write_all(b"N").await.unwrap(); // no TLS here
+        // A client that falls back sends the startup message next.
+        let mut rest = Vec::new();
+        let _ = peer.0.read_to_end(&mut rest).await;
+        (request, rest)
+    };
+    let (connected, (request, rest)) = tokio::join!(
+        async {
+            let connected = connect_over(transport, password(), true).await;
+            // Dropping the error closes the transport: the server read ends.
+            connected.err().unwrap()
+        },
+        server
+    );
+    assert_eq!(request, [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F], "SSLRequest");
+    assert_eq!(
+        connected.category(),
+        ErrorCategory::Connectivity,
+        "{connected}"
+    );
+    assert!(
+        connected.message().contains("does not support TLS"),
+        "{connected}"
+    );
+    assert!(
+        rest.is_empty(),
+        "the driver sent {} bytes in plaintext",
+        rest.len()
+    );
 }
 
 #[tokio::test]
@@ -372,7 +433,7 @@ async fn cancel_that_never_ends_frees_the_busy_lock() {
     let (transport, mut peer) = pipe();
     let config = config(&profile(false), &password()).unwrap();
     let (login, _) = tokio::join!(
-        start(&config, Transport::new(transport)),
+        start(&config, Transport::new(transport), None),
         peer.accept_login()
     );
     let (client, _task) = login.unwrap();
@@ -387,6 +448,7 @@ async fn cancel_that_never_ends_frees_the_busy_lock() {
     let cancel = Canceller {
         token: client.cancel_token(),
         target: Some((address.ip().to_string(), address.port())),
+        tls: None,
     };
     let busy = Arc::new(Mutex::new(()));
     let running = Running {

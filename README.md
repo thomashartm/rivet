@@ -62,6 +62,17 @@ Run every command from the repository root: rivet reads `./.env` there.
 | `rivet <name>` | The saved connection `<name>`, else `RIVET_DATABASE_URL_<NAME>` |
 | `rivet postgres://user:password@host:port/db` | That address. `mysql://…` works too. |
 
+**TLS**
+
+| Address ends with | Connection |
+|---|---|
+| nothing | TLS. The server certificate and the host name are checked against the system trust store. |
+| `?tls_ca=/path/ca.pem` | TLS. Only the CA in that file is trusted. |
+| `?tls=off` | Plain text. The connect line says `plaintext, no TLS`. The playground uses this. |
+
+- Any other parameter in the address is refused.
+- A server without TLS is refused unless the address has `?tls=off`.
+
 **At the prompt**
 
 | Input | Action |
@@ -148,7 +159,7 @@ read_only = true
 
 **Known limit**
 
-- No TLS yet: connections are plain text (#19).
+- No TLS client certificate yet: a profile with one is refused (#19).
 
 ## Licence
 

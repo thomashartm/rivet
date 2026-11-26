@@ -6,6 +6,7 @@
 #   RIVET_DATABASE_URL        default (PostgreSQL)   -> rivet
 #   RIVET_DATABASE_URL_PG     PostgreSQL             -> rivet pg
 #   RIVET_DATABASE_URL_MYSQL  MySQL                  -> rivet mysql
+# The playground servers have no TLS, so their addresses end with ?tls=off.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,7 +24,7 @@ add() { [[ -n "$(get "$1")" ]] || echo "$1=$2" >> "$env_file"; }
 password() { local value; value="$(get "$1")"; echo "${value:-$(openssl rand -hex 16)}"; }
 
 pg_password="$(password POSTGRES_PASSWORD)"
-pg_url="postgres://rivet:$pg_password@127.0.0.1:55432/playground"
+pg_url="postgres://rivet:$pg_password@127.0.0.1:55432/playground?tls=off"
 add POSTGRES_USER rivet
 add POSTGRES_PASSWORD "$pg_password"
 add POSTGRES_DB playground
@@ -35,7 +36,19 @@ add MYSQL_USER rivet
 add MYSQL_PASSWORD "$mysql_password"
 add MYSQL_ROOT_PASSWORD "$(password MYSQL_ROOT_PASSWORD)"
 add MYSQL_DATABASE playground
-add RIVET_DATABASE_URL_MYSQL "mysql://rivet:$mysql_password@127.0.0.1:53306/playground"
+add RIVET_DATABASE_URL_MYSQL "mysql://rivet:$mysql_password@127.0.0.1:53306/playground?tls=off"
+
+# A .env from before TLS (#19): rivet now asks for TLS, which the playground
+# lacks. Only playground addresses without a tls parameter get ?tls=off; the
+# rest of each line, also the password, stays as it is.
+updated="$(mktemp "$env_file.XXXXXX")"
+awk '/^RIVET_DATABASE_URL[A-Z0-9_]*=.*@127\.0\.0\.1:(55432|53306)\// && !/[?&]tls=/ {
+        $0 = $0 (index($0, "?") ? "&" : "?") "tls=off"; changed++
+    }
+    { print }
+    END { if (changed) printf "added ?tls=off to %d playground address(es) in .env\n", changed > "/dev/stderr" }' \
+    "$env_file" > "$updated"
+mv "$updated" "$env_file"
 
 docker compose --env-file "$env_file" -f "$root/docker/compose.playground.yml" up -d --wait
 echo "playground ready. Run: make run (PostgreSQL) or make run-mysql"

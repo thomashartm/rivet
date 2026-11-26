@@ -12,12 +12,15 @@
 # - Data is in memory (tmpfs). It is lost when the container stops.
 # - crates/rivet-testkit/src/database.rs has the same ports and credentials.
 #   Its tests fail if the two files differ.
+# - postgres-tls and mysql-tls are the same databases with TLS. Their test
+#   certificate (host name `localhost`) and CA come from docker/test-certs.sh,
+#   written to docker/test-certs/ on the first start; Git ignores them.
 name: rivet-test
 
 services:
   postgres:
     image: postgres:18.7
-    environment:
+    environment: &postgres-environment
       POSTGRES_USER: rivet_test
       POSTGRES_PASSWORD: test-only-not-a-secret
       POSTGRES_DB: rivet_test
@@ -25,7 +28,7 @@ services:
       - "127.0.0.1:54329:5432"
     tmpfs:
       - /var/lib/postgresql
-    healthcheck:
+    healthcheck: &postgres-healthcheck
       # TCP, not the socket: the setup server listens on the socket only.
       test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=rivet_test", "--dbname=rivet_test"]
       interval: 2s
@@ -34,7 +37,7 @@ services:
 
   mysql:
     image: mysql:8.4.13
-    environment:
+    environment: &mysql-environment
       MYSQL_ROOT_PASSWORD: test-only-not-a-secret
       MYSQL_USER: rivet_test
       MYSQL_PASSWORD: test-only-not-a-secret
@@ -43,9 +46,59 @@ services:
       - "127.0.0.1:33069:3306"
     tmpfs:
       - /var/lib/mysql
-    healthcheck:
+    healthcheck: &mysql-healthcheck
       # TCP, not the socket: the setup server has no network.
       test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--user=rivet_test", "--password=test-only-not-a-secret"]
       interval: 2s
       timeout: 5s
       retries: 30
+
+  # Writes the test TLS files once; the TLS servers start after it.
+  tls-certs:
+    image: postgres:18.7
+    entrypoint: ["sh", "/test-certs.sh"]
+    volumes:
+      - ./test-certs.sh:/test-certs.sh:ro
+      - ./test-certs:/certs
+
+  postgres-tls:
+    image: postgres:18.7
+    environment: *postgres-environment
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+    # PostgreSQL wants its key private to its user: a copy, owned by postgres.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        install -o postgres -m 600 /certs/server.key /tmp/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/certs/server.pem -c ssl_key_file=/tmp/server.key
+    ports:
+      - "127.0.0.1:54330:5432"
+    volumes:
+      - ./test-certs:/certs:ro
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck: *postgres-healthcheck
+
+  mysql-tls:
+    image: mysql:8.4.13
+    environment: *mysql-environment
+    depends_on:
+      tls-certs:
+        condition: service_completed_successfully
+    # Plaintext is refused, so a test that connects has used TLS.
+    command:
+      - --ssl-ca=/certs/ca.pem
+      - --ssl-cert=/certs/server.pem
+      - --ssl-key=/certs/server.key
+      - --require-secure-transport=ON
+    ports:
+      - "127.0.0.1:33070:3306"
+    volumes:
+      - ./test-certs:/certs:ro
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck: *mysql-healthcheck

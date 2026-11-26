@@ -35,6 +35,14 @@ allow = ["BSL-1.0"]
 crate = "error-code"
 allow = ["BSL-1.0"]
 
+# webpki-roots comes in through mysql_async `rustls-tls` (#19), which has no
+# switch to leave it out. The MySQL driver turns the built-in roots off; it
+# trusts the system store or the pinned CA. CDLA-Permissive-2.0 is a
+# permissive data licence. Maintainer approval 2026-11-26 (ADR-0026).
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 

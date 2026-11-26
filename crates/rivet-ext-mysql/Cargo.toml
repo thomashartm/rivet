@@ -14,9 +14,11 @@ workspace = true
 arrow-array = { version = "60.2.0", default-features = false }
 arrow-schema = { version = "60.2.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
-# Pure-Rust compression backend: `minimal` links the C zlib. No TLS (#19).
-mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+# Pure-Rust compression backend (`minimal` links the C zlib); TLS by rustls with
+# the ring provider (aws-lc-rs brings the OpenSSL licence).
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "ring", "rustls-tls", "tls12"] }
 rivet-sdk = { path = "../rivet-sdk" }
+rustls-native-certs = "0.8.5"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]

@@ -9,6 +9,16 @@
 //! sql> select 1 as one;
 //! ```
 //!
+//! # TLS
+//!
+//! TLS is on: the server certificate and the host name are verified against
+//! the system trust store. Parameters of the address change that:
+//!
+//! - `?tls=off`: plaintext. The connect line says `plaintext, no TLS`.
+//! - `?tls_ca=<path>`: trust only the CA in that PEM file.
+//!
+//! Any other parameter is refused.
+//!
 //! # Saved connections
 //!
 //! `rivet <name>` looks in this order:
@@ -65,6 +75,8 @@ usage: rivet [postgres://… | mysql://… | <name>] [-f <file.sql>] [--format t
   <name>      a saved connection: [connections.<name>] in the user settings
               file, or RIVET_DATABASE_URL_<NAME> in the environment or ./.env
   no target   RIVET_DATABASE_URL from the environment or ./.env
+  ?tls=off    in the address: plaintext; TLS with a verified certificate is the default
+  ?tls_ca=<f> in the address: trust only the CA in the PEM file <f>
   -f <file>   run the statements of <file>, stop at the first error
   --format    table (default), csv, or json (one object per row)
   save        ask for the password, check the connection, store the password in
@@ -233,7 +245,12 @@ async fn connect(target: Option<&str>) -> Result<(Box<dyn Connection>, Connectio
     } else {
         format!(" [{}]", flags.join(", "))
     };
-    eprintln!("connected to {shown}{flags} (plaintext, no TLS)");
+    let tls = if profile.tls.enabled {
+        "TLS"
+    } else {
+        "plaintext, no TLS"
+    };
+    eprintln!("connected to {shown}{flags} ({tls})");
     Ok((connection, profile))
 }
 
@@ -372,20 +389,60 @@ fn parse(address: &str) -> Result<(ConnectRequest, &'static dyn Driver)> {
     if !database.is_empty() {
         endpoint = endpoint.with_database(decode(database)?);
     }
-    // shortcut: TLS is always off because the drivers have no TLS yet (#19);
-    // honour `sslmode` / `ssl-mode` once they have.
     let profile = ConnectionProfile::new(
         ProviderRef::new(engine),
         endpoint,
         ProviderRef::new("password"),
     )
-    .with_tls(TlsSettings::new().with_enabled(false));
+    .with_tls(tls(&url)?);
     let password = Credential::Password(Secret::from(decode(url.password().unwrap_or(""))?));
     let mut credentials = Credentials::new(password);
     if !url.username().is_empty() {
         credentials = credentials.with_user(decode(url.username())?);
     }
     Ok((ConnectRequest::new(profile, credentials), driver))
+}
+
+/// The TLS settings from the query of the address: TLS is on unless
+/// `tls=off`; `tls_ca=<path>` trusts only that CA file. Each other
+/// parameter is refused, so a typing error cannot turn TLS off silently.
+fn tls(url: &Url) -> Result<TlsSettings> {
+    let mut tls = TlsSettings::new();
+    let (mut seen_tls, mut seen_ca) = (false, false);
+    for (key, value) in url.query_pairs() {
+        let seen = match key.as_ref() {
+            "tls" => &mut seen_tls,
+            "tls_ca" => &mut seen_ca,
+            _ => {
+                return Err(Error::user(format!(
+                    "the address has the unknown parameter `{key}`; rivet knows `tls=on|off` \
+                     and `tls_ca=<CA file>`"
+                )));
+            }
+        };
+        if std::mem::replace(seen, true) {
+            return Err(Error::user(format!(
+                "the address has the parameter `{key}` twice"
+            )));
+        }
+        tls = match (key.as_ref(), value.as_ref()) {
+            ("tls", "on") => tls.with_enabled(true),
+            ("tls", "off") => tls.with_enabled(false),
+            ("tls", other) => {
+                return Err(Error::user(format!(
+                    "`tls={other}` is not known; use `tls=on` or `tls=off`"
+                )));
+            }
+            (_, "") => return Err(Error::user("`tls_ca` needs the path of a CA file")),
+            (_, path) => tls.with_ca_certificate(path),
+        };
+    }
+    if !tls.enabled && tls.ca_certificate.is_some() {
+        return Err(Error::user(
+            "the address has `tls=off` and `tls_ca`; remove one of them",
+        ));
+    }
+    Ok(tls)
 }
 
 /// Decodes the `%xx` escapes of one part of the address.
@@ -407,7 +464,8 @@ mod tests {
         assert_eq!(request.profile.endpoint.host, "db.local");
         assert_eq!(request.profile.endpoint.port, Some(5433));
         assert_eq!(request.profile.endpoint.database.as_deref(), Some("my db"));
-        assert!(!request.profile.tls.enabled);
+        assert!(request.profile.tls.enabled, "TLS is on by default");
+        assert_eq!(request.profile.tls.ca_certificate, None);
         assert_eq!(request.credentials.user.as_deref(), Some("app@x"));
         let Credential::Password(password) = &request.credentials.credential else {
             panic!("not a password");
@@ -489,6 +547,34 @@ mod tests {
         let prod = saved(&settings, "prod").unwrap().unwrap();
         assert!(prod.read_only && prod.confirm_on_write);
         assert_eq!(prod.environment.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn parse_reads_the_tls_parameters() {
+        let tls = |address: &str| parse(address).map(|(request, _)| request.profile.tls);
+        let off = tls("postgres://a@h/d?tls=off").unwrap();
+        assert!(!off.enabled);
+        assert!(tls("mysql://a@h/d?tls=on").unwrap().enabled);
+        let pinned = tls("postgres://a@h/d?tls_ca=%2Fetc%2Fca%20x.pem").unwrap();
+        assert!(pinned.enabled);
+        assert_eq!(
+            pinned.ca_certificate.as_deref(),
+            Some(std::path::Path::new("/etc/ca x.pem"))
+        );
+        let pinned = tls("postgres://a@h/d?tls=on&tls_ca=ca.pem").unwrap();
+        assert!(pinned.enabled && pinned.ca_certificate.is_some());
+        for (wrong, says) in [
+            ("postgres://a@h/d?tls=no", "tls=no"),
+            ("postgres://a@h/d?tls=", "tls="),
+            ("postgres://a@h/d?sslmode=disable", "sslmode"),
+            ("postgres://a@h/d?tls=off&tls=on", "twice"),
+            ("postgres://a@h/d?tls_ca=", "tls_ca"),
+            ("mysql://a@h/d?tls=off&tls_ca=ca.pem", "tls=off"),
+        ] {
+            let error = tls(wrong).unwrap_err();
+            assert_eq!(error.category(), rivet_sdk::error::ErrorCategory::User);
+            assert!(error.message().contains(says), "{wrong}: {error}");
+        }
     }
 
     #[test]
