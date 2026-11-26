@@ -354,3 +354,49 @@ fn manifest_contributes_the_driver_point() {
     assert_eq!(manifest.contributes.len(), 1);
     assert_eq!(manifest.contributes[0].kind, ExtensionPoint::Driver);
 }
+
+#[tokio::test(start_paused = true)]
+async fn login_that_never_gets_an_answer_fails_with_connectivity() {
+    // `_peer` stays open and silent: the server accepted and says nothing.
+    let (transport, _peer) = pipe();
+    let request = ConnectRequest::new(profile(false), password()).with_transport(transport);
+    let error = PostgresDriver.connect(request).await.err().unwrap();
+    assert_eq!(error.category(), ErrorCategory::Connectivity, "{error}");
+    assert!(error.message().contains("login"), "{error}");
+    assert!(!format!("{error:?}").contains(PASSWORD));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_that_never_ends_frees_the_busy_lock() {
+    // A real login over a pipe gives a cancel token.
+    let (transport, mut peer) = pipe();
+    let config = config(&profile(false), &password()).unwrap();
+    let (login, _) = tokio::join!(
+        start(&config, Transport::new(transport)),
+        peer.accept_login()
+    );
+    let (client, _task) = login.unwrap();
+    // The cancel socket is accepted and never closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = tokio::spawn(async move {
+        let socket = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+        drop(socket);
+    });
+    let cancel = Canceller {
+        token: client.cancel_token(),
+        target: Some((address.ip().to_string(), address.port())),
+    };
+    let busy = Arc::new(Mutex::new(()));
+    let running = Running {
+        _busy: Arc::clone(&busy).lock_owned().await,
+        cancel,
+        tunnel: None,
+    };
+    running.stop();
+    // The lock comes free after the cancel limit, not never.
+    let lock = tokio::time::timeout(CANCEL_TIMEOUT * 2, busy.lock()).await;
+    assert!(lock.is_ok(), "the busy lock stayed held");
+    held.abort();
+}

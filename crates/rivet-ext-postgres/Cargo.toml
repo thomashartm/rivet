@@ -14,10 +14,10 @@ arrow-array = { version = "60.2.0", default-features = false }
 arrow-schema = { version = "60.2.0", default-features = false }
 futures-core = "0.3.34"
 rivet-sdk = { path = "../rivet-sdk" }
-tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "sync", "time"] }
 # Without the default `runtime` feature: the driver opens its sockets itself.
 tokio-postgres = { version = "0.7.18", default-features = false }
 
 [dev-dependencies]
 rivet-testkit = { path = "../rivet-testkit" }
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "test-util"] }

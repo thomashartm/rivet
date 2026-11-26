@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -59,6 +60,14 @@ pub const BATCH_ROWS: usize = 1024;
 
 /// The port of PostgreSQL if the endpoint has none.
 const DEFAULT_PORT: u16 = 5432;
+
+/// The time limit of the login. The SDK has no connect timeout; without a
+/// limit a server that accepts the socket and never answers hangs the caller.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The time limit of the whole cancel request. The background task of a
+/// dropped result holds the `busy` lock until the cancel ends.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The PostgreSQL driver.
 ///
@@ -151,7 +160,10 @@ fn config(
     config
         .user(user)
         .password(password.expose())
-        .ssl_mode(SslMode::Disable);
+        .ssl_mode(SslMode::Disable)
+        // The decoder of `bytea` reads only the hex format; a role or database
+        // default of `escape` must not change that.
+        .options("-c bytea_output=hex");
     if let Some(database) = &profile.endpoint.database {
         config.dbname(database);
     }
@@ -173,7 +185,17 @@ async fn start<S>(config: &tokio_postgres::Config, stream: S) -> Result<(Client,
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (client, connection) = config.connect_raw(stream, NoTls).await.map_err(map_error)?;
+    let (client, connection) =
+        tokio::time::timeout(LOGIN_TIMEOUT, config.connect_raw(stream, NoTls))
+            .await
+            .map_err(|elapsed| {
+                Error::connectivity(format!(
+                    "PostgreSQL did not finish the login in {} seconds",
+                    LOGIN_TIMEOUT.as_secs()
+                ))
+                .with_source(elapsed)
+            })?
+            .map_err(map_error)?;
     // The task ends when the client is dropped or the stream fails. A failure
     // reaches the caller as a `closed` error of the next call.
     let task = tokio::spawn(connection).abort_handle();
@@ -231,15 +253,26 @@ impl Canceller {
                  second connection, and the driver has only the one stream",
             ));
         };
-        let mut socket = open_socket(target).await?;
-        self.token
-            .cancel_query_raw(&mut socket, NoTls)
+        let cancel = async {
+            let mut socket = open_socket(target).await?;
+            self.token
+                .cancel_query_raw(&mut socket, NoTls)
+                .await
+                .map_err(map_error)?;
+            // The server closes the socket after it has passed the request on.
+            // A later statement thus cannot get the cancel.
+            let _ = socket.read_to_end(&mut Vec::new()).await;
+            Ok(())
+        };
+        tokio::time::timeout(CANCEL_TIMEOUT, cancel)
             .await
-            .map_err(map_error)?;
-        // The server closes the socket after it has passed the request on.
-        // A later statement thus cannot get the cancel.
-        let _ = socket.read_to_end(&mut Vec::new()).await;
-        Ok(())
+            .map_err(|elapsed| {
+                Error::connectivity(format!(
+                    "the cancel request took more than {} seconds",
+                    CANCEL_TIMEOUT.as_secs()
+                ))
+                .with_source(elapsed)
+            })?
     }
 }
 
