@@ -66,6 +66,17 @@ Run every command from the repository root: rivet reads `./.env` there.
 | `rivet <name>` | The saved connection `<name>`, else `RIVET_DATABASE_URL_<NAME>` |
 | `rivet postgres://user:password@host:port/db` | That address. `mysql://…` works too. |
 
+**Commands at the `sql>` prompt**
+
+| Command | What it does |
+|---|---|
+| `\l` | Lists the databases on the server |
+| `\c <database>` | Connects to `<database>` on the same server. User, password, TLS and flags stay the same. If it fails, the old connection stays. |
+| `\d` | Lists the tables |
+| `\d <table>` | Shows the columns of a table |
+| `\?` | Shows this list |
+| `\q` | Quits |
+
 **TLS**
 
 | Address ends with | Connection |

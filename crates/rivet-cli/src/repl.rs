@@ -27,9 +27,14 @@ pub struct Session<'a> {
     /// `None` while a job holds it, and after it was closed.
     pub connection: Option<Box<dyn Connection>>,
     /// Its `read_only` and `confirm_on_write` flags drive the guard.
-    pub profile: &'a ConnectionProfile,
+    pub profile: ConnectionProfile,
     pub format: Format,
+    /// Connects to another database of the same server (`\c`).
+    pub switch: &'a dyn Fn(&str) -> Result<Connected>,
 }
+
+/// A new connection and its profile.
+pub type Connected = (Box<dyn Connection>, ConnectionProfile);
 
 /// Where the statements come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,8 @@ pub enum Input {
 }
 
 const HELP: &str = "\
+\\l            list the databases
+\\c <database> connect to another database on the same server
 \\d            list the tables
 \\d <table>    describe a table (<table> or <schema>.<table>)
 \\?            this help
@@ -155,14 +162,23 @@ pub fn repl(
             Input::Failed => return false,
             Input::End => break,
         };
-        let sql = if statement.is_empty() && line.trim_start().starts_with('\\') {
+        let done = if statement.is_empty() && line.trim_start().starts_with('\\') {
             match line.trim() {
                 "\\q" => return ok,
                 "\\?" => {
                     let _ = output.write_all(HELP.as_bytes());
                     continue;
                 }
-                command => meta(command),
+                command if command.split_whitespace().next() == Some("\\c") => {
+                    switch(session, command)
+                }
+                command => match meta(command, &session.profile.engine.id) {
+                    Ok(sql) => guarded(session, &sql, mode, &mut next, output),
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        false
+                    }
+                },
             }
         } else {
             if statement.is_empty() && line.trim().is_empty() {
@@ -173,14 +189,8 @@ pub fn repl(
             if !line.trim_end().ends_with(';') {
                 continue;
             }
-            Ok(std::mem::take(&mut statement))
-        };
-        let done = match sql {
-            Ok(sql) => guarded(session, &sql, mode, &mut next, output),
-            Err(error) => {
-                eprintln!("error: {error}");
-                false
-            }
+            let sql = std::mem::take(&mut statement);
+            guarded(session, &sql, mode, &mut next, output)
         };
         if !done {
             ok = false;
@@ -193,6 +203,34 @@ pub fn repl(
         ok &= guarded(session, &statement, mode, &mut next, output);
     }
     ok
+}
+
+/// Runs `\c <database>`: connects to `<database>` and keeps everything else
+/// of the session. The old connection stays if the new one fails.
+/// Returns `false` if it failed.
+fn switch(session: &mut Session<'_>, command: &str) -> bool {
+    let mut words = command.split_whitespace().skip(1);
+    let (Some(database), None) = (words.next(), words.next()) else {
+        eprintln!(
+            "error: {}",
+            Error::user("`\\c` needs one database name: `\\c <database>`")
+        );
+        return false;
+    };
+    match (session.switch)(database) {
+        Ok((connection, profile)) => {
+            session.connection = Some(connection);
+            session.profile = profile;
+            true
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            if session.connection.is_some() {
+                eprintln!("the old connection stays open");
+            }
+            false
+        }
+    }
 }
 
 /// The end of the confirmation prompt.
@@ -218,7 +256,7 @@ fn guarded(
         return false;
     };
     let statement = statement.trim().trim_end_matches(';').to_owned();
-    let profile = session.profile;
+    let profile = &session.profile;
     // A job starts only inside the runtime.
     let _runtime = session.runtime.enter();
     let check = |connection, statement, confirmed| {
@@ -288,11 +326,24 @@ fn guarded(
 const SYSTEM_SCHEMAS: &str =
     "('pg_catalog', 'information_schema', 'mysql', 'performance_schema', 'sys')";
 
-/// The SQL of a `\d` command. Uses `information_schema`, which PostgreSQL
-/// and MySQL both have.
-fn meta(command: &str) -> Result<String> {
+/// The SQL of a `\l` or `\d` command on the engine `engine`. `\d` uses
+/// `information_schema`, which PostgreSQL and MySQL both have.
+fn meta(command: &str, engine: &str) -> Result<String> {
     let mut words = command.split_whitespace();
     match (words.next(), words.next(), words.next()) {
+        // In MySQL a database is a schema.
+        (Some("\\l"), None, None) => match engine {
+            "postgres" => Ok("select datname as database_name from pg_database \
+                 where not datistemplate order by 1"
+                .to_owned()),
+            "mysql" => Ok(format!(
+                "select schema_name as database_name from information_schema.schemata \
+                 where schema_name not in {SYSTEM_SCHEMAS} order by 1"
+            )),
+            other => Err(Error::user(format!(
+                "`\\l` does not know the engine `{other}`"
+            ))),
+        },
         (Some("\\d"), None, None) => Ok(format!(
             "select table_schema as table_schema, table_name as table_name, \
              table_type as table_type from information_schema.tables \
@@ -451,28 +502,113 @@ mod tests {
     /// the result of the loop, how many statements reached the driver, and
     /// whether the session still has its connection.
     fn session(input: &str, mode: Mode, read_only: bool, confirm: bool) -> (bool, usize, bool) {
+        run(input, mode, read_only, confirm, &Arc::default())
+    }
+
+    /// As `session`; `\c <database>` connects to a connection that counts
+    /// in `switched`, and `\c missing` fails.
+    fn run(
+        input: &str,
+        mode: Mode,
+        read_only: bool,
+        confirm: bool,
+        switched: &Arc<AtomicUsize>,
+    ) -> (bool, usize, bool) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let profile = ConnectionProfile::new(
-            ProviderRef::new("fake"),
-            Endpoint::new("localhost"),
-            ProviderRef::new("none"),
-        )
-        .with_read_only(read_only)
-        .with_confirm_on_write(confirm);
+        let profile = |database: &str| {
+            ConnectionProfile::new(
+                ProviderRef::new("fake"),
+                Endpoint::new("localhost").with_database(database),
+                ProviderRef::new("none"),
+            )
+            .with_read_only(read_only)
+            .with_confirm_on_write(confirm)
+        };
+        let switch = |database: &str| -> Result<Connected> {
+            if database == "missing" {
+                return Err(Error::user("database \"missing\" does not exist"));
+            }
+            Ok((Box::new(Counting(switched.clone())), profile(database)))
+        };
         let executed = Arc::new(AtomicUsize::new(0));
         let mut session = Session {
             runtime: &runtime,
             scheduler: JobScheduler::new(std::num::NonZeroUsize::MIN, 0),
             connection: Some(Box::new(Counting(executed.clone()))),
-            profile: &profile,
+            profile: profile("first"),
             format: Format::Csv,
+            switch: &switch,
         };
         let ok = repl(&mut session, lines(input.as_bytes()), &mut Vec::new(), mode);
         let kept = session.connection.is_some();
         (ok, executed.load(Ordering::SeqCst), kept)
+    }
+
+    #[test]
+    fn backslash_c_moves_the_next_statements_to_the_new_database() {
+        let switched = Arc::default();
+        assert_eq!(
+            run(
+                "select 1;\n\\c other\nselect 2;\nselect 3;\n",
+                Mode::Pipe,
+                false,
+                false,
+                &switched
+            ),
+            (true, 1, true)
+        );
+        assert_eq!(switched.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_failed_backslash_c_keeps_the_old_connection() {
+        let switched = Arc::default();
+        // Pipe: goes on after the error, on the old connection.
+        assert_eq!(
+            run(
+                "\\c missing\nselect 1;\n",
+                Mode::Pipe,
+                false,
+                false,
+                &switched
+            ),
+            (false, 1, true)
+        );
+        // Script: stops at the error. No name, or two names, is an error too.
+        for bad in ["\\c missing", "\\c", "\\c a b"] {
+            assert_eq!(
+                run(
+                    &format!("{bad}\nselect 1;\n"),
+                    Mode::Script,
+                    false,
+                    false,
+                    &switched
+                ),
+                (false, 0, true),
+                "{bad}"
+            );
+        }
+        assert_eq!(switched.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn backslash_c_keeps_the_guard_flags() {
+        // The read-only flag of the new profile still refuses the write.
+        let switched = Arc::default();
+        assert_eq!(
+            run(
+                "\\c other\ndelete from t;\nselect 1;\n",
+                Mode::Pipe,
+                true,
+                false,
+                &switched
+            ),
+            (false, 0, true)
+        );
+        assert_eq!(switched.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -521,6 +657,7 @@ mod tests {
 
     #[test]
     fn meta_lists_and_describes_tables() {
+        let meta = |command| meta(command, "postgres");
         assert!(meta("\\d").unwrap().contains("information_schema.tables"));
         let describe = meta("\\d playground.orders").unwrap();
         assert!(describe.contains("table_name = 'orders' and table_schema = 'playground'"));
@@ -532,9 +669,21 @@ mod tests {
     }
 
     #[test]
+    fn meta_lists_the_databases_of_each_engine() {
+        assert!(meta("\\l", "postgres").unwrap().contains("pg_database"));
+        assert!(
+            meta("\\l", "mysql")
+                .unwrap()
+                .contains("information_schema.schemata")
+        );
+        assert!(meta("\\l", "fake").is_err());
+        assert!(meta("\\l x", "postgres").is_err());
+    }
+
+    #[test]
     fn meta_refuses_unsafe_names_and_unknown_commands() {
         for bad in ["\\d x'y", "\\d a.b.c", "\\d .x", "\\d a b", "\\x"] {
-            assert!(meta(bad).is_err(), "{bad}");
+            assert!(meta(bad, "postgres").is_err(), "{bad}");
         }
     }
 }
